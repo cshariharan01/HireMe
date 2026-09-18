@@ -1,0 +1,41 @@
+name: Release
+
+# Fires when you push a version tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+# It builds a clean source zip and publishes a GitHub Release with your notes.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # required to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # git archive = only committed files, with a top folder, forward slashes, no .git.
+      # Gitignored data/.env.local/PDFs are never committed, so this zip is inherently clean.
+      - name: Build source zip
+        run: git archive --format=zip --prefix="hiresignal-personal/" -o "hiresignal-personal-${GITHUB_REF_NAME}.zip" HEAD
+
+      # Use a per-version note file if present, else a repo-level RELEASE_NOTES.md, else a stub.
+      - name: Prepare release body
+        run: |
+          if [ -f "docs/RELEASE-${GITHUB_REF_NAME}.md" ]; then
+            cp "docs/RELEASE-${GITHUB_REF_NAME}.md" RELEASE_BODY.md
+          elif [ -f RELEASE_NOTES.md ]; then
+            cp RELEASE_NOTES.md RELEASE_BODY.md
+          else
+            echo "HireSignal Personal Edition ${GITHUB_REF_NAME}" > RELEASE_BODY.md
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_BODY.md
+          generate_release_notes: true   # appends an auto changelog from commits/PRs
+          files: hiresignal-personal-${{ github.ref_name }}.zip

@@ -1,0 +1,61 @@
+# dependencies
+/node_modules
+/.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local env files
+.env*.local
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# HireSignal data
+/data/
+*.db
+
+# Local backups (contain data + secrets — ship via USB, never commit)
+/backups/
+*.tgz
+
+# Personal data — NEVER commit (PII). Résumé PDFs + any local-only notes.
+*.pdf
+/test/data/
+CLAUDE.local.md
+# Working notes, plans and verification scripts kept with the project instead of in a global
+# tool directory. Contains résumé facts, employer names and pipeline diagnostics — PII, and
+# this repo is public, so it must never be committed.
+/.notes/
+
+# Private launch/marketing notes (not for the public repo)
+LAUNCH_KIT.md
+
+# Release artifacts built locally
+hiresignal-personal-*.zip
+
+# Local env (contains personal API keys - never commit)
+.env
+

@@ -1,0 +1,147 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* Notion-warm palette: warm stone neutrals (hue ~35), rounded, soft shadows, a calm blue accent.
+     Token names are unchanged so all existing components inherit the new look. */
+  :root {
+    --background: 40 24% 98%;        /* warm off-white canvas */
+    --foreground: 30 10% 16%;
+    --card: 0 0% 100%;              /* white cards float on the warm canvas */
+    --card-foreground: 30 10% 16%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 30 10% 16%;
+    --primary: 30 9% 18%;          /* warm near-black for buttons/active */
+    --primary-foreground: 40 24% 98%;
+    --secondary: 40 15% 94%;
+    --secondary-foreground: 30 9% 18%;
+    --muted: 40 15% 94%;
+    --muted-foreground: 30 6% 45%;
+    --accent: 40 16% 92%;          /* hover / active surface */
+    --accent-foreground: 30 9% 18%;
+    --destructive: 8 74% 54%;      /* warm red */
+    --destructive-foreground: 0 0% 100%;
+    --border: 38 16% 88%;
+    --input: 38 16% 88%;
+    --ring: 210 80% 52%;           /* calm blue focus ring / accent */
+    --radius: 0.875rem;
+
+    --success: 145 55% 42%;
+    --success-foreground: 0 0% 100%;
+    --warning: 34 90% 48%;
+    --warning-foreground: 0 0% 100%;
+    --info: 210 82% 52%;
+    --info-foreground: 0 0% 100%;
+
+    /* Soft, warm shadows (Notion-ish) */
+    --shadow-soft: 0 1px 2px hsl(30 20% 20% / 0.04), 0 2px 8px hsl(30 20% 20% / 0.06);
+    --shadow-pop: 0 4px 12px hsl(30 20% 20% / 0.08), 0 8px 24px hsl(30 20% 20% / 0.10);
+  }
+
+  .dark {
+    --background: 30 7% 10%;        /* warm charcoal, not blue-black */
+    --foreground: 40 15% 92%;
+    --card: 30 6% 13%;
+    --card-foreground: 40 15% 92%;
+    --popover: 30 6% 13%;
+    --popover-foreground: 40 15% 92%;
+    --primary: 40 20% 94%;
+    --primary-foreground: 30 9% 14%;
+    --secondary: 30 5% 18%;
+    --secondary-foreground: 40 15% 92%;
+    --muted: 30 5% 18%;
+    --muted-foreground: 40 8% 62%;
+    --accent: 30 5% 20%;
+    --accent-foreground: 40 15% 92%;
+    --destructive: 8 62% 52%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 30 5% 20%;
+    --input: 30 5% 22%;
+    --ring: 210 70% 58%;
+
+    --success: 145 48% 48%;
+    --success-foreground: 0 0% 100%;
+    --warning: 34 82% 56%;
+    --warning-foreground: 30 10% 10%;
+    --info: 210 72% 62%;
+    --info-foreground: 30 10% 10%;
+
+    --shadow-soft: 0 1px 2px hsl(0 0% 0% / 0.20), 0 2px 8px hsl(0 0% 0% / 0.28);
+    --shadow-pop: 0 4px 12px hsl(0 0% 0% / 0.30), 0 8px 24px hsl(0 0% 0% / 0.38);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: 'rlig' 1, 'calt' 1, 'ss01' 1;
+  }
+  /* Tabular numerals for scores + dates */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+  /* Subtle radial spotlight used in hero */
+  .spotlight {
+    background-image: radial-gradient(ellipse at top, hsl(var(--accent) / 0.5) 0%, transparent 60%);
+  }
+  /* Warm soft shadows (Notion-ish) for cards + popovers */
+  .shadow-soft {
+    box-shadow: var(--shadow-soft);
+  }
+  .shadow-pop {
+    box-shadow: var(--shadow-pop);
+  }
+  /* Indeterminate top progress bar (sync "it's alive" signal) */
+  @keyframes indeterminate {
+    0% { transform: translateX(-120%); }
+    100% { transform: translateX(420%); }
+  }
+  .animate-indeterminate {
+    animation: indeterminate 1.3s ease-in-out infinite;
+  }
+  /* Thin, unobtrusive scrollbars for the two-pane list/detail scroll areas */
+  .scroll-slim {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  .scroll-slim::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scroll-slim::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--border));
+    border-radius: 9999px;
+  }
+  .scroll-slim::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* Skip layout/paint for match rows that are scrolled out of view.
+ *
+ * WHY NOT VIRTUALIZATION: measured first. At 210 loaded rows the list is ~4,500 DOM nodes and
+ * typing latency did NOT scale with row count (1663ms for 9 chars at 30 rows vs 1258ms at 210) —
+ * `React.memo` on the row had already removed the re-render cost, so a virtualized list would have
+ * added real risk for no measured gain. It would also break j/k keyboard nav and the detail
+ * route's prev/next, both of which resolve rows via `document.getElementById('match-row-<id>')`
+ * and `scrollIntoView` — impossible when the element is unmounted.
+ *
+ * `content-visibility: auto` gets most of the benefit with none of that: the browser skips
+ * rendering work for offscreen rows while KEEPING them in the DOM, so every id lookup, scroll and
+ * hotkey keeps working. `contain-intrinsic-size` supplies a placeholder height so the scrollbar
+ * doesn't jump as rows are skipped and restored.
+ */
+.match-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 76px;
+}

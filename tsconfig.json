@@ -1,0 +1,55 @@
+{
+  "compilerOptions": {
+    // Read by tsconfig-paths so `@/*` resolves in ts-node CJS scripts. Next resolves the alias via
+    // its own bundler config, so this is inert for the app build.
+    "baseUrl": ".",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "preserve",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ]
+    },
+    "target": "ES2017"
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ],
+  "ts-node": {
+    // `@/*` path-alias support for ts-node scripts. `src/lib/apply/*` imports siblings via the
+    // alias, so without this any script touching prepare.ts dies with "Cannot find module @/lib/...".
+    "require": [
+      "tsconfig-paths/register"
+    ],
+    "compilerOptions": {
+      "module": "commonjs",
+      "moduleResolution": "node"
+    },
+    "transpileOnly": true
+  }
+}
