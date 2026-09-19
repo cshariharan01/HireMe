@@ -1,5 +1,5 @@
 {
-  "name": "hiresignal-personal",
+  "name": "hireme",
   "version": "1.0.0",
   "private": true,
   "license": "MIT",
@@ -34,7 +34,7 @@
     "test-freeway": "npx ts-node scripts/test-freeway.ts",
     "backup": "npx ts-node scripts/backup.ts",
     "daily": "npm run ingest:all && npm run discover && npm run embed && npm run prune && npm run verify:links && npm run evaluate:top",
-    "db:reset": "node -e \"require('fs').unlinkSync('./data/hiresignal.db')\"",
+    "db:reset": "node -e \"require('fs').unlinkSync('./data/hireme.db')\"",
     "test": "vitest run",
     "test:watch": "vitest",
     "sync:directory": "npx ts-node scripts/sync-company-directory.ts"

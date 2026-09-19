@@ -9,8 +9,8 @@ import { Toaster } from '@/components/ui/sonner';
 import { CommandPalette } from '@/components/command-palette';
 
 export const metadata: Metadata = {
-  title: 'HireSignal',
-  description: 'Personal AI job matcher',
+  title: 'HireMe',
+  description: 'Personal AI job assistant — auto-apply to LinkedIn & Naukri jobs tailored to your profile',
 };
 
 export default function RootLayout({

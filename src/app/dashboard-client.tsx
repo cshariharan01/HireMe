@@ -133,6 +133,39 @@ function Dashboard() {
   // just to read `.length` was two full payloads for two integers.
   const { freshCount, appliedCount } = useDashboardStats();
 
+  // Job Mode — Smart Apply (score ≥ threshold) vs Apply All (no score filter). Persisted in DB.
+  const [jobMode, setJobModeState] = useState<'smart' | 'all'>('smart');
+  const [scoreThreshold, setScoreThreshold] = useState(60);
+  const [jobModeLoaded, setJobModeLoaded] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/profile/apply-mode')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.mode === 'smart' || d.mode === 'all') setJobModeState(d.mode);
+        if (typeof d.threshold === 'number') setScoreThreshold(d.threshold);
+        setJobModeLoaded(true);
+      })
+      .catch(() => setJobModeLoaded(true));
+  }, []);
+
+  const setJobMode = useCallback(async (mode: 'smart' | 'all') => {
+    setJobModeState(mode);
+    try {
+      await fetch('/api/profile/apply-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, threshold: scoreThreshold }),
+      });
+      // Refresh matches to apply the new score filter
+      await refreshMatches();
+    } catch {
+      toast.error('Failed to save mode');
+    }
+  }, [scoreThreshold, refreshMatches]);
+
+
+
   const [refreshing, setRefreshing] = useState(false);
   type SortKey = 'score' | 'eval' | 'recent' | 'company' | 'location';
   const [sortBy, setSortBy] = useState<SortKey>('score');
@@ -752,6 +785,68 @@ function Dashboard() {
       </div>
 
       {/* Filter toolbar — full width, separate from the job list */}
+      {/* Job Mode Selection — Smart Apply vs Apply All */}
+      <div className="shrink-0 rounded-xl border bg-card p-3 shadow-soft">
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <Target className="h-4 w-4 text-primary shrink-0" />
+            <div className="min-w-0">
+              <p className="text-sm font-semibold leading-tight">Job Loading Mode</p>
+              <p className="text-[11px] text-muted-foreground">Choose which jobs to load &amp; auto-apply to</p>
+            </div>
+          </div>
+          <div className="flex gap-2 flex-wrap">
+            <button
+              id="job-mode-smart"
+              type="button"
+              onClick={() => setJobMode('smart')}
+              className={cn(
+                'flex flex-col items-start gap-0.5 rounded-lg border px-3.5 py-2.5 text-left text-sm transition-all',
+                jobMode === 'smart'
+                  ? 'border-primary bg-primary/10 text-primary ring-1 ring-primary'
+                  : 'border-border bg-muted/30 text-muted-foreground hover:border-border/80 hover:bg-muted/60'
+              )}
+            >
+              <span className="font-semibold text-xs uppercase tracking-wide flex items-center gap-1">
+                <CheckCircle2 className="h-3 w-3" /> Smart Apply
+              </span>
+              <span className="text-[11px] opacity-80">Score ≥ {scoreThreshold} — best matches only</span>
+            </button>
+            <button
+              id="job-mode-all"
+              type="button"
+              onClick={() => setJobMode('all')}
+              className={cn(
+                'flex flex-col items-start gap-0.5 rounded-lg border px-3.5 py-2.5 text-left text-sm transition-all',
+                jobMode === 'all'
+                  ? 'border-info bg-info/10 text-info ring-1 ring-info'
+                  : 'border-border bg-muted/30 text-muted-foreground hover:border-border/80 hover:bg-muted/60'
+              )}
+            >
+              <span className="font-semibold text-xs uppercase tracking-wide flex items-center gap-1">
+                <Globe2 className="h-3 w-3" /> Apply All
+              </span>
+              <span className="text-[11px] opacity-80">All matching roles — any score</span>
+            </button>
+          </div>
+          {jobMode === 'smart' && (
+            <div className="flex items-center gap-2 ml-auto shrink-0">
+              <span className="text-[11px] text-muted-foreground">Min score:</span>
+              <input
+                id="score-threshold-input"
+                type="number"
+                min={0}
+                max={100}
+                value={scoreThreshold}
+                onChange={(e) => setScoreThreshold(Number(e.target.value))}
+                onBlur={() => setJobMode('smart')}
+                className="h-7 w-16 rounded-md border border-input bg-card px-2 text-xs text-center font-mono"
+              />
+            </div>
+          )}
+        </div>
+      </div>
+
       <div className="shrink-0 space-y-2 rounded-xl border bg-card p-3 shadow-soft">
         <div className="flex flex-wrap items-center gap-2">
           {/* Dedicated Apply Mode Switcher */}

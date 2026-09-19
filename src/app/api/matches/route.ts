@@ -23,6 +23,9 @@ export async function GET(request: Request) {
       refresh: url.searchParams.get('refresh') === '1',
       limit: Math.min(Math.max(parseInt(url.searchParams.get('limit') || String(envLimit), 10) || envLimit, 1), 200),
       offset: Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0),
+      // applyScoreFilter: read apply_mode from user_settings and apply the threshold automatically.
+      // Pass apply_score_filter=0 to bypass (e.g. for the Tracker view).
+      applyScoreFilter: url.searchParams.get('apply_score_filter') !== '0',
       filters: {
         badge: norm(url.searchParams.get('badge')),
         place: norm(url.searchParams.get('place')),
@@ -42,3 +45,4 @@ export async function GET(request: Request) {
     );
   }
 }
+

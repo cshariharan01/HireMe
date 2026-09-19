@@ -24,7 +24,7 @@ export function Nav() {
           <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
             <Sparkles className="h-4 w-4" />
           </div>
-          <span className="font-semibold tracking-tight">HireSignal</span>
+          <span className="font-semibold tracking-tight">HireMe</span>
         </Link>
 
         <nav className="flex items-center gap-1 text-sm shrink-0">

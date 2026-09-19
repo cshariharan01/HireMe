@@ -33,7 +33,7 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# HireSignal data
+# HireMe data — NEVER commit (your personal job DB, resume embeddings, etc.)
 /data/
 *.db
 
@@ -55,6 +55,7 @@ LAUNCH_KIT.md
 
 # Release artifacts built locally
 hiresignal-personal-*.zip
+hireme-*.zip
 
 # Local env (contains personal API keys - never commit)
 .env

@@ -10,7 +10,7 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 
 /**
- * Database file. `HIRESIGNAL_DB` overrides it.
+ * Database file. `HIREME_DB` overrides it (legacy `HIRESIGNAL_DB` is also accepted).
  *
  * THE OVERRIDE IS A SAFETY FEATURE, and it was missing here. `scripts/prune-stale.ts` honours
  * `HIRESIGNAL_DB` because it opens its own handle, and CLAUDE.md tells you to test destructive
@@ -19,9 +19,11 @@ if (!fs.existsSync(DATA_DIR)) {
  * modified production while reporting success against the copy. Honouring it here makes that
  * instruction true for every script.
  */
-const DB_PATH = process.env.HIRESIGNAL_DB
-  ? path.resolve(process.env.HIRESIGNAL_DB)
-  : path.join(DATA_DIR, 'hiresignal.db');
+const DB_PATH = process.env.HIREME_DB
+  ? path.resolve(process.env.HIREME_DB)
+  : process.env.HIRESIGNAL_DB
+  ? path.resolve(process.env.HIRESIGNAL_DB)  // legacy compat
+  : path.join(DATA_DIR, 'hireme.db');
 
 // Reuse a single connection across Next dev recompiles. Without this guard, every server-module
 // re-evaluation opens a fresh handle and re-runs the whole schema init (CREATE TABLE ×many, the
@@ -305,6 +307,15 @@ function initDb(): Database.Database {
   -- Small key/value store for app-level metadata. Currently holds 'embedding_signature'
   -- (provider:model of the DB's embeddings) — see src/lib/embedding-signature.ts.
   CREATE TABLE IF NOT EXISTS app_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
+
+  -- User-configurable preferences (key-value store).
+  -- Includes apply_mode ('smart' | 'all') and score_threshold (default 60).
+  -- 'smart' mode: only show/apply to jobs with score >= score_threshold.
+  -- 'all' mode: show all matching jobs regardless of score.
+  CREATE TABLE IF NOT EXISTS user_settings (
     key TEXT PRIMARY KEY,
     value TEXT
   );

@@ -55,6 +55,9 @@ function relTime(s: string | null): string {
 
 export function SyncButton() {
   const { data, mutate } = useSWR<SyncStatus>('/api/sync', fetcher, { refreshInterval: (d) => (d?.running ? 1500 : 0) });
+  const { data: applyModeData } = useSWR<{ mode: string; threshold: number }>('/api/profile/apply-mode', fetcher, { dedupingInterval: 30_000 });
+  const applyMode = applyModeData?.mode ?? 'smart';
+  const applyThreshold = applyModeData?.threshold ?? 60;
   const [menuOpen, setMenuOpen] = useState(false);
   const [starting, setStarting] = useState(false);
   const wasRunning = useRef(false);
@@ -239,6 +242,16 @@ export function SyncButton() {
 
       <div className="text-[11px] tabular text-muted-foreground">
         {data ? `${data.counts.active.toLocaleString()} active · ${data.counts.evaluated} rated` : '…'}
+      </div>
+
+      {/* Apply Mode Badge */}
+      <div className={cn(
+        'inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide w-fit',
+        applyMode === 'smart'
+          ? 'border-primary/30 bg-primary/10 text-primary'
+          : 'border-info/30 bg-info/10 text-info'
+      )}>
+        {applyMode === 'smart' ? `Smart ≥${applyThreshold}` : 'Apply All'}
       </div>
 
       {/* Platform Buttons */}

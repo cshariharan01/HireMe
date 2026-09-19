@@ -43,7 +43,7 @@ interface EmbeddingsInfo {
 }
 
 const KIND_OPTIONS: Array<{ value: ProviderKind; label: string; hint: string; needsKey: boolean; needsBaseUrl: boolean; keyOptional?: boolean }> = [
-  { value: 'gemini', label: 'Google Gemini', hint: 'Free tier requires GEMINI_API_KEY from Google AI Studio', needsKey: true, needsBaseUrl: false },
+  { value: 'gemini', label: 'Google Gemini', hint: '✅ Free tier — 1,500 req/day, no billing. Get key at aistudio.google.com/apikey', needsKey: true, needsBaseUrl: false },
   { value: 'freeway', label: 'Freeway (NVIDIA Cloud)', hint: 'Generous free tier — recommended for quick setup. Free key from build.nvidia.com', needsKey: true, needsBaseUrl: false, keyOptional: true },
   { value: 'openai', label: 'OpenAI (GPT-4o, o3-mini)', hint: 'Requires paid OpenAI API key', needsKey: true, needsBaseUrl: false },
   { value: 'anthropic', label: 'Anthropic Claude', hint: 'Requires paid Anthropic API key', needsKey: true, needsBaseUrl: false },
@@ -78,7 +78,7 @@ export default function SettingsPage() {
   }>({
     kind: 'gemini',
     display_name: 'Google Gemini',
-    model: 'gemini-1.5-flash',
+    model: 'gemini-2.0-flash',
     base_url: '',
     api_key: '',
   });
@@ -88,7 +88,7 @@ export default function SettingsPage() {
 
   const onKindChange = (kind: ProviderKind) => {
     const defaults: Record<ProviderKind, { display_name: string; model: string; base_url: string }> = {
-      gemini: { display_name: 'Google Gemini', model: 'gemini-1.5-flash', base_url: '' },
+      gemini: { display_name: 'Google Gemini', model: 'gemini-2.0-flash', base_url: '' },
       freeway: { display_name: 'Freeway (NVIDIA Cloud)', model: 'nvidia/nemotron-3-super-120b-a12b:free', base_url: '' },
       openai: { display_name: 'OpenAI', model: 'gpt-4o-mini', base_url: '' },
       anthropic: { display_name: 'Anthropic Claude', model: 'claude-3-5-haiku-20241022', base_url: '' },
@@ -419,11 +419,16 @@ export default function SettingsPage() {
               <CardTitle className="text-base font-medium">Provider Selection Guide</CardTitle>
             </CardHeader>
             <CardContent className="space-y-2 text-sm">
+              <div className="rounded-md border border-success/30 bg-success/5 p-2.5 text-xs text-success">
+                <strong>Recommended for sharing:</strong> Google Gemini free tier — 1,500 req/day, no credit card needed.
+                {' '}<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer" className="underline">Get free key →</a>
+              </div>
               <ol className="list-decimal list-inside text-muted-foreground space-y-2.5">
                 <li>If a provider here is <strong>active</strong>, it&apos;s used for every LLM call.</li>
                 <li>If <strong>none</strong> is active, the runtime falls back to env-based selection: <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono">GEMINI_API_KEY</code> &gt; <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono">ANTHROPIC_API_KEY</code> &gt; Ollama.</li>
                 <li>Only one provider can be active at a time. Activating a new one deactivates the others.</li>
                 <li>Search-grounded company briefs only work with Gemini. Other providers use training-data-only mode for that feature.</li>
+                <li>Ollama (local models) is optional — install only if you want fully offline operation.</li>
               </ol>
             </CardContent>
           </Card>

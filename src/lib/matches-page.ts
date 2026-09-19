@@ -9,6 +9,17 @@ import { getRankedMatches, type RankedMatch, INDIA_LOCATIONS_REGEX } from '@/lib
 import { normalizeLocationLabel } from '@/lib/score';
 import db from '@/lib/db';
 
+/** Reads the user's apply mode + score threshold from user_settings. */
+export function getApplyMode(): { mode: 'smart' | 'all'; threshold: number } {
+  try {
+    const mode = (db.prepare("SELECT value FROM user_settings WHERE key = 'apply_mode'").get() as { value: string } | undefined)?.value as 'smart' | 'all' ?? 'smart';
+    const threshold = parseInt((db.prepare("SELECT value FROM user_settings WHERE key = 'score_threshold'").get() as { value: string } | undefined)?.value ?? '60', 10);
+    return { mode, threshold };
+  } catch {
+    return { mode: 'smart', threshold: 60 };
+  }
+}
+
 export interface CandidatePreferences {
   yearsOfExperience: number;
   targetRoles: string[];
@@ -63,11 +74,19 @@ interface Filters {
   platform: string | null;
   q: string | null;
   includeApplied?: boolean;
+  /** Minimum score (0-100). Jobs below this threshold are excluded when Smart Apply mode is on. */
+  minScore?: number | null;
 }
 
 function matchesFilters(m: RankedMatch, f: Filters, prefs: CandidatePreferences): boolean {
   // Hide applied jobs from active dashboard feed by default (they live in the Tracker)
   if (!f.includeApplied && (m.applied || m.applicationStatus)) {
+    return false;
+  }
+
+  // Smart Apply mode: exclude jobs below the score threshold.
+  // minScore is 0-100 (e.g. 60); m.score is also 0-100.
+  if (f.minScore != null && m.score < f.minScore) {
     return false;
   }
 
@@ -185,6 +204,8 @@ export interface MatchesPageOptions {
   limit?: number;
   offset?: number;
   filters?: Partial<Filters>;
+  /** When true, apply score threshold from user_settings (Smart Apply mode). */
+  applyScoreFilter?: boolean;
 }
 
 export type { Filters };
@@ -197,6 +218,16 @@ export function defaultPageLimit(): number {
 export function buildMatchesPage(o: MatchesPageOptions = {}) {
   const limit = Math.min(Math.max(o.limit ?? defaultPageLimit(), 1), 200);
   const offset = Math.max(o.offset ?? 0, 0);
+
+  // Resolve apply mode: only when caller explicitly passes applyScoreFilter: true.
+  // The API route (/api/matches) always sets this; direct calls (tests, server render) don't
+  // apply the threshold by default so they see the full pool.
+  let resolvedMinScore: number | null = o.filters?.minScore ?? null;
+  if (o.applyScoreFilter === true) {
+    const { mode, threshold } = getApplyMode();
+    if (mode === 'smart') resolvedMinScore = threshold;
+  }
+
   const filters: Filters = {
     badge: o.filters?.badge ?? null,
     place: o.filters?.place ?? null,
@@ -205,6 +236,7 @@ export function buildMatchesPage(o: MatchesPageOptions = {}) {
     platform: o.filters?.platform ?? null,
     q: o.filters?.q ?? null,
     includeApplied: !!o.includeApplied,
+    minScore: resolvedMinScore,
   };
 
   const result = getRankedMatches({
