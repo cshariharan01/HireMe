@@ -1,38 +1,42 @@
-﻿# HireSignal — Personal Job Assistant
+# HireMe — Personal AI Job Assistant
 
-Your AI-powered job matching and auto-apply assistant. Runs 100% on your own laptop.
-No cloud, no shared accounts, no subscription fees.
-
----
-
-## Quick Start (Windows)
-
-1. **Install Node.js** if you haven't already:
-   → https://nodejs.org (download the **LTS** version)
-
-2. **Double-click `start.bat`**
-   - First launch installs everything automatically (~2 minutes)
-   - The app opens at http://localhost:3000
-
-3. **Upload your resume** (PDF, Word, or LaTeX)
-
-4. **Get your free AI key** at https://aistudio.google.com/apikey
-   - Sign in with Google → "Create API key" → copy it
-   - Paste it in the app under Settings → Add Provider → Gemini
-
-5. **Log into LinkedIn** (for job ingestion + Easy Apply):
-   - In the terminal, run: `npm run login:naukri` for Naukri
-   - LinkedIn login is handled automatically when you first use Apply
+Your AI-powered job matching and auto-apply assistant. Runs 100% on your own laptop.  
+No cloud, no shared accounts, no subscription fees. Each person uses their own profile & API key.
 
 ---
 
-## Quick Start (Mac / Linux)
+## ⚡ Quick Start
 
+### Step 1 — Install Node.js (one-time)
+Download the **LTS** version from https://nodejs.org and install it.
+
+### Step 2 — Get a Free Gemini API Key (one-time)
+1. Go to https://aistudio.google.com/apikey
+2. Sign in with Google → click **"Create API key"** → copy it
+3. You'll paste it into the app in Step 4 (no billing required, 1500 requests/day free)
+
+### Step 3 — Run the App
+
+**Windows** — double-click `start.bat`
+
+**Mac / Linux** — open Terminal and run:
 ```bash
 bash start.sh
 ```
 
-Then open http://localhost:3000
+> First launch takes ~2 minutes to install dependencies. After that it opens instantly.
+
+The app opens automatically at **http://localhost:3000**
+
+### Step 4 — First-Time Setup (the app guides you)
+
+The app shows a setup banner with 3 steps:
+
+1. **Add your Gemini API key** → click "Add Key" → Settings → Google Gemini → paste your key → Save
+2. **Upload your resume** → PDF, Word, or plain text → the AI reads and understands it
+3. **Run a Full sync** → fetches fresh jobs from LinkedIn & Naukri matched to YOUR profile
+
+That's it — your personalised job matches appear automatically!
 
 ---
 
@@ -40,32 +44,49 @@ Then open http://localhost:3000
 
 | Feature | Description |
 |---|---|
-| **Job Matching** | Ingests jobs from LinkedIn & Naukri, scores them against your profile |
-| **AI Resume Tailoring** | Rewrites your resume for each job using your actual experience |
-| **Auto-Apply** | Fills LinkedIn Easy Apply forms automatically |
-| **Kanban Tracker** | Tracks all your applications in one place |
+| **Smart Job Matching** | Scores every job against your resume — shows your best fits first |
+| **AI Resume Tailoring** | Rewrites your resume for each specific job |
+| **Auto-Apply** | Fills LinkedIn Easy Apply & Naukri forms automatically |
+| **Job Mode** | Smart Apply (score ≥ 60) or Apply All — your choice |
+| **Application Tracker** | Kanban board tracks all your applications |
+| **Cover Letters** | AI generates a tailored cover letter per job |
 
 ---
 
 ## Requirements
 
-- Node.js 18+ (https://nodejs.org)
-- Your own free Gemini API key (https://aistudio.google.com/apikey)
-- Chrome browser (for LinkedIn/Naukri login sessions)
+- **Node.js 18+** → https://nodejs.org
+- **Free Gemini API key** → https://aistudio.google.com/apikey
+- **Chrome browser** (used automatically for login sessions)
 
 ---
 
 ## Stopping the App
 
-Press **Ctrl+C** in the terminal window where `start.bat` / `start.sh` is running.
+Press **Ctrl+C** in the terminal / command prompt window.
 
 ---
 
-## Your Data
+## Your Data — Stays on Your Computer
 
-Everything stays on your computer:
-- Your resume → `data/hiresignal.db`
-- Your Chrome session → `data/playwright/`
-- Your API keys → `data/hiresignal.db` (encrypted)
+Everything is stored locally, nothing is sent to any external server except:
+- AI API calls to Google Gemini (using **your own key**)
+- Job scraping from LinkedIn & Naukri (reading public job listings)
 
-None of this is ever sent to any external server (except the AI API calls you configure).
+| What | Where |
+|---|---|
+| Your resume & job matches | `data/hireme.db` |
+| Your browser session | `data/playwright/` |
+| Your API keys | Stored in `data/hireme.db` (on your machine only) |
+
+---
+
+## Updating to the Latest Version
+
+```bash
+git pull
+start.bat   # (or bash start.sh)
+```
+
+Dependencies update automatically on next launch.
+
