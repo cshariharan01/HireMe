@@ -41,11 +41,11 @@ fi
 mkdir -p data/playwright
 
 # Open browser after delay
-(sleep 10 && open http://localhost:3000 2>/dev/null || \
-  xdg-open http://localhost:3000 2>/dev/null || true) &
+(sleep 10 && open http://localhost:3001 2>/dev/null || \
+  xdg-open http://localhost:3001 2>/dev/null || true) &
 
 echo ""
-echo " Starting HireMe at http://localhost:3000"
+echo " Starting HireMe at http://localhost:3001"
 echo " Press Ctrl+C to stop."
 echo ""
-npm run dev
+npm run dev -- --port 3001
