@@ -197,7 +197,7 @@ const FIELD_RULES: FieldRule[] = [
       (p.streetAddress as string) ||
       (p.address as string) ||
       (p.location as string)?.split(',')[0]?.trim() ||
-      'Madurai',
+      null,
   },
   {
     label: 'City',
@@ -210,7 +210,7 @@ const FIELD_RULES: FieldRule[] = [
     resolve: (p) =>
       (p.city as string) ||
       (p.location as string)?.split(',')[0]?.trim() ||
-      'Madurai',
+      null,
   },
   {
     label: 'State',

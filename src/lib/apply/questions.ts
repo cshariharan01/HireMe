@@ -9,9 +9,9 @@
 // Every answer flows back into the library so the second time we see the same
 // question (across companies) we hit the cache.
 
-import { createHash } from 'crypto';
 import db from '../db';
 import { primaryGenerate } from '../llm';
+import { screeningOwnerId, hashScreeningQuestion, ensureScreeningOwner } from './screening-owner';
 
 export type QuestionCategory =
   | 'work_auth'         // "Are you authorized to work in X?"
@@ -67,14 +67,9 @@ export interface AnswerResult {
   questionHash: string;
 }
 
-// Normalize question text for hashing — lowercase, collapse whitespace, strip punctuation.
-function normalizeQuestion(q: string): string {
-  return q.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
-}
-
-function hashQuestion(q: string): string {
-  return createHash('sha256').update(normalizeQuestion(q)).digest('hex').slice(0, 24);
-}
+// Question hashing is profile-scoped — see ./screening-owner. A hash written by one
+// profile must never match a lookup from another, so a new user starts fresh instead
+// of inheriting the previous owner's cached answers.
 
 /**
  * Normalizes common Indian and international city names and aliases/typos.
@@ -153,8 +148,11 @@ export function matchCityResidenceQuestion(
 
   if (!cleanedTarget) return null;
 
-  // Extract candidate city
-  const candLoc = candidateLocation || 'Madurai, India';
+  // Extract candidate city. Empty/unknown location means we cannot verify a
+  // residence claim — return null so the caller answers from the profile (or
+  // leaves it manual) instead of guessing from a hardcoded hometown.
+  const candLoc = (candidateLocation || '').trim();
+  if (!candLoc) return null;
   const candCityRaw = candLoc.split(',')[0].trim();
   const candNormalized = normalizeCityName(candCityRaw);
 
@@ -243,48 +241,49 @@ function answerFromDefaults(
       return `${days} days`;
     }
     case 'current_salary': {
-      if (/monthly|per\s*month/i.test(question)) {
-        const annual = (profile.currentCtcInr as number) ?? 700000;
-        return String(Math.round(annual / 12));
-      }
-      if (/lpa|lakh/i.test(question)) return '7';
-      if (/inr|in inr|in ₹|rupees|ctc/i.test(question)) {
-        return String((profile.currentCtcInr as number) ?? defaults.currentSalary ?? 700000);
-      }
-      return defaults.currentSalary || String((profile.currentCtcInr as number) ?? '700000');
+      // Profile-only: never invent compensation for a user who hasn't provided it.
+      // null falls through to the answer cache, then the LLM, then manual entry.
+      const numericDefault =
+        defaults.currentSalary != null && /^\d+$/.test(defaults.currentSalary.trim())
+          ? Number(defaults.currentSalary.trim())
+          : undefined;
+      const ctc = (profile.currentCtcInr as number | undefined) ?? numericDefault;
+      if (ctc == null) return defaults.currentSalary || null;
+      if (/monthly|per\s*month/i.test(question)) return String(Math.round(ctc / 12));
+      if (/lpa|lakh/i.test(question)) return String(Math.round(ctc / 100000));
+      if (/inr|in inr|in ₹|rupees|ctc/i.test(question)) return String(ctc);
+      return defaults.currentSalary || String(ctc);
     }
     case 'salary': {
-      if (/monthly|per\s*month/i.test(question)) {
-        const annual = (profile.expectedCtcInr as number) ?? 1200000;
-        return String(Math.round(annual / 12));
-      }
-      if (/lpa|lakh/i.test(question)) return '12';
-      if (/inr|in inr|in ₹|rupees|ctc/i.test(question)) {
-        const targets = (profile.targets as Record<string, unknown>) || {};
-        const min = (profile.expectedCtcInr as number | undefined) ?? (targets.comp_min as number | undefined) ?? 1200000;
-        return String(min);
-      }
-      if (defaults.expectedSalary) return defaults.expectedSalary;
       const targets = (profile.targets as Record<string, unknown>) || {};
-      const min = (profile.expectedCtcInr as number | undefined) ?? (targets.comp_min as number | undefined) ?? 1200000;
-      return String(min);
+      const ctc =
+        (profile.expectedCtcInr as number | undefined) ??
+        (targets.comp_min as number | undefined);
+      if (ctc == null) return defaults.expectedSalary || null;
+      if (/monthly|per\s*month/i.test(question)) return String(Math.round(ctc / 12));
+      if (/lpa|lakh/i.test(question)) return String(Math.round(ctc / 100000));
+      if (/inr|in inr|in ₹|rupees|ctc/i.test(question)) return String(ctc);
+      if (defaults.expectedSalary) return defaults.expectedSalary;
+      return String(ctc);
     }
     case 'street':
-      return (profile.street as string) || (profile.address as string) || 'Madurai';
+      return (profile.street as string) || (profile.address as string) || null;
     case 'state':
-      return (profile.state as string) || (profile.province as string) || 'Tamil Nadu';
+      return (profile.state as string) || (profile.province as string) || null;
     case 'country':
-      return (profile.country as string) || 'India';
-    case 'zipcode':
-      return String(profile.zipCode ?? profile.pincode ?? profile.postalCode ?? '625001');
+      return (profile.country as string) || null;
+    case 'zipcode': {
+      const zip = profile.zipCode ?? profile.pincode ?? profile.postalCode;
+      return zip != null ? String(zip) : null;
+    }
     case 'portfolio':
-      return (profile.portfolioUrl as string) || defaults.portfolioUrl || 'https://github.com/cshariharan01';
+      return (profile.portfolioUrl as string) || defaults.portfolioUrl || null;
     case 'dob':
-      return (profile.dateOfBirth as string) || defaults.dateOfBirth || '2001-05-15';
+      return (profile.dateOfBirth as string) || defaults.dateOfBirth || null;
     case 'start_date':
       return defaults.startDate || (defaults.noticePeriodDays === 0 ? 'Immediately' : null);
     case 'location': {
-      const candidateLocation = (profile.location as string) || (defaults.workAuth?.IN ? 'Madurai, India' : '');
+      const candidateLocation = (profile.location as string) || '';
       const cityResidence = matchCityResidenceQuestion(question, candidateLocation);
       if (cityResidence) return cityResidence.answer;
       return (profile.location as string) || null;
@@ -363,7 +362,9 @@ export async function answerScreeningQuestion(
   ctx: QuestionContext,
   defaults: ApplyDefaults = {},
 ): Promise<AnswerResult> {
-  const hash = hashQuestion(question);
+  const ownerId = screeningOwnerId(profile);
+  ensureScreeningOwner(ownerId);
+  const hash = hashScreeningQuestion(question, ownerId);
   const category = classifyQuestion(question);
 
   // 1. Defaults-based (no LLM cost, always honors current profile/settings)

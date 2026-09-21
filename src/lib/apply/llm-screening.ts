@@ -1,29 +1,33 @@
 import fs from 'fs';
 import path from 'path';
-import { createHash } from 'crypto';
 import type { CandidateProfile } from './platform';
 import db from '../db';
 import { primaryGenerate } from '../llm';
+import { screeningOwnerId, hashScreeningQuestion, ensureScreeningOwner } from './screening-owner';
 
-const CACHE_FILE_PATH = path.join(process.cwd(), 'data', 'screening-answers.json');
-
-// Memory cache backed by data/screening-answers.json
-let screeningCache: Record<string, string> | null = null;
-
-function hashQuestion(q: string): string {
-  const norm = q.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
-  return createHash('sha256').update(norm).digest('hex').slice(0, 24);
+// Overridable for tests so suites never touch the real data dir.
+function cacheFilePath(): string {
+  return process.env.SCREENING_CACHE_PATH || path.join(process.cwd(), 'data', 'screening-answers.json');
 }
 
-function getStoredAnswerFromDb(questionText: string): string | null {
+// Memory cache backed by the JSON file (keyed per-profile by email — see below).
+let screeningCache: Record<string, string> | null = null;
+let screeningCachePath: string | null = null;
+
+/** Test-only: drop the memoized JSON cache (e.g. after re-pointing the path). */
+export function __resetScreeningCache(): void {
+  screeningCache = null;
+  screeningCachePath = null;
+}
+
+function getStoredAnswerFromDb(questionText: string, ownerId: string): string | null {
   try {
-    const qHash = hashQuestion(questionText);
-    const normQ = questionText.trim().toLowerCase();
+    const qHash = hashScreeningQuestion(questionText, ownerId);
     const row = db.prepare(`
       SELECT answer FROM screening_answers
-      WHERE question_hash = ? OR lower(question) = ?
+      WHERE question_hash = ?
       ORDER BY last_used_at DESC LIMIT 1
-    `).get(qHash, normQ) as { answer: string } | undefined;
+    `).get(qHash) as { answer: string } | undefined;
     if (row?.answer && row.answer.trim()) return row.answer.trim();
   } catch {
     // ignore DB error
@@ -31,9 +35,9 @@ function getStoredAnswerFromDb(questionText: string): string | null {
   return null;
 }
 
-function saveAnswerToDb(questionText: string, answerText: string, category: string = 'llm'): void {
+function saveAnswerToDb(questionText: string, answerText: string, ownerId: string, category: string = 'llm'): void {
   try {
-    const qHash = hashQuestion(questionText);
+    const qHash = hashScreeningQuestion(questionText, ownerId);
     db.prepare(`
       INSERT INTO screening_answers (question_hash, question, answer, category, used_count, last_used_at)
       VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
@@ -48,27 +52,31 @@ function saveAnswerToDb(questionText: string, answerText: string, category: stri
 }
 
 function loadCache(): Record<string, string> {
-  if (screeningCache) return screeningCache;
+  const cachePath = cacheFilePath();
+  if (screeningCache && screeningCachePath === cachePath) return screeningCache;
   try {
-    if (fs.existsSync(CACHE_FILE_PATH)) {
-      const content = fs.readFileSync(CACHE_FILE_PATH, 'utf-8');
+    if (fs.existsSync(cachePath)) {
+      const content = fs.readFileSync(cachePath, 'utf-8');
       screeningCache = JSON.parse(content);
+      screeningCachePath = cachePath;
       return screeningCache!;
     }
   } catch {
     // ignore read error
   }
   screeningCache = {};
+  screeningCachePath = cachePath;
   return screeningCache;
 }
 
 function saveCache(cache: Record<string, string>) {
   try {
-    const dir = path.dirname(CACHE_FILE_PATH);
+    const cachePath = cacheFilePath();
+    const dir = path.dirname(cachePath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(CACHE_FILE_PATH, JSON.stringify(cache, null, 2), 'utf-8');
+    fs.writeFileSync(cachePath, JSON.stringify(cache, null, 2), 'utf-8');
   } catch (err) {
     console.warn('[llm-screening] Failed to save answer cache:', err);
   }
@@ -77,7 +85,7 @@ function saveCache(cache: Record<string, string>) {
 /**
  * Uses LLM (primaryGenerate) to resolve custom, qualitative, or multiline screening questions.
  * Works with ANY configured provider (Gemini, Freeway, OpenAI, Groq, Anthropic, Ollama).
- * Checks SQLite screening_answers database FIRST (respecting user edits made in /settings).
+ * Checks the profile-scoped SQLite screening_answers cache FIRST.
  */
 export async function resolveScreeningQuestionWithGemini(
   label: string,
@@ -88,8 +96,13 @@ export async function resolveScreeningQuestionWithGemini(
   const normLabel = label.trim();
   if (!normLabel) return null;
 
+  // Profile-scoped cache: a new user (different email/name) never sees the
+  // previous owner's stored answers, and the previous owner's rows are wiped.
+  const ownerId = screeningOwnerId(profile as Record<string, unknown>);
+  ensureScreeningOwner(ownerId);
+
   // 1. Check user-configured / edited answers in database table `screening_answers`
-  const dbAnswer = getStoredAnswerFromDb(normLabel);
+  const dbAnswer = getStoredAnswerFromDb(normLabel, ownerId);
   if (dbAnswer) {
     if (options.length > 0) {
       const matchedOpt = options.find((o) => o.trim().toLowerCase() === dbAnswer.toLowerCase())
@@ -100,9 +113,8 @@ export async function resolveScreeningQuestionWithGemini(
     }
   }
 
-  // 2. Check JSON disk cache
-  const profileId = profile.email || profile.name || 'default';
-  const cacheKey = `${normLabel.toLowerCase()}::${profileId}`;
+  // 2. Check JSON disk cache (also per-profile: key includes the owner id)
+  const cacheKey = `${normLabel.toLowerCase()}::${ownerId}`;
 
   const cache = loadCache();
   if (cache[cacheKey]) {
@@ -173,8 +185,9 @@ Respond ONLY with the exact choice string from the list. Do not add markdown or 
     }
 
     if (responseText) {
-      // Save to both SQLite DB (so it shows in /settings) and JSON cache
-      saveAnswerToDb(normLabel, responseText);
+      // Save to both SQLite DB and the per-profile JSON cache, so the NEXT
+      // application by THIS user reuses it without another LLM call.
+      saveAnswerToDb(normLabel, responseText, ownerId);
       cache[cacheKey] = responseText;
       saveCache(cache);
       return responseText;

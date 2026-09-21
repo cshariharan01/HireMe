@@ -11,7 +11,6 @@ import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 import { AutoApplySettingsCard } from '@/components/auto-apply-settings-card';
-import { ScreeningAnswersCard } from '@/components/screening-answers-card';
 
 type ProviderKind = 'gemini' | 'openai' | 'anthropic' | 'openai-compatible' | 'ollama' | 'freeway';
 
@@ -193,7 +192,7 @@ export default function SettingsPage() {
           Settings
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Configure LLM providers, auto-apply controls, and screening answers.
+          Configure LLM providers and auto-apply controls.
         </p>
       </div>
 
@@ -395,9 +394,6 @@ export default function SettingsPage() {
 
           {/* 3. Auto-apply Controls */}
           <AutoApplySettingsCard />
-
-          {/* 4. Standalone Screening Answers Library */}
-          <ScreeningAnswersCard />
         </div>
 
         {/* Right 1 Column: Help & Guidance */}
