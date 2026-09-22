@@ -7,7 +7,7 @@ import { extractJdKeywords, matchKeywordsInText, type JdKeyword } from './jd-key
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
 const OLLAMA_CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || 'llama3.2';
 const ANTHROPIC_MODEL_ENV = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
-const GEMINI_MODEL_ENV = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+const GEMINI_MODEL_ENV = process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest';
 const GEMINI_CREATIVE_MODEL_ENV = process.env.GEMINI_CREATIVE_MODEL || 'gemini-2.5-pro';
 /** Where the creative lane lands when Pro is rate-limited or unavailable. Verified working. */
 const GEMINI_CREATIVE_FALLBACK_MODEL = process.env.GEMINI_CREATIVE_FALLBACK_MODEL || 'gemini-3.6-flash';

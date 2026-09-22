@@ -304,6 +304,22 @@ export async function detectNaukriCaptcha(page: Page): Promise<boolean> {
  * Detect if login is required (login modal or redirect).
  */
 export async function detectNaukriLoginRequired(page: Page): Promise<boolean> {
+  // Check URL for login page patterns
+  try {
+    const url = page.url();
+    if (
+      url.includes('/login') ||
+      url.includes('/signin') ||
+      url.includes('/auth') ||
+      url.includes('/nlogin') ||
+      url.includes('login.naukri.com')
+    ) {
+      return true;
+    }
+  } catch {
+    // ignore
+  }
+
   // Naukri shows a login / continue with google button when not authenticated
   try {
     const loginBtn = page.locator(
@@ -315,6 +331,58 @@ export async function detectNaukriLoginRequired(page: Page): Promise<boolean> {
   } catch {
     // ignore
   }
+  return false;
+}
+
+/**
+ * Wait for the user to complete login on the Naukri login page.
+ * Polls for login completion by checking if login buttons disappear and job content appears.
+ */
+export async function waitForNaukriLogin(
+  page: Page,
+  maxWaitMs = 120_000
+): Promise<boolean> {
+  const start = Date.now();
+  console.log('[naukri] Waiting for user to complete login...');
+
+  while (Date.now() - start < maxWaitMs) {
+    // Check if login is no longer required
+    const loginRequired = await detectNaukriLoginRequired(page);
+    if (!loginRequired) {
+      // Login appears complete - verify we're not on a login page
+      const url = page.url();
+      console.log(`[naukri] Login buttons gone, current URL: ${url}`);
+      // Accept any non-login URL as success (Naukri may redirect to various pages after login)
+      const isLoginPage = url.includes('/login') || url.includes('/signin') || url.includes('/auth') || url.includes('/nlogin') || url.includes('login.naukri.com');
+      if (!isLoginPage) {
+        console.log('[naukri] Login completed successfully');
+        return true;
+      }
+      console.log('[naukri] Login buttons gone but still on login page, waiting...');
+    }
+
+    // Check for CAPTCHA
+    if (await detectNaukriCaptcha(page)) {
+      console.warn('[naukri] CAPTCHA detected during login wait');
+      return false;
+    }
+
+    // Check if application was submitted (edge case)
+    if (await detectNaukriApplicationSubmitted(page)) {
+      console.log('[naukri] Application already submitted');
+      return true;
+    }
+
+    // Log progress every 15 seconds
+    const elapsed = Math.floor((Date.now() - start) / 1000);
+    if (elapsed % 15 === 0 && elapsed > 0) {
+      console.log(`[naukri] Still waiting for login... (${elapsed}s elapsed, URL: ${page.url()})`);
+    }
+
+    await page.waitForTimeout(3000);
+  }
+
+  console.warn('[naukri] Login wait timed out');
   return false;
 }
 
@@ -1423,26 +1491,57 @@ export async function naukriApply(opts: {
     ctx = await launchApplyBrowser(BROWSER_PROFILE_DIR, { focus: true });
 
     const page = ctx.pages()[0] || (await ctx.newPage());
+
+    // Wait for page to fully stabilize (handle Naukri redirect loops on login page)
     await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
     try { await page.bringToFront(); } catch {}
     bringWindowToFront('Chrome');
-    await page.waitForTimeout(3500);
+
+    // Extended stabilization: wait for network idle and no rapid navigations
+    await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+    await page.waitForTimeout(5000);
+
+    // Detect redirect loops (page URL changing rapidly)
+    let lastUrl = page.url();
+    let redirectCount = 0;
+    for (let i = 0; i < 6; i++) {
+      await page.waitForTimeout(2000);
+      const currentUrl = page.url();
+      if (currentUrl !== lastUrl) {
+        redirectCount++;
+        lastUrl = currentUrl;
+        console.log(`[naukri] Redirect detected (${redirectCount}): ${currentUrl}`);
+      }
+    }
+    if (redirectCount >= 3) {
+      console.warn('[naukri] Possible redirect loop detected, proceeding anyway');
+    }
 
     // Wait for page content to settle
-    await page.locator('button, a, input').first().waitFor({ state: 'attached', timeout: 10_000 }).catch(() => {});
+    await page.locator('button, a, input').first().waitFor({ state: 'attached', timeout: 15_000 }).catch(() => {});
 
     // Safety: login check
     if (await detectNaukriLoginRequired(page)) {
       try { await page.bringToFront(); } catch {}
       bringWindowToFront('Chrome');
-      ctx = null; // Leave browser open so user can log in
-      return {
-        status: 'login_required',
-        filledFields: [],
-        resumeAttached: false,
-        stepCount: 0,
-        error: 'Naukri login required. Please log into your Naukri account in the Chrome window.',
-      };
+
+      // Wait for user to complete login (up to 2 minutes)
+      const loginCompleted = await waitForNaukriLogin(page, 120_000);
+      if (!loginCompleted) {
+        ctx = null; // Leave browser open
+        return {
+          status: 'login_required',
+          filledFields: [],
+          resumeAttached: false,
+          stepCount: 0,
+          error: 'Naukri login required. Please log into your Naukri account in the Chrome window. If the page keeps reloading, try logging in manually first.',
+        };
+      }
+
+      // Login completed - wait for page to stabilize again
+      await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
+      await page.waitForTimeout(3000);
+      await page.locator('button, a, input').first().waitFor({ state: 'attached', timeout: 15_000 }).catch(() => {});
     }
 
     // Safety: CAPTCHA check

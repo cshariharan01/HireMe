@@ -87,7 +87,7 @@ export default function SettingsPage() {
 
   const onKindChange = (kind: ProviderKind) => {
     const defaults: Record<ProviderKind, { display_name: string; model: string; base_url: string }> = {
-      gemini: { display_name: 'Google Gemini', model: 'gemini-2.0-flash', base_url: '' },
+      gemini: { display_name: 'Google Gemini', model: 'gemini-1.5-flash-latest', base_url: '' },
       freeway: { display_name: 'Freeway (NVIDIA Cloud)', model: 'nvidia/nemotron-3-super-120b-a12b:free', base_url: '' },
       openai: { display_name: 'OpenAI', model: 'gpt-4o-mini', base_url: '' },
       anthropic: { display_name: 'Anthropic Claude', model: 'claude-3-5-haiku-20241022', base_url: '' },
