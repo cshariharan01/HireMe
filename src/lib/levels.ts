@@ -49,7 +49,7 @@ export function toLevelsSlug(companyName: string): string {
 let sharedBrowser: Browser | null = null;
 async function getBrowser(): Promise<Browser> {
   if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
-  sharedBrowser = await chromium.launch({ headless: true });
+  sharedBrowser = await chromium.launch({ headless: true, channel: 'chrome' }).catch(() => chromium.launch({ headless: true }));
   return sharedBrowser;
 }
 

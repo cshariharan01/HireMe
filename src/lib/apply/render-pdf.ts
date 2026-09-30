@@ -12,7 +12,7 @@ export async function renderResumePdf(markdown: string, customFilename?: string)
 
   let browser: Browser | null = null;
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, channel: 'chrome' }).catch(() => chromium.launch({ headless: true }));
     const ctx = await browser.newContext();
     const page = await ctx.newPage();
     await page.setContent(fullHtml, { waitUntil: 'load' });

@@ -36,7 +36,7 @@ export async function crawlCareersPage(url: string, opts: CrawlOptions = {}): Pr
   } else {
     // Lazy import so module load stays free.
     const { chromium } = await import('playwright');
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, channel: 'chrome' }).catch(() => chromium.launch({ headless: true }));
   }
   try {
     const context = await browser.newContext({
