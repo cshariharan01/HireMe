@@ -12,7 +12,7 @@ import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/compone
 import { ScoreBadge } from '@/components/ui/score-badge';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
-import { useApplications, type Application } from '@/lib/hooks';
+import { useApplications, useProfile, type Application } from '@/lib/hooks';
 import { useDebouncedValue } from '@/lib/use-debounce';
 import { CoverLetterView } from '@/components/cover-letter-view';
 
@@ -45,7 +45,10 @@ function isStale(app: Application): boolean {
 }
 
 export default function TrackerPage() {
-  const { applications, isLoading, refresh } = useApplications();
+  const [viewScope, setViewScope] = useState<'active' | 'all'>('active');
+  const { applications, activeOwner, isLoading, refresh } = useApplications(viewScope === 'all' ? 'all' : undefined);
+  const { profile } = useProfile();
+  const candidateName = profile?.name || profile?.email || 'Active Profile';
   const [expanded, setExpanded] = useState<number | null>(null);
   const [query, setQuery] = useState('');
   const debouncedQuery = useDebouncedValue(query, 200);
@@ -84,7 +87,7 @@ export default function TrackerPage() {
   // Automatically calculate tailored fit scores in the background for any application that doesn't have one yet
   useEffect(() => {
     const unscored = applications.filter(
-      (a) => Boolean(a.has_tailored_resume) && a.tailored_score == null && a.job_id && !scoringQueueRef.current.has(a.job_id)
+      (a) => a.resume_source !== 'original' && Boolean(a.has_tailored_resume) && a.tailored_score == null && a.job_id && !scoringQueueRef.current.has(a.job_id)
     );
     if (unscored.length === 0) return;
 
@@ -274,7 +277,7 @@ export default function TrackerPage() {
     const a = document.createElement('a');
     const url = URL.createObjectURL(blob);
     a.href = url;
-    a.download = `hiresignal-applications-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `hireme-applications-${new Date().toISOString().slice(0, 10)}.csv`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -346,14 +349,29 @@ export default function TrackerPage() {
     <div className="space-y-8">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h1 className="text-3xl font-semibold tracking-tight">Tracker</h1>
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <h1 className="text-3xl font-semibold tracking-tight">Tracker</h1>
+            <Badge variant="outline" className="gap-1.5 py-1 px-2.5 text-xs font-normal border-primary/30 bg-primary/5 text-primary">
+              <User2 className="h-3.5 w-3.5 text-primary" />
+              {candidateName}
+            </Badge>
+          </div>
           <p className="mt-1 text-sm text-muted-foreground">
             {applications.length === 0
-              ? 'Applications you send will appear here.'
+              ? `No applications yet for ${candidateName}. Applications you send will appear here.`
               : `${applications.length} application${applications.length === 1 ? '' : 's'} across ${COLUMNS.length} stages.`}
           </p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          <Button
+            variant={viewScope === 'all' ? 'secondary' : 'outline'}
+            size="sm"
+            onClick={() => setViewScope(viewScope === 'all' ? 'active' : 'all')}
+            className="text-xs h-9"
+            title={viewScope === 'all' ? 'Showing all profiles — click for active only' : 'Showing active profile only — click to view all'}
+          >
+            {viewScope === 'all' ? 'Showing All Profiles' : 'Active Profile Only'}
+          </Button>
           {applications.length > 0 && (
             <div className="flex items-center gap-2 flex-1 sm:max-w-md">
               <div className="relative flex-1">
@@ -417,14 +435,21 @@ export default function TrackerPage() {
           <CardContent className="p-12 text-center space-y-3">
             <ListChecks className="mx-auto h-8 w-8 text-muted-foreground" />
             <div className="space-y-1">
-              <p className="font-medium">No applications yet</p>
+              <p className="font-medium">No applications yet for {candidateName}</p>
               <p className="text-sm text-muted-foreground">
-                Apply to a match and it will appear here. Generating a cover letter on its own doesn&apos;t count as applying.
+                Apply to a match from your feed and it will appear here. Applications are kept separate for each candidate profile.
               </p>
             </div>
-            <Button asChild size="sm">
-              <Link href="/">Back to matches</Link>
-            </Button>
+            <div className="flex items-center justify-center gap-2 pt-2">
+              <Button asChild size="sm">
+                <Link href="/">Back to matches</Link>
+              </Button>
+              {viewScope !== 'all' && (
+                <Button variant="outline" size="sm" onClick={() => setViewScope('all')}>
+                  View all profiles&apos; applications
+                </Button>
+              )}
+            </div>
           </CardContent>
         </Card>
       ) : (
@@ -594,38 +619,73 @@ export default function TrackerPage() {
                                   follow-up
                                 </Badge>
                               )}
-                              {Boolean(app.has_tailored_resume) && (
-                                <div className="flex items-center gap-1">
-                                  <Badge variant="success" className="px-1 py-0 text-[10px] font-normal gap-0.5">
-                                    <FileText className="h-2.5 w-2.5" />
-                                    tailored
-                                  </Badge>
-                                  {app.tailored_score != null ? (
-                                    <span
-                                      className={cn(
-                                        'inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-semibold tabular',
-                                        app.tailored_score >= 55
-                                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30'
-                                          : app.tailored_score >= 40
-                                          ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30'
-                                          : 'bg-muted text-muted-foreground border border-border',
-                                      )}
-                                      title={`Tailored résumé match score: ${Math.round(app.tailored_score)}% against JD${app.default_score != null ? ` (original: ${Math.round(app.default_score)}%)` : ''}`}
-                                    >
-                                      <Sparkles className="h-2.5 w-2.5" />
-                                      {Math.round(app.tailored_score)}% match
-                                    </span>
-                                  ) : (
-                                    <span
-                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium text-muted-foreground bg-muted/60 border border-border"
-                                      title="Calculating tailored match score in background..."
-                                    >
-                                      <Loader2 className="h-2.5 w-2.5 animate-spin text-primary" />
-                                      evaluating...
-                                    </span>
+
+                              {/* Résumé Badges & Match Scores */}
+                              {app.resume_source === 'original' ? (
+                                <div
+                                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium text-muted-foreground bg-muted/60 border border-border"
+                                  title="Applied using your original PDF résumé"
+                                >
+                                  <FileText className="h-2.5 w-2.5 text-muted-foreground" />
+                                  <span>Applied via Original Resume</span>
+                                  {app.default_score != null && (
+                                    <span className="font-semibold ml-0.5">({Math.round(app.default_score)}% match)</span>
                                   )}
                                 </div>
+                              ) : (
+                                <>
+                                  {/* Original Match Score (calculated with candidate's default resume) */}
+                                  {app.default_score != null && (
+                                    <div
+                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium text-muted-foreground bg-muted/60 border border-border"
+                                      title={`Original match score calculated with your default résumé: ${Math.round(app.default_score)}%`}
+                                    >
+                                      <ScoreBadge score={app.default_score / 100} size="sm" />
+                                      <span className="font-semibold">{Math.round(app.default_score)}% match</span>
+                                    </div>
+                                  )}
+
+                                  {/* Tailored Resume Score & Lift */}
+                                  {Boolean(app.has_tailored_resume) && (
+                                    <div className="flex items-center gap-1">
+                                      <Badge variant="success" className="px-1 py-0 text-[10px] font-normal gap-0.5">
+                                        <FileText className="h-2.5 w-2.5" />
+                                        tailored
+                                      </Badge>
+                                      {app.tailored_score != null ? (
+                                        <span
+                                          className={cn(
+                                            'inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-semibold tabular',
+                                            app.tailored_score >= 55
+                                              ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30'
+                                              : app.tailored_score >= 40
+                                              ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/30'
+                                              : 'bg-muted text-muted-foreground border border-border',
+                                          )}
+                                          title={`Tailored résumé match score: ${Math.round(app.tailored_score)}% against JD${app.default_score != null ? ` (original: ${Math.round(app.default_score)}%, lift: ${app.tailored_score >= app.default_score ? '+' : ''}${Math.round(app.tailored_score - app.default_score)} pts)` : ''}`}
+                                        >
+                                          <Sparkles className="h-2.5 w-2.5 text-primary" />
+                                          {Math.round(app.tailored_score)}%
+                                          {app.default_score != null && app.tailored_score !== app.default_score && (
+                                            <span className={cn('font-bold ml-0.5', app.tailored_score > app.default_score ? 'text-emerald-600 dark:text-emerald-400' : 'text-destructive')}>
+                                              ({app.tailored_score > app.default_score ? '+' : ''}{Math.round(app.tailored_score - app.default_score)})
+                                            </span>
+                                          )}
+                                        </span>
+                                      ) : (
+                                        <span
+                                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium text-muted-foreground bg-muted/60 border border-border"
+                                          title="Calculating tailored match score in background..."
+                                        >
+                                          <Loader2 className="h-2.5 w-2.5 animate-spin text-primary" />
+                                          evaluating...
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+                                </>
                               )}
+
                               {app.recruiter_name && (
                                 <span className="flex items-center gap-0.5 normal-nums">
                                   <User2 className="h-3 w-3" />
@@ -636,13 +696,30 @@ export default function TrackerPage() {
 
                             {isExpanded && (
                               <div className="pt-2 space-y-2 border-t border-border/60" onClick={(e) => e.stopPropagation()}>
-                                {Boolean(app.has_tailored_resume) && (
-                                  <div className="rounded-md border p-2.5 bg-muted/30 space-y-1.5">
+                                {app.resume_source === 'original' ? (
+                                  <div className="rounded-md border p-3 bg-muted/30 space-y-1.5">
+                                    <div className="flex items-center gap-1.5">
+                                      <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+                                      <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                                        Application Résumé
+                                      </p>
+                                    </div>
+                                    <p className="text-xs text-foreground/80">
+                                      Applied using your <span className="font-semibold text-foreground">Original PDF</span> résumé.
+                                      {app.default_score != null && (
+                                        <span className="ml-1 text-muted-foreground">
+                                          (Match score: <span className="font-semibold">{Math.round(app.default_score)}%</span>)
+                                        </span>
+                                      )}
+                                    </p>
+                                  </div>
+                                ) : Boolean(app.has_tailored_resume) && (
+                                  <div className="rounded-md border p-3 bg-muted/30 space-y-2">
                                     <div className="flex items-center justify-between">
                                       <div className="flex items-center gap-1.5">
                                         <Sparkles className="h-3.5 w-3.5 text-primary" />
                                         <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                                          Tailored Résumé Match Score
+                                          Application Effort (Score Lift)
                                         </p>
                                       </div>
                                       <Button
@@ -662,37 +739,51 @@ export default function TrackerPage() {
                                     </div>
 
                                     {app.tailored_score != null ? (
-                                      <div className="flex items-center gap-3 pt-0.5">
-                                        <ScoreBadge score={app.tailored_score / 100} size="md" />
-                                        <div className="min-w-0 flex-1">
-                                          <div className="flex items-center gap-1.5 flex-wrap">
-                                            <span className="text-xs font-semibold text-foreground">
-                                              {Math.round(app.tailored_score)}% fit against job description
-                                            </span>
-                                            {app.default_score != null && (
-                                              <span className="text-[11px] text-muted-foreground flex items-center gap-1">
-                                                <span>(original: {Math.round(app.default_score)}%)</span>
-                                                {app.tailored_score !== app.default_score && (
-                                                  <span
-                                                    className={cn(
-                                                      'font-semibold',
-                                                      app.tailored_score > app.default_score
-                                                        ? 'text-emerald-600 dark:text-emerald-400'
-                                                        : 'text-destructive',
-                                                    )}
-                                                  >
-                                                    {app.tailored_score > app.default_score
-                                                      ? `▲ +${Math.round(app.tailored_score - app.default_score)} pts lift`
-                                                      : `▼ ${Math.round(app.tailored_score - app.default_score)} pts`}
-                                                  </span>
-                                                )}
-                                              </span>
-                                            )}
+                                      <div className="space-y-2 pt-0.5">
+                                        <div className="flex flex-wrap items-center gap-3">
+                                          {/* Default / Original Match Score */}
+                                          {app.default_score != null && (
+                                            <div className="flex items-center gap-2 rounded-lg border bg-background px-3 py-1.5 shadow-2xs">
+                                              <ScoreBadge score={app.default_score / 100} size="sm" />
+                                              <div>
+                                                <p className="text-[10px] uppercase font-semibold text-muted-foreground">Default Résumé</p>
+                                                <p className="text-xs font-semibold tabular">{Math.round(app.default_score)}% match</p>
+                                              </div>
+                                            </div>
+                                          )}
+
+                                          {/* Arrow & Tailored Match Score */}
+                                          {app.default_score != null && (
+                                            <span className="text-muted-foreground font-semibold">→</span>
+                                          )}
+
+                                          <div className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 shadow-2xs">
+                                            <ScoreBadge score={app.tailored_score / 100} size="sm" />
+                                            <div>
+                                              <p className="text-[10px] uppercase font-semibold text-emerald-700 dark:text-emerald-400">Tailored Résumé</p>
+                                              <p className="text-xs font-semibold tabular text-emerald-700 dark:text-emerald-300">
+                                                {Math.round(app.tailored_score)}% match
+                                              </p>
+                                            </div>
                                           </div>
-                                          <p className="text-[11px] text-muted-foreground mt-0.5">
-                                            Score re-evaluated using the AI-tailored résumé against the employer's job description.
-                                          </p>
+
+                                          {/* Score Lift Badge */}
+                                          {app.default_score != null && app.tailored_score !== app.default_score && (
+                                            <Badge
+                                              variant={app.tailored_score > app.default_score ? 'success' : 'destructive'}
+                                              className="text-xs py-1 px-2.5 font-semibold gap-1"
+                                            >
+                                              {app.tailored_score > app.default_score ? '▲' : '▼'}
+                                              {Math.abs(Math.round(app.tailored_score - app.default_score))} pts lift
+                                            </Badge>
+                                          )}
                                         </div>
+
+                                        <p className="text-[11px] text-muted-foreground">
+                                          {app.default_score != null
+                                            ? `Calculated against your default profile résumé (${Math.round(app.default_score)}%). AI tailoring improved the match score by ${app.tailored_score >= app.default_score ? '+' : ''}${Math.round(app.tailored_score - app.default_score)} pts to ${Math.round(app.tailored_score)}%.`
+                                            : `Score evaluated using the AI-tailored résumé against the employer's job description.`}
+                                        </p>
                                       </div>
                                     ) : (
                                       <div className="flex items-center gap-2 py-1 text-[11px] text-muted-foreground">
@@ -703,22 +794,20 @@ export default function TrackerPage() {
                                   </div>
                                 )}
                                 {app.cover_letter && (
-                                  <div>
-                                    <div className="flex items-center justify-between mb-1">
-                                      <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                                        Cover letter
-                                      </p>
-                                      <button
-                                        type="button"
-                                        onClick={() => setCoverLetterModal({ text: app.cover_letter!, company: app.company, title: app.title })}
-                                        className="text-[10px] text-primary hover:underline font-medium"
-                                      >
-                                        View full letter
-                                      </button>
-                                    </div>
-                                    <p className="text-xs text-foreground/80 line-clamp-3">
-                                      {app.cover_letter.slice(0, 180)}…
+                                  <div className="flex items-center justify-between py-1 border-t border-border/40">
+                                    <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground flex items-center gap-1">
+                                      <FileText className="h-3 w-3 text-primary" />
+                                      Cover letter
                                     </p>
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="sm"
+                                      onClick={() => setCoverLetterModal({ text: app.cover_letter!, company: app.company, title: app.title })}
+                                      className="h-6 text-[10px] px-2 gap-1"
+                                    >
+                                      View cover letter
+                                    </Button>
                                   </div>
                                 )}
 
@@ -801,65 +890,90 @@ export default function TrackerPage() {
                                 </div>
 
                                 {app.has_tailored_resume ? (
-                                  <div className="grid grid-cols-2 gap-1.5 pt-1">
-                                    <Button
-                                      asChild
-                                      variant="outline"
-                                      size="sm"
-                                      className="h-7 text-[11px] px-2 justify-center gap-1 min-w-0"
-                                      title="View AI-tailored résumé"
-                                    >
-                                      <a
-                                        href={`/api/jobs/${app.job_id}/resume.pdf?source=tailored`}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="flex items-center justify-center gap-1 min-w-0 w-full"
-                                      >
-                                        <Sparkles className="h-3 w-3 text-primary shrink-0" />
-                                        <span className="truncate font-medium">Tailored</span>
-                                        <ExternalLink className="h-2.5 w-2.5 text-muted-foreground shrink-0" />
-                                      </a>
-                                    </Button>
-                                    <Button
-                                      asChild
-                                      variant="outline"
-                                      size="sm"
-                                      className="h-7 text-[11px] px-2 justify-center gap-1 min-w-0 text-muted-foreground hover:text-foreground"
-                                      title="View original un-tailored résumé"
-                                    >
-                                      <a
-                                        href={`/api/jobs/${app.job_id}/resume.pdf?source=original`}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="flex items-center justify-center gap-1 min-w-0 w-full"
-                                      >
-                                        <FileText className="h-3 w-3 shrink-0" />
-                                        <span className="truncate font-medium">Original</span>
-                                        <ExternalLink className="h-2.5 w-2.5 text-muted-foreground shrink-0" />
-                                      </a>
-                                    </Button>
+                                  <div className="space-y-1 pt-1">
+                                    <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground flex items-center justify-between">
+                                      <span>Résumé</span>
+                                      <span>View / Download</span>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-1.5">
+                                      <div className="flex items-center justify-between border rounded-md px-2 py-1 bg-background text-[11px]">
+                                        <span className="flex items-center gap-1 font-medium truncate min-w-0">
+                                          <Sparkles className="h-3 w-3 text-primary shrink-0" />
+                                          <span className="truncate">Tailored</span>
+                                        </span>
+                                        <div className="flex items-center gap-1 shrink-0 ml-1">
+                                          <a
+                                            href={`/api/jobs/${app.job_id}/resume.pdf?source=tailored`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="p-1 text-info hover:bg-accent rounded"
+                                            title="View Tailored Résumé in new tab"
+                                          >
+                                            <ExternalLink className="h-3 w-3" />
+                                          </a>
+                                          <a
+                                            href={`/api/jobs/${app.job_id}/resume.pdf?source=tailored`}
+                                            download={`${app.company.replace(/[^a-z0-9]+/gi, '_')}_Tailored_Resume.pdf`}
+                                            className="p-1 text-muted-foreground hover:text-foreground hover:bg-accent rounded"
+                                            title="Download Tailored Résumé PDF"
+                                          >
+                                            <Download className="h-3 w-3" />
+                                          </a>
+                                        </div>
+                                      </div>
+
+                                      <div className="flex items-center justify-between border rounded-md px-2 py-1 bg-background text-[11px]">
+                                        <span className="flex items-center gap-1 font-medium truncate min-w-0">
+                                          <FileText className="h-3 w-3 text-muted-foreground shrink-0" />
+                                          <span className="truncate">Original</span>
+                                        </span>
+                                        <div className="flex items-center gap-1 shrink-0 ml-1">
+                                          <a
+                                            href={`/api/jobs/${app.job_id}/resume.pdf?source=original`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="p-1 text-info hover:bg-accent rounded"
+                                            title="View Original Résumé in new tab"
+                                          >
+                                            <ExternalLink className="h-3 w-3" />
+                                          </a>
+                                          <a
+                                            href={`/api/jobs/${app.job_id}/resume.pdf?source=original`}
+                                            download={`${app.company.replace(/[^a-z0-9]+/gi, '_')}_Original_Resume.pdf`}
+                                            className="p-1 text-muted-foreground hover:text-foreground hover:bg-accent rounded"
+                                            title="Download Original Résumé PDF"
+                                          >
+                                            <Download className="h-3 w-3" />
+                                          </a>
+                                        </div>
+                                      </div>
+                                    </div>
                                   </div>
                                 ) : (
-                                  <div className="pt-1">
-                                    <Button
-                                      asChild
-                                      variant="outline"
-                                      size="sm"
-                                      className="h-7 w-full text-xs justify-start px-2 gap-1.5 min-w-0"
-                                    >
+                                  <div className="flex items-center justify-between border rounded-md px-2.5 py-1 bg-background text-xs pt-1">
+                                    <span className="flex items-center gap-1.5 font-medium truncate">
+                                      <FileText className="h-3.5 w-3.5 text-primary shrink-0" />
+                                      <span className="truncate">Original Résumé</span>
+                                    </span>
+                                    <div className="flex items-center gap-1 shrink-0">
                                       <a
                                         href={`/api/jobs/${app.job_id}/resume.pdf?source=original`}
                                         target="_blank"
                                         rel="noopener noreferrer"
-                                        className="flex items-center justify-between min-w-0 w-full"
+                                        className="p-1 text-info hover:bg-accent rounded flex items-center gap-1 text-[11px]"
+                                        title="View Résumé in new tab"
                                       >
-                                        <span className="flex items-center gap-1.5 truncate">
-                                          <FileText className="h-3 w-3 text-primary shrink-0" />
-                                          <span className="truncate">View résumé</span>
-                                        </span>
-                                        <ExternalLink className="h-3 w-3 text-muted-foreground shrink-0" />
+                                        <ExternalLink className="h-3 w-3" /> View
                                       </a>
-                                    </Button>
+                                      <a
+                                        href={`/api/jobs/${app.job_id}/resume.pdf?source=original`}
+                                        download={`${app.company.replace(/[^a-z0-9]+/gi, '_')}_Resume.pdf`}
+                                        className="p-1 text-muted-foreground hover:text-foreground hover:bg-accent rounded flex items-center gap-1 text-[11px]"
+                                        title="Download Résumé PDF"
+                                      >
+                                        <Download className="h-3 w-3" /> Download
+                                      </a>
+                                    </div>
                                   </div>
                                 )}
 

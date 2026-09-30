@@ -38,13 +38,32 @@ const TECH_VOCAB = [
   'SSO', 'WebSocket', 'webhook', 'API Gateway',
   // ML / AI
   'PyTorch', 'TensorFlow', 'scikit-learn', 'Hugging Face', 'LLM', 'RAG',
-  'embeddings', 'vector database', 'fine-tuning',
+  'embeddings', 'vector database', 'fine-tuning', 'Agentic AI', 'Foundation Models', 'Generative AI',
   // Methodology
   'Agile', 'Scrum', 'Kanban', 'SDLC', 'TDD', 'BDD', 'pair programming',
+  // Business Analysis & Product
+  'Business Analysis', 'Business Requirements', 'Requirement Gathering', 'BRD', 'FRD', 'User Stories',
+  'UAT', 'User Acceptance Testing', 'Product Management', 'Product Analyst', 'Process Documentation',
+  'Stakeholder Management', 'Change Management', 'Jira', 'Confluence',
+  // Risk, Audit, Controls & Analytics
+  'Risk Assessment', 'Risk Advisory', 'Risk Analytics', 'Internal Controls', 'Control Automation',
+  'Audit', 'Compliance', 'Data Analytics', 'Root Cause Analysis', 'GAP Analysis', 'KPI Tracking',
+  'MIS', 'Power BI', 'Tableau', 'Excel',
   // Security / compliance buckets non-healthcare
   'SOC 2', 'ISO 27001', 'GDPR', 'PCI DSS', 'penetration testing', 'OWASP',
-  // Testing
+  // QA & Testing
+  'Quality Assurance', 'QA Engineer', 'Manual Testing', 'Functional Testing', 'Regression Testing',
+  'API Testing', 'Postman', 'RestAssured', 'JMeter', 'Performance Testing', 'Test Cases', 'Bug Tracking',
   'Jest', 'Cypress', 'Playwright', 'Selenium', 'JUnit', 'Mockito', 'pytest',
+  // Technical Support & Helpdesk
+  'Technical Support', 'IT Support', 'Helpdesk', 'L1 Support', 'L2 Support', 'L3 Support',
+  'Incident Management', 'Troubleshooting', 'SLA Management', 'ServiceNow', 'Zendesk', 'ITIL',
+  // System Engineering, Infrastructure & Networking
+  'System Engineer', 'System Administration', 'Sysadmin', 'Infrastructure Support', 'Local Infra Support',
+  'Network Configuration', 'Networking', 'TCP/IP', 'DNS', 'DHCP', 'VPN', 'Firewall', 'Cisco',
+  'Routers & Switches', 'Windows Server', 'Active Directory', 'Virtualization', 'VMware', 'Hyper-V',
+  // Data Science & Python Ecosystem
+  'Data Analyst', 'Data Science', 'Pandas', 'NumPy', 'Scikit-Learn', 'Statistical Analysis', 'Python Developer',
 ];
 
 // Combined master vocabulary; ontology terms are scored higher (they're domain-specific).

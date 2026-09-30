@@ -93,7 +93,8 @@ function classifyJob(title: string, description: string, location: string) {
 const DATA_DIR = path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, 'hiresignal.db'));
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(DATA_DIR, 'hireme.db');
+const db = new Database(DB_PATH);
 sqliteVec.load(db);
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
@@ -129,7 +130,7 @@ const insertStmt = db.prepare(`
     apply_type = excluded.apply_type
 `);
 
-const HOURS = parseInt(process.env.JOBSPY_HOURS || '168', 10) || 168;
+const HOURS = parseInt(process.env.JOBSPY_HOURS || '24', 10) || 24;
 const WANTED = parseInt(process.env.JOBSPY_WANTED || '25', 10) || 25;
 const SITES = (process.env.JOBSPY_SITES || 'linkedin').split(',').map((s) => s.trim()).filter(Boolean);
 const LOCATIONS = (process.env.JOBSPY_LOCATIONS || 'India,Remote').split(',').map((s) => s.trim()).filter(Boolean);

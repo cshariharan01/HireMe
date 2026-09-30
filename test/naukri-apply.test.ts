@@ -10,7 +10,10 @@ import {
   closeNaukriChatbotDrawer,
   detectNaukriApplicationSubmitted,
   answerCheckboxQuestion,
+  answerRadioQuestion,
   matchCityResidenceQuestion,
+  extractNaukriDOMConstraints,
+  answerTextQuestion,
 } from '@/lib/apply/naukri';
 
 /**
@@ -93,8 +96,11 @@ class FakePage {
     return new FakeLocator({ present: isPresent, text });
   }
 
-  async evaluate<T>(_fn: () => T): Promise<T> {
-    return this.bodyText as unknown as T;
+  async evaluate<T>(_fn: unknown, _arg?: unknown): Promise<T> {
+    if (this.presentSelectors.some((s) => /contenteditable|input|textarea|send/i.test(s))) {
+      return true as unknown as T;
+    }
+    return (this.bodyText || true) as unknown as T;
   }
 
   async goto(url: string): Promise<void> {
@@ -213,6 +219,7 @@ describe('Naukri chatbot text question resolution (resolveChatbotTextAnswer)', (
     currentCtcInr: 700000,
     expectedCtcInr: 1200000,
     portfolioUrl: 'https://github.com/cshariharan01',
+    education: ['B.E. Computer Science and Engineering'],
     experience: ['Software Engineer at Solartis Technology (Jan 2022 – Present)'],
   };
 
@@ -243,13 +250,13 @@ describe('Naukri chatbot text question resolution (resolveChatbotTextAnswer)', (
   it('answers current CTC in LPA format', () => {
     const q = 'What is your current CTC in LPA?';
     const answer = resolveChatbotTextAnswer(q, profile);
-    expect(answer).toBe('7.0 LPA');
+    expect(answer).toBe('7');
   });
 
   it('answers expected CTC in LPA format', () => {
     const q = 'What is your expected CTC?';
     const answer = resolveChatbotTextAnswer(q, profile);
-    expect(answer).toBe('12.0 LPA');
+    expect(answer).toBe('12');
   });
 
   it('answers notice period in days when requested in days', () => {
@@ -424,6 +431,122 @@ describe('Naukri multi-select checkbox answering (answerCheckboxQuestion)', () =
       location: 'Bengaluru',
     };
     const result = await answerCheckboxQuestion(page as never, 'Which is your preferred location?', profile as never);
+    expect(result).toBe(true);
+  });
+});
+
+describe('Naukri radio question answering (answerRadioQuestion)', () => {
+  const profile = {
+    name: 'Hariharan Subramaniyan',
+    email: 'cshariharan2001@gmail.com',
+    phone: '6383827363',
+    location: 'Madurai, India',
+    yearsOfExperience: 4,
+  };
+
+  it('answers "Yes" for "Will you attend the walk-in?" question', async () => {
+    const page = new FakePage({ presentSelectors: ['ssrc__label'] });
+    const result = await answerRadioQuestion(
+      page as never,
+      'Will you attend the walk-in?',
+      profile as never,
+      ['Yes', 'No']
+    );
+    expect(result).toBe(true);
+  });
+
+  it('answers "Yes" for "Are you willing to work in night shifts?" question', async () => {
+    const page = new FakePage({ presentSelectors: ['ssrc__label'] });
+    const result = await answerRadioQuestion(
+      page as never,
+      'Are you willing to work in night shifts?',
+      profile as never,
+      ['Yes', 'No']
+    );
+    expect(result).toBe(true);
+  });
+
+  it('answers "No" for ex-employee questions', async () => {
+    const page = new FakePage({ presentSelectors: ['ssrc__label'] });
+    const result = await answerRadioQuestion(
+      page as never,
+      'Are you an ex-employee of Infosys?',
+      profile as never,
+      ['Yes', 'No']
+    );
+    expect(result).toBe(true);
+  });
+
+  it('answers experience range matching candidate YOE', async () => {
+    const page = new FakePage({ presentSelectors: ['ssrc__label'] });
+    const result = await answerRadioQuestion(
+      page as never,
+      'How many years of experience do you have in Python?',
+      profile as never,
+      ['< 3 years', '3-5 years', '5+ years']
+    );
+    expect(result).toBe(true);
+  });
+});
+
+describe('Naukri DOM constraints and Gemini screening engine', () => {
+  const profile = {
+    name: 'Hariharan Subramaniyan',
+    email: 'cshariharan2001@gmail.com',
+    phone: '6383827363',
+    location: 'Madurai, India',
+    yearsOfExperience: 4,
+    noticePeriodDays: 30,
+  };
+
+  it('extracts DOM constraints safely when page has evaluate method', async () => {
+    const page = new FakePage();
+    const constraints = await extractNaukriDOMConstraints(page as never);
+    expect(constraints).toBeDefined();
+  });
+
+  it('answers custom text questions using profile context', async () => {
+    const page = new FakePage({ presentSelectors: ['contenteditable'] });
+    const result = await answerTextQuestion(
+      page as never,
+      'Do you have experience in RPA BA and developer role ?',
+      profile as never,
+      'TechCorp'
+    );
+    expect(result).toBe(true);
+  });
+
+  it('answers "How many years of experience do you have in Business Analyst?" with clean numeric digits', async () => {
+    const ans = resolveChatbotTextAnswer('How many years of experience do you have in Business Analyst?', profile as never);
+    expect(ans).toBe('4');
+    expect(/^\d+$/.test(ans)).toBe(true);
+
+    const page = new FakePage({ presentSelectors: ['contenteditable'] });
+    const result = await answerTextQuestion(
+      page as never,
+      'How many years of experience do you have in Business Analyst?',
+      profile as never,
+      'TechCorp'
+    );
+    expect(result).toBe(true);
+  });
+
+  it('answers "What is your current CTC in Lacs per annum?" with clean Lacs format (e.g. 5.25)', async () => {
+    const profileWithDecimalCTC = {
+      ...profile,
+      currentCtcInr: 525000,
+      expectedCtcInr: 1000000,
+    };
+    const ans = resolveChatbotTextAnswer('What is your current CTC in Lacs per annum?', profileWithDecimalCTC as never);
+    expect(ans).toBe('5.25');
+
+    const page = new FakePage({ presentSelectors: ['input', 'chatbot_Input'] });
+    const result = await answerTextQuestion(
+      page as never,
+      'What is your current CTC in Lacs per annum?',
+      profileWithDecimalCTC as never,
+      'TechCorp'
+    );
     expect(result).toBe(true);
   });
 });

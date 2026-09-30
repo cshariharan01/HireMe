@@ -21,6 +21,7 @@ import { useMatches, useDashboardStats, revalidateDashboardStats, revalidateMatc
 import { useDebouncedValue } from '@/lib/use-debounce';
 import { JobDetailPanel } from '@/components/job-detail-panel';
 import { OnboardingBanner } from '@/components/onboarding-banner';
+import { useAutoApply } from '@/lib/auto-apply-context';
 
 type LocationBadge = 'india' | 'remote-global' | 'relocation' | 'visa' | 'remote-neutral' | 'us-city' | 'us-only';
 
@@ -77,7 +78,7 @@ function resolvePlatformBadge(m: Match): { label: string; variant: 'info' | 'mut
 }
 
 function isDesktop() {
-  return typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches;
+  return typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches;
 }
 
 /**
@@ -118,21 +119,6 @@ function Dashboard() {
   const [archetypeFilter, setArchetypeFilter] = useState<RoleArchetype | 'all'>('all');
   const [evalFilter, setEvalFilter] = useState<'all' | 'apply' | 'consider' | 'skip' | 'unevaluated'>('all');
 
-  const {
-    matches, hiddenCount, totalEmbedded, totalFiltered, facets, hasMore, loadingMore, loadMore,
-    noResume, error, isLoading, refresh: refreshMatches, removeMatch, updateMatchHidden,
-  } = useMatches(showHidden, {
-    badge: badgeFilter,
-    place: locationFilter,
-    archetype: archetypeFilter,
-    eval: evalFilter,
-    platform: platformFilter,
-    q: debouncedQuery.trim(),
-  });
-  // Counts only — see `useDashboardStats`. Fetching the digest ITEMS and every application row
-  // just to read `.length` was two full payloads for two integers.
-  const { freshCount, appliedCount } = useDashboardStats();
-
   // Job Mode — Smart Apply (score ≥ threshold) vs Apply All (no score filter). Persisted in DB.
   const [jobMode, setJobModeState] = useState<'smart' | 'all'>('smart');
   const [scoreThreshold, setScoreThreshold] = useState(60);
@@ -148,6 +134,23 @@ function Dashboard() {
       })
       .catch(() => setJobModeLoaded(true));
   }, []);
+
+  const {
+    matches, hiddenCount, totalEmbedded, totalFiltered, facets, hasMore, loadingMore, loadMore,
+    noResume, error, isLoading, refresh: refreshMatches, removeMatch, updateMatchHidden,
+  } = useMatches(showHidden, {
+    apply_score_filter: jobMode === 'smart' ? 1 : 0,
+    score_threshold: scoreThreshold,
+    badge: badgeFilter,
+    place: locationFilter,
+    archetype: archetypeFilter,
+    eval: evalFilter,
+    platform: platformFilter,
+    q: debouncedQuery.trim(),
+  });
+  // Counts only — see `useDashboardStats`. Fetching the digest ITEMS and every application row
+  // just to read `.length` was two full payloads for two integers.
+  const { freshCount, appliedCount } = useDashboardStats();
 
   const setJobMode = useCallback(async (mode: 'smart' | 'all') => {
     setJobModeState(mode);
@@ -221,11 +224,13 @@ function Dashboard() {
         const p = (m.sourcePlatform || m.source || '').toLowerCase();
         const u = (m.url || '').toLowerCase();
         if (platformFilter === 'linkedin') {
-          if (p !== 'linkedin' && !u.includes('linkedin.com')) return false;
+          if (u.includes('naukri.com')) return false;
+          if (!u.includes('linkedin.com') && p !== 'linkedin') return false;
         } else if (platformFilter === 'naukri') {
-          if (p !== 'naukri' && !u.includes('naukri.com')) return false;
+          if (u.includes('linkedin.com')) return false;
+          if (!u.includes('naukri.com') && p !== 'naukri') return false;
         } else if (platformFilter === 'direct') {
-          if (p === 'linkedin' || u.includes('linkedin.com') || p === 'naukri' || u.includes('naukri.com')) return false;
+          if (u.includes('linkedin.com') || u.includes('naukri.com') || p === 'linkedin' || p === 'naukri') return false;
         }
       }
       if (locationFilter !== 'all' && normalizeLocationLabel(m.location) !== locationFilter) return false;
@@ -282,10 +287,36 @@ function Dashboard() {
     return () => clearTimeout(t);
   }, [filtered]);
 
-  // Auto-select the top match on desktop when nothing is selected.
+  // Keep selection in sync with the filtered matches.
+  // 1. If no matches exist (0 jobs in dashboard), clear selection and URL parameter.
+  // 2. If matches exist, auto-select top match on desktop if nothing is selected or if previously selected job was filtered out.
   useEffect(() => {
-    if (selectedId == null && filtered.length && isDesktop()) setSelectedId(filtered[0].id);
-  }, [filtered, selectedId]);
+    if (isLoading && matches.length === 0) return;
+    if (filtered.length === 0) {
+      if (selectedId != null) {
+        setSelectedId(null);
+        try {
+          const u = new URL(window.location.href);
+          if (u.searchParams.has('job')) {
+            u.searchParams.delete('job');
+            window.history.replaceState(null, '', u.toString());
+          }
+        } catch { /* ignore */ }
+      }
+      return;
+    }
+    const hasSelected = selectedId != null && filtered.some((m) => m.id === selectedId);
+    if (!hasSelected && isDesktop()) {
+      setSelectedId(filtered[0].id);
+      try {
+        const u = new URL(window.location.href);
+        u.searchParams.set('job', String(filtered[0].id));
+        window.history.replaceState(null, '', u.toString());
+      } catch { /* ignore */ }
+    } else if (!hasSelected && !isDesktop() && selectedId != null) {
+      setSelectedId(null);
+    }
+  }, [filtered, selectedId, isLoading, matches.length]);
 
   // Memoised so `MatchRow`'s React.memo can actually skip work. As a plain function this was a new
   // object every render, which made the `handleRowSelect` useCallback below produce a new function
@@ -322,256 +353,38 @@ function Dashboard() {
     document.getElementById(`match-row-${id}`)?.scrollIntoView({ block: 'nearest' });
   }, [focusedIdx, filtered]);
 
-  type ApplyMode = 'manual' | 'auto';
-  const [applyMode, setApplyModeState] = useState<'manual' | 'auto'>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('hs_apply_mode');
-      if (saved === 'auto' || saved === 'manual') return saved;
-    }
-    return 'manual';
-  });
-
-  const setApplyMode = useCallback((mode: 'manual' | 'auto') => {
-    setApplyModeState(mode);
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('hs_apply_mode', mode);
-    }
-  }, []);
-
-  const [autoApplyRunning, setAutoApplyRunning] = useState(false);
-  const [autoApplyPaused, setAutoApplyPaused] = useState(false);
-
-  useEffect(() => {
-    if (autoApplyRunning) {
-      setApplyMode('auto');
-    }
-  }, [autoApplyRunning, setApplyMode]);
-
-  interface AutoApplyProgress {
-    current: number;
-    total: number;
-    company: string;
-    title: string;
-    stepText: string;
-  }
-  const [autoApplyProgress, setAutoApplyProgress] = useState<AutoApplyProgress | null>(null);
-  const [autoApplyStatusMessage, setAutoApplyStatusMessage] = useState<string>('');
-
-  const autoApplyStopRef = useRef(false);
-  const autoApplyPausedRef = useRef(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const {
+    applyMode,
+    setApplyMode,
+    autoApplyRunning,
+    autoApplyPaused,
+    autoApplyProgress,
+    autoApplyStatusMessage,
+    activeJobId,
+    startAutoApply: startAutoApplyRunner,
+    stopAutoApply,
+    pauseAutoApply,
+    resumeAutoApply,
+  } = useAutoApply();
 
   const currentFilteredIndex = useMemo(() => {
     if (!selectedId) return -1;
     return filtered.findIndex((m) => m.id === selectedId);
   }, [filtered, selectedId]);
 
-  const stopAutoApply = useCallback(() => {
-    autoApplyStopRef.current = true;
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
+  // Sync selected match when runner moves to next job
+  useEffect(() => {
+    if (activeJobId != null) {
+      setSelectedId(activeJobId);
+      const idx = filtered.findIndex((m) => m.id === activeJobId);
+      if (idx >= 0) setFocusedIdx(idx);
     }
-    setAutoApplyRunning(false);
-    setAutoApplyPaused(false);
-    setAutoApplyStatusMessage('');
-    setAutoApplyProgress(null);
-    void fetch('/api/apply/focus-browser', { method: 'DELETE' }).catch(() => {});
-    toast('Auto-Apply runner stopped.');
-  }, []);
+  }, [activeJobId, filtered]);
 
-  const pauseAutoApply = useCallback(() => {
-    autoApplyPausedRef.current = true;
-    setAutoApplyPaused(true);
-    toast('Auto-Apply paused.');
-  }, []);
-
-  const resumeAutoApply = useCallback(() => {
-    autoApplyPausedRef.current = false;
-    setAutoApplyPaused(false);
-    toast('Auto-Apply resumed.');
-  }, []);
-
-  const startAutoApply = useCallback(async () => {
-    if (filtered.length === 0) {
-      toast.error('No matched jobs in the current list to apply');
-      return;
-    }
-    autoApplyStopRef.current = false;
-    autoApplyPausedRef.current = false;
-    setAutoApplyRunning(true);
-    setAutoApplyPaused(false);
-
-    const queue = [...filtered];
-    const totalJobs = queue.length;
+  const startAutoApply = useCallback(() => {
     const startIdx = currentFilteredIndex >= 0 ? currentFilteredIndex : 0;
-    toast.success(`Starting Auto-Apply queue from job ${startIdx + 1} of ${totalJobs}...`);
-
-    for (let i = startIdx; i < queue.length; i++) {
-      if (autoApplyStopRef.current) break;
-
-      while (autoApplyPausedRef.current) {
-        if (autoApplyStopRef.current) break;
-        await new Promise((r) => setTimeout(r, 500));
-      }
-      if (autoApplyStopRef.current) break;
-
-      const job = queue[i];
-      setFocusedIdx(i);
-      setSelectedId(job.id);
-      try { const u = new URL(window.location.href); u.searchParams.set('job', String(job.id)); window.history.replaceState(null, '', u.toString()); } catch { /* ignore */ }
-
-      // Animated multi-stage progress description
-      const STAGES = [
-        'Analyzing job requirements & submission plan',
-        'Tailoring résumé with AI & matching skills',
-        'Opening Chrome browser & navigating to portal',
-        'Auto-filling form fields & submitting',
-      ];
-
-      const updateStageStatus = (stageIdx: number) => {
-        if (autoApplyStopRef.current) return;
-        const text = STAGES[stageIdx];
-        setAutoApplyStatusMessage(text);
-        setAutoApplyProgress({
-          current: i + 1,
-          total: totalJobs,
-          company: job.company,
-          title: job.title,
-          stepText: text,
-        });
-      };
-
-      updateStageStatus(0);
-      const stageTimeouts = [
-        setTimeout(() => updateStageStatus(1), 3500),
-        setTimeout(() => updateStageStatus(2), 8500),
-        setTimeout(() => updateStageStatus(3), 16000),
-      ];
-      const clearStageTimeouts = () => stageTimeouts.forEach(clearTimeout);
-
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
-
-      try {
-        const res = await fetch(`/api/jobs/${job.id}/apply?auto_submit=1`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ autoSubmit: true }),
-          signal: controller.signal,
-        });
-
-        clearStageTimeouts();
-        abortControllerRef.current = null;
-
-        if (autoApplyStopRef.current || res.status === 499) {
-          break;
-        }
-
-        const json = await res.json();
-
-        const isAlreadyApplied = Boolean(
-          json.alreadyApplied ||
-          json.response?.platformStatus === 'already_applied' ||
-          json.error?.toLowerCase().includes('already applied')
-        );
-
-        const isSubmitted = Boolean(
-          json.ok ||
-          json.response?.submitted ||
-          json.unconfirmed ||
-          json.readyForSubmit ||
-          json.response?.readyForSubmit ||
-          isAlreadyApplied
-        );
-
-        if (isSubmitted) {
-          removeMatch(job.id, 0);
-          setSelectedId((prev) => (prev === job.id ? null : prev));
-          revalidateApplications();
-          revalidateMatches();
-          revalidateDashboardStats();
-          revalidateDigest();
-
-          const label = isAlreadyApplied
-            ? `Already applied on platform!`
-            : `Submitted application!`;
-          const msg = `${label} Moved to Tracker. Switching to next job...`;
-          setAutoApplyStatusMessage(msg);
-          setAutoApplyProgress({
-            current: i + 1,
-            total: totalJobs,
-            company: job.company,
-            title: job.title,
-            stepText: msg,
-          });
-          toast.success(`${job.company}: ${label} Moved to Tracker.`);
-          await new Promise((r) => setTimeout(r, 2500));
-        } else if (json.stoppedForReview) {
-          revalidateApplications();
-          revalidateMatches();
-          revalidateDashboardStats();
-          revalidateDigest();
-          const msg = `Form filled in Chrome (review required). Waiting 5s before next job...`;
-          setAutoApplyStatusMessage(msg);
-          setAutoApplyProgress({
-            current: i + 1,
-            total: totalJobs,
-            company: job.company,
-            title: job.title,
-            stepText: msg,
-          });
-          toast.info(`Review required in Chrome for ${job.company}. Switching to next job...`, { duration: 4000 });
-          for (let s = 0; s < 5; s++) {
-            if (autoApplyStopRef.current) break;
-            await new Promise((r) => setTimeout(r, 1000));
-          }
-        } else {
-          const msg = `${json.error || 'Skipped'}. Switching to next job...`;
-          setAutoApplyStatusMessage(msg);
-          setAutoApplyProgress({
-            current: i + 1,
-            total: totalJobs,
-            company: job.company,
-            title: job.title,
-            stepText: msg,
-          });
-          await new Promise((r) => setTimeout(r, 2000));
-        }
-      } catch (err: any) {
-        clearStageTimeouts();
-        abortControllerRef.current = null;
-        if (err?.name === 'AbortError' || autoApplyStopRef.current) {
-          break;
-        }
-        const msg = `Error: ${err?.message || 'Application error'}. Switching to next job...`;
-        setAutoApplyStatusMessage(msg);
-        setAutoApplyProgress({
-          current: i + 1,
-          total: totalJobs,
-          company: job.company,
-          title: job.title,
-          stepText: msg,
-        });
-        await new Promise((r) => setTimeout(r, 2000));
-      }
-
-      void refreshMatches();
-    }
-
-    setAutoApplyRunning(false);
-    setAutoApplyPaused(false);
-    setAutoApplyStatusMessage('');
-    setAutoApplyProgress(null);
-    void fetch('/api/apply/focus-browser', { method: 'DELETE' }).catch(() => {});
-    revalidateApplications();
-    revalidateMatches();
-    revalidateDashboardStats();
-    revalidateDigest();
-    if (!autoApplyStopRef.current) {
-      toast.success('Auto-Apply queue finished! All jobs processed.');
-    }
-  }, [currentFilteredIndex, filtered, refreshMatches, removeMatch]);
+    startAutoApplyRunner(filtered, startIdx);
+  }, [currentFilteredIndex, filtered, startAutoApplyRunner]);
 
   const handleNextAutoApply = useCallback(() => {
     if (filtered.length === 0) return;
@@ -582,10 +395,10 @@ function Dashboard() {
       selectMatch(nextMatch);
       toast.info(`Moved to job ${nextIdx + 1} of ${filtered.length}: ${nextMatch.company}`);
     } else {
-      setAutoApplyRunning(false);
+      stopAutoApply();
       toast.success('Auto-apply queue completed! All jobs in view processed.');
     }
-  }, [currentFilteredIndex, filtered, selectMatch]);
+  }, [currentFilteredIndex, filtered, selectMatch, stopAutoApply]);
 
   const handlePrevAutoApply = useCallback(() => {
     if (filtered.length === 0) return;
@@ -773,7 +586,7 @@ function Dashboard() {
   }
 
   return (
-    <div className="flex flex-col gap-3 lg:h-[calc(100vh-4.5rem)]">
+    <div className="flex flex-col gap-3 min-h-[calc(100vh-4.5rem)] pb-6">
       {/* First-run: resume exists but no jobs yet → guide them to run a Full sync. */}
       {totalEmbedded === 0 && <OnboardingBanner hasResume jobCount={0} />}
       {/* Info strip — one compact row */}
@@ -855,7 +668,7 @@ function Dashboard() {
               type="button"
               onClick={() => {
                 setApplyMode('manual');
-                setAutoApplyRunning(false);
+                stopAutoApply();
               }}
               className={cn(
                 'rounded-md px-2.5 py-1 text-xs font-medium transition-all',
@@ -1033,23 +846,58 @@ function Dashboard() {
           </div>
         )}
         {/* chip filter groups */}
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5">
-          <div className="flex flex-wrap items-center gap-1">
-            <span className="mr-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Fit</span>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 py-1">
+          {/* FIT */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="px-2 py-0.5 rounded-md bg-primary/15 text-primary font-semibold text-[11px] tracking-wider uppercase border border-primary/25 shadow-xs shrink-0 select-none">
+              FIT
+            </span>
             {(['all', 'apply', 'consider', 'skip', 'unevaluated'] as const).map((k) => (
-              <button key={k} onClick={() => setEvalFilter(k)} className={cn('rounded-full border px-2 py-0.5 text-[11px] capitalize', evalFilter === k ? 'border-primary/40 bg-primary/10 text-foreground' : 'border-border text-muted-foreground hover:text-foreground')}>
-                {k === 'all' ? 'All' : k} <span className="tabular opacity-60">{evalCounts[k]}</span>
+              <button
+                key={k}
+                onClick={() => setEvalFilter(k)}
+                className={cn(
+                  'rounded-full border px-2.5 py-0.5 text-[11px] capitalize transition-colors',
+                  evalFilter === k
+                    ? 'border-primary/50 bg-primary/20 text-primary font-medium shadow-xs'
+                    : 'border-border text-muted-foreground hover:text-foreground hover:bg-accent/40'
+                )}
+              >
+                {k === 'all' ? 'All' : k} <span className="tabular opacity-70">{evalCounts[k]}</span>
               </button>
             ))}
           </div>
-          <div className="flex flex-wrap items-center gap-1">
-            <span className="mr-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Location</span>
+
+          <span className="text-muted-foreground/40 font-bold select-none px-0.5 hidden sm:inline">|</span>
+
+          {/* LOCATION */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="px-2 py-0.5 rounded-md bg-primary/15 text-primary font-semibold text-[11px] tracking-wider uppercase border border-primary/25 shadow-xs shrink-0 select-none">
+              LOCATION
+            </span>
             {badgeFilterOptions.map((o) => (
-              <button key={o.value} onClick={() => setBadgeFilter(o.value)} className={cn('rounded-full border px-2 py-0.5 text-[11px]', badgeFilter === o.value ? 'border-primary/40 bg-primary/10 text-foreground' : 'border-border text-muted-foreground hover:text-foreground')}>{o.label}</button>
+              <button
+                key={o.value}
+                onClick={() => setBadgeFilter(o.value)}
+                className={cn(
+                  'rounded-full border px-2.5 py-0.5 text-[11px] transition-colors',
+                  badgeFilter === o.value
+                    ? 'border-primary/50 bg-primary/20 text-primary font-medium shadow-xs'
+                    : 'border-border text-muted-foreground hover:text-foreground hover:bg-accent/40'
+                )}
+              >
+                {o.label}
+              </button>
             ))}
           </div>
-          <div className="flex flex-wrap items-center gap-1">
-            <span className="mr-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Platform</span>
+
+          <span className="text-muted-foreground/40 font-bold select-none px-0.5 hidden sm:inline">|</span>
+
+          {/* PLATFORM */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="px-2 py-0.5 rounded-md bg-primary/15 text-primary font-semibold text-[11px] tracking-wider uppercase border border-primary/25 shadow-xs shrink-0 select-none">
+              PLATFORM
+            </span>
             {platformOptions.map((o) => {
               const n = platformCounts[o.value] ?? 0;
               return (
@@ -1058,24 +906,43 @@ function Dashboard() {
                   onClick={() => setPlatformFilter(o.value)}
                   disabled={o.value !== 'all' && n === 0}
                   className={cn(
-                    'rounded-full border px-2 py-0.5 text-[11px] disabled:opacity-40',
+                    'rounded-full border px-2.5 py-0.5 text-[11px] disabled:opacity-40 transition-colors',
                     platformFilter === o.value
-                      ? 'border-primary/40 bg-primary/10 text-foreground'
-                      : 'border-border text-muted-foreground hover:text-foreground'
+                      ? 'border-primary/50 bg-primary/20 text-primary font-medium shadow-xs'
+                      : 'border-border text-muted-foreground hover:text-foreground hover:bg-accent/40'
                   )}
                 >
                   {o.label}
-                  {o.value !== 'all' && <span className="tabular opacity-60"> {n}</span>}
+                  {o.value !== 'all' && <span className="tabular opacity-70"> {n}</span>}
                 </button>
               );
             })}
           </div>
-          <div className="flex flex-wrap items-center gap-1">
-            <span className="mr-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Role</span>
+
+          <span className="text-muted-foreground/40 font-bold select-none px-0.5 hidden sm:inline">|</span>
+
+          {/* ROLE */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="px-2 py-0.5 rounded-md bg-primary/15 text-primary font-semibold text-[11px] tracking-wider uppercase border border-primary/25 shadow-xs shrink-0 select-none">
+              ROLE
+            </span>
             {archetypeOptions.map((o) => {
               const n = archetypeCounts[o.value] ?? 0;
               return (
-                <button key={o.value} onClick={() => setArchetypeFilter(o.value)} disabled={o.value !== 'all' && n === 0} className={cn('rounded-full border px-2 py-0.5 text-[11px] disabled:opacity-40', archetypeFilter === o.value ? 'border-primary/40 bg-primary/10 text-foreground' : 'border-border text-muted-foreground hover:text-foreground')}>{o.label}{o.value !== 'all' && <span className="tabular opacity-60"> {n}</span>}</button>
+                <button
+                  key={o.value}
+                  onClick={() => setArchetypeFilter(o.value)}
+                  disabled={o.value !== 'all' && n === 0}
+                  className={cn(
+                    'rounded-full border px-2.5 py-0.5 text-[11px] disabled:opacity-40 transition-colors',
+                    archetypeFilter === o.value
+                      ? 'border-primary/50 bg-primary/20 text-primary font-medium shadow-xs'
+                      : 'border-border text-muted-foreground hover:text-foreground hover:bg-accent/40'
+                  )}
+                >
+                  {o.label}
+                  {o.value !== 'all' && <span className="tabular opacity-70"> {n}</span>}
+                </button>
               );
             })}
           </div>
@@ -1087,8 +954,10 @@ function Dashboard() {
           </div>
         )}
         {savedSearches.length > 0 && (
-          <div className="flex flex-wrap items-center gap-1">
-            <span className="mr-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">Saved</span>
+          <div className="flex flex-wrap items-center gap-1.5 pt-1">
+            <span className="px-2 py-0.5 rounded-md bg-primary/15 text-primary font-semibold text-[11px] tracking-wider uppercase border border-primary/25 shadow-xs shrink-0 select-none">
+              SAVED
+            </span>
             {savedSearches.map((s) => (
               <span key={s.name} className="inline-flex items-center gap-1 rounded-full border bg-muted/50 py-0.5 pl-2 pr-1 text-[11px]">
                 <button onClick={() => applySaved(s)} className="inline-flex items-center gap-1 hover:text-foreground"><Bookmark className="h-3 w-3" />{s.name}</button>
@@ -1100,9 +969,9 @@ function Dashboard() {
       </div>
 
       {/* Two-pane: job list (left) + detail (right) */}
-      <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
+      <div className="flex flex-1 flex-col gap-3 md:flex-row min-h-[600px] lg:min-h-[650px]">
         {/* Left: list only */}
-        <div className="flex w-full flex-col overflow-hidden rounded-xl border bg-card shadow-soft lg:w-[380px] lg:shrink-0">
+        <div className="flex w-full flex-col overflow-hidden rounded-xl border bg-card shadow-soft md:w-[320px] lg:w-[380px] md:shrink-0 min-h-[500px]">
           {/* List */}
           <div className="flex-1 overflow-y-auto scroll-slim">
             {isLoading && matches.length === 0 ? (
@@ -1148,8 +1017,18 @@ function Dashboard() {
         </div>
 
         {/* Right: detail — plain scroll surface; the panel renders its own cards */}
-        <div className="hidden min-w-0 flex-1 overflow-y-auto scroll-slim pr-1 lg:block">
-          {selectedId != null ? (
+        <div className="hidden min-w-0 flex-1 overflow-y-auto scroll-slim pr-1 md:block min-h-[500px]">
+          {isLoading && matches.length === 0 ? (
+            <div className="space-y-4 p-6 rounded-xl border bg-card shadow-soft">
+              <Skeleton className="h-8 w-2/3" />
+              <Skeleton className="h-4 w-1/3" />
+              <div className="grid grid-cols-2 gap-4 mt-6">
+                <Skeleton className="h-24 w-full" />
+                <Skeleton className="h-24 w-full" />
+              </div>
+              <Skeleton className="h-48 w-full mt-4" />
+            </div>
+          ) : selectedId != null && filtered.some((m) => m.id === selectedId) ? (
             <JobDetailPanel
               jobId={selectedId}
               variant="pane"
@@ -1180,7 +1059,11 @@ function Dashboard() {
           ) : (
             <div className="flex h-full flex-col items-center justify-center gap-2 rounded-xl border bg-card text-center text-muted-foreground shadow-soft">
               <Target className="h-8 w-8" />
-              <p className="text-sm">Select a job to see the full match, evaluation, and apply options.</p>
+              <p className="text-sm">
+                {filtered.length === 0
+                  ? 'No jobs available to display.'
+                  : 'Select a job to see the full match, evaluation, and apply options.'}
+              </p>
             </div>
           )}
         </div>
@@ -1268,7 +1151,7 @@ const MatchRow = memo(function MatchRow({
         <div className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
           <span className="inline-flex items-center gap-1 font-medium text-foreground/80">
             <Clock className="h-3 w-3 text-muted-foreground/70" />
-            {formatJobAge(m.postedAt, m.ingestedAt, m.ageDays)}
+            {formatJobAge(m.postedAt, m.ingestedAt, m.ageDays, m.lastSeenAt)}
           </span>
           <span className="text-muted-foreground/30">•</span>
           {m.applyType && (

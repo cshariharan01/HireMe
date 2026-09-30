@@ -5,7 +5,7 @@ import {
   isAutofillCapableUrl,
   isLocationCompatible,
 } from './target-job-filter';
-import { getRankedMatches, type RankedMatch, INDIA_LOCATIONS_REGEX } from '@/lib/matches';
+import { getRankedMatches, type RankedMatch, INDIA_LOCATIONS_REGEX, buildFreshRankedMatches, diversify } from '@/lib/matches';
 import { normalizeLocationLabel } from '@/lib/score';
 import db from '@/lib/db';
 
@@ -33,13 +33,23 @@ export function getCandidatePreferences(): CandidatePreferences {
       | undefined;
     if (row?.parsed_json) {
       const p = JSON.parse(row.parsed_json);
-      const years = typeof p.yearsOfExperience === 'number' ? p.yearsOfExperience : 3.6;
+      const rawYears = p.yearsOfExperience ?? p.yearsExperience;
+      const numYears = typeof rawYears === 'number' && Number.isFinite(rawYears)
+        ? rawYears
+        : typeof rawYears === 'string' && !isNaN(parseFloat(rawYears))
+        ? parseFloat(rawYears)
+        : null;
+      const years = numYears != null
+        ? numYears
+        : Array.isArray(p.experience) && p.experience.length > 0
+        ? Math.min(10, Math.max(1, p.experience.length * 1.5))
+        : 3;
       const roles = Array.isArray(p.targets?.roles) ? p.targets.roles.filter(Boolean) : [];
       const locations = Array.isArray(p.targets?.locations) ? p.targets.locations.filter(Boolean) : [];
       return { yearsOfExperience: years, targetRoles: roles, targetLocations: locations };
     }
   } catch {}
-  return { yearsOfExperience: 3.6, targetRoles: [], targetLocations: [] };
+  return { yearsOfExperience: 3, targetRoles: [], targetLocations: [] };
 }
 
 export function getCandidateYears(): number {
@@ -105,7 +115,7 @@ function matchesFilters(m: RankedMatch, f: Filters, prefs: CandidatePreferences)
     !isExperienceCompatible(
       m.facts?.experienceMin,
       m.facts?.experienceMax,
-      `${m.title} ${m.url} ${m.facts?.experienceText ?? ''}`,
+      `${m.title} ${m.url} ${m.facts?.experienceText ?? ''} ${m.description || ''}`,
       prefs.yearsOfExperience,
     )
   ) {
@@ -122,7 +132,9 @@ function matchesFilters(m: RankedMatch, f: Filters, prefs: CandidatePreferences)
 
   // Never show external / apply-on-company-site jobs.
   if (m.applyType === 'external') return false;
-  if (m.sourcePlatform === 'naukri' && m.applyType !== 'direct_apply') return false;
+  const platform = getMatchPlatform(m);
+  if (platform === 'naukri' && m.applyType !== 'direct_apply') return false;
+  if (platform === 'linkedin' && m.applyType !== 'easy_apply') return false;
 
   // 4. Dynamic UI Entries: filters selected directly in the dashboard UI
   if (f.badge) {
@@ -222,10 +234,12 @@ export function buildMatchesPage(o: MatchesPageOptions = {}) {
   // Resolve apply mode: only when caller explicitly passes applyScoreFilter: true.
   // The API route (/api/matches) always sets this; direct calls (tests, server render) don't
   // apply the threshold by default so they see the full pool.
-  let resolvedMinScore: number | null = o.filters?.minScore ?? null;
+  let resolvedMinScore: number | null = null;
   if (o.applyScoreFilter === true) {
     const { mode, threshold } = getApplyMode();
-    if (mode === 'smart') resolvedMinScore = threshold;
+    if (mode === 'smart') {
+      resolvedMinScore = o.filters?.minScore ?? threshold;
+    }
   }
 
   const filters: Filters = {
@@ -249,8 +263,18 @@ export function buildMatchesPage(o: MatchesPageOptions = {}) {
 
   const prefs = getCandidatePreferences();
   const { ranked, totalEmbedded, hiddenCount } = result;
-  const facets = computeFacets(ranked, filters, prefs);
-  const filtered = ranked.filter((m) => matchesFilters(m, filters, prefs));
+
+  // Include newly-ingested jobs that haven't been incorporated into match_cache yet
+  const existingIds = new Set(ranked.map((m) => m.id));
+  const freshUncached = buildFreshRankedMatches(existingIds);
+  let pool = ranked;
+  if (freshUncached.length > 0) {
+    pool = [...freshUncached, ...ranked];
+  }
+  pool = diversify(pool);
+
+  const facets = computeFacets(pool, filters, prefs);
+  const filtered = pool.filter((m) => matchesFilters(m, filters, prefs));
 
   // Prioritize fresh jobs (ingested within 24h) at the top of the feed
   filtered.sort((a, b) => {

@@ -38,8 +38,8 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import { normalizeStoredPostedAt } from './shared/freshness';
 
-const STALE_DAYS = parseInt(process.env.STALE_DAYS || '21', 10) || 21;
-const MAX_POST_AGE_DAYS = parseInt(process.env.MAX_POST_AGE_DAYS || '180', 10) || 180;
+const STALE_DAYS = parseInt(process.env.STALE_DAYS || '14', 10) || 14;
+const MAX_POST_AGE_DAYS = parseInt(process.env.MAX_POST_AGE_DAYS || '14', 10) || 14;
 // Fraction of the active corpus the age rules may retire in one run before we treat it as a
 // pipeline failure rather than genuine churn. 0.4 = "more than 40% is not churn".
 const MAX_EXPIRY_RATIO = parseFloat(process.env.MAX_EXPIRY_RATIO || '0.4') || 0.4;
@@ -48,7 +48,7 @@ const PURGE_DAYS = parseInt(process.env.PRUNE_PURGE_DAYS || '0', 10) || 0;
 
 // HIRESIGNAL_DB lets you point this at a COPY of the database. Do that before trusting any
 // change to the expiry rules: `HIRESIGNAL_DB=/tmp/copy.db npx ts-node scripts/prune-stale.ts`.
-const DB_PATH = process.env.HIRESIGNAL_DB || path.join(process.cwd(), 'data', 'hiresignal.db');
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(process.cwd(), 'data', 'hireme.db');
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 // Per-connection, so db.ts's setting never reaches this script. NORMAL is safe under WAL and

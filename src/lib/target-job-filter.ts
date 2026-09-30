@@ -73,7 +73,9 @@ export function isSeniorityCompatible(
   if (!title) return true;
 
   if (userYears != null && userYears <= 4.5) {
-    const isHighSeniority = /\b(lead|principal|staff|architect|director|head\s+of|manager|vp)\b/i.test(title);
+    // For candidates with <= 4.5 YOE, filter out Senior titles that typically require 5+ years
+    // Only filter "Senior" alone - "Senior Data Engineer" etc where the role itself is senior-level
+    const isHighSeniority = /\b(lead|principal|staff|architect|director|head\s+of|manager|vp|sr\.?\s+(?:lead|manager|director|architect|principal))\b/i.test(title);
     if (isHighSeniority) {
       const explicitlyTargeted = targetRoles?.some((r) =>
         /\b(lead|principal|staff|architect|director|manager)\b/i.test(r),
@@ -94,39 +96,67 @@ export function isExperienceCompatible(
   experienceMin: number | null | undefined,
   experienceMax: number | null | undefined,
   fallbackText = '',
-  userYears = 3.6,
+  userYears = 3,
 ): boolean {
   const candidateYears = userYears;
+  const maxReach = candidateYears <= 4 ? candidateYears + 1.0 : candidateYears + 1.5;
 
-  // Use HireSignal's extracted values first when available.
-  if (experienceMin != null || experienceMax != null) {
-    const min = experienceMin ?? 0;
-    const max = experienceMax;
+  const checkBounds = (min: number | null | undefined, max: number | null | undefined): boolean | null => {
+    if (min == null && max == null) return null;
+    const mMin = min ?? 0;
 
-    // Clearly too senior.
-    if (min > candidateYears) return false;
+    // Clearly too senior if minimum requirement exceeds candidate reach
+    if (mMin > maxReach) return false;
 
-    // Clearly too junior, e.g. 1-2 years.
-    if (max != null && max < 3) return false;
+    // For candidate <= 4 YOE, if min > candidateYears and max != null && max >= candidateYears + 3.0 (e.g. 4-7, 4-8 yrs for 3.5 YOE candidate)
+    if (candidateYears <= 4 && mMin > candidateYears && (max == null || max >= candidateYears + 3.0)) {
+      return false;
+    }
+
+    // Clearly too junior (e.g. 0-1 or 1-2 for candidate >= 3 YOE)
+    if (max != null && max <= Math.max(1.5, candidateYears - 1.0)) return false;
 
     return true;
-  }
+  };
+
+  const initialCheck = checkBounds(experienceMin, experienceMax);
+  if (initialCheck === false) return false;
 
   // Fallback to robust parsing on text/url
   const exp = extractExperience(fallbackText, fallbackText);
   if (exp) {
-    const min = exp.min ?? 0;
-    const max = exp.max;
-
-    if (min > candidateYears) return false;
-    if (max != null && max < 3) return false;
-    return true;
+    const expCheck = checkBounds(exp.min, exp.max);
+    if (expCheck === false) return false;
   }
 
-  // No experience requirement detected.
+  // Scan text for explicit high-experience requirements (5+ years for candidate <= 4.0 YOE)
+  if (candidateYears <= 4.0 && fallbackText) {
+    const highExpMatches = fallbackText.matchAll(/\b(?:min(?:imum)?\s*(?:of\s*)?|at\s*least\s*|\+\s*)?([5-9]|1\d)\s*\+?\s*(?:years?|yrs?|yoe)(?:\s+(?:of\s+)?(?:hands-on\s+)?(?:relevant\s+)?experience)?/gi);
+    for (const m of highExpMatches) {
+      const val = parseInt(m[1], 10);
+      if (val >= 5) {
+        // Exclude company founding / history mentions or lower range bounds like "2-5 years"
+        const beforeText = fallbackText.slice(Math.max(0, m.index! - 6), m.index!);
+        if (/\d+\s*[-–to]\s*$/i.test(beforeText)) {
+          continue;
+        }
+        const snippet = fallbackText.slice(Math.max(0, m.index! - 40), m.index! + 40);
+        if (/company\s+with|founded|established|presence\s+of/i.test(snippet)) {
+          continue;
+        }
+        return false;
+      }
+    }
+
+    // Also check for explicit "Experience required - 5+ years" or similar phrasing
+    const expReqMatch = fallbackText.match(/\bexperience\s*(?:required|needed)?\s*[-:]?\s*([5-9]|1\d)\s*(?:years?|yrs?)/i);
+    if (expReqMatch) {
+      return false;
+    }
+  }
+
   return true;
 }
-
 export function isAutofillCapableUrl(url: string | null | undefined): boolean {
   if (!url) return false;
 
@@ -138,6 +168,8 @@ export function isAutofillCapableUrl(url: string | null | undefined): boolean {
   );
 }
 
+const INDIA_LOC_RE = /\b(india|bengaluru|bangalore|mumbai|bombay|delhi|new delhi|ncr|gurugram|gurgaon|noida|hyderabad|secunderabad|chennai|madras|pune|kolkata|calcutta|ahmedabad|kochi|cochin|thiruvananthapuram|trivandrum|karnataka|maharashtra|telangana|tamil nadu|tamilnadu|kerala|haryana|uttar pradesh|chandigarh|jaipur|indore|coimbatore|dindigul|madurai|trichy|tiruchirappalli|salem|tirunelveli|vellore|erode)\b/i;
+
 export function isTargetLocation(
   location: string | null | undefined,
   locationBadge: string | null | undefined,
@@ -146,18 +178,7 @@ export function isTargetLocation(
   const badge = (locationBadge || '').toLowerCase();
 
   // India roles
-  if (
-    value.includes('india') ||
-    value.includes('bengaluru') ||
-    value.includes('bangalore') ||
-    value.includes('chennai') ||
-    value.includes('hyderabad') ||
-    value.includes('pune') ||
-    value.includes('gurugram') ||
-    value.includes('gurgaon') ||
-    value.includes('noida') ||
-    value.includes('mumbai')
-  ) {
+  if (INDIA_LOC_RE.test(value) || badge === 'india') {
     return true;
   }
 
@@ -169,7 +190,6 @@ export function isTargetLocation(
     value.includes('remote');
 
   if (isRemote) {
-    // Reject clearly US-only remote jobs.
     if (
       value.includes('united states') ||
       value.includes('usa') ||
@@ -179,7 +199,6 @@ export function isTargetLocation(
     ) {
       return false;
     }
-
     return true;
   }
 
@@ -198,9 +217,15 @@ export function isLocationCompatible(
   const loc = (location || '').toLowerCase();
   const badge = (locationBadge || '').toLowerCase();
 
+  // Explicit remote-global roles match any location preference
+  if (badge === 'remote-global' || (loc.includes('remote') && (loc.includes('global') || loc.includes('anywhere') || loc.includes('worldwide')))) {
+    return true;
+  }
+
   return preferredLocations.some((pref) => {
-    const p = pref.trim().toLowerCase();
+    let p = pref.trim().toLowerCase();
     if (!p) return false;
+
     if (p === 'remote') {
       const isRemote =
         badge === 'remote-global' ||
@@ -222,22 +247,17 @@ export function isLocationCompatible(
       }
       return false;
     }
+
     if (p === 'india') {
-      return (
-        loc.includes('india') ||
-        loc.includes('bengaluru') ||
-        loc.includes('bangalore') ||
-        loc.includes('chennai') ||
-        loc.includes('hyderabad') ||
-        loc.includes('pune') ||
-        loc.includes('gurugram') ||
-        loc.includes('gurgaon') ||
-        loc.includes('noida') ||
-        loc.includes('mumbai') ||
-        loc.includes('delhi') ||
-        badge.includes('india')
-      );
+      return INDIA_LOC_RE.test(loc) || badge === 'india' || loc.includes('india');
     }
-    return loc.includes(p) || badge.includes(p);
+
+    const matchBangalore = (p === 'bengaluru' || p === 'bangalore') && (loc.includes('bengaluru') || loc.includes('bangalore'));
+    const matchGurgaon = (p === 'gurugram' || p === 'gurgaon') && (loc.includes('gurugram') || loc.includes('gurgaon'));
+    const matchChennai = (p === 'chennai' || p === 'madras') && (loc.includes('chennai') || loc.includes('madras') || loc.includes('mylapore'));
+    const matchCoimbatore = (p === 'coimbatore' || p === 'kovai') && (loc.includes('coimbatore') || loc.includes('kovai'));
+
+    return matchBangalore || matchGurgaon || matchChennai || matchCoimbatore || loc.includes(p) || badge.includes(p);
   });
 }
+

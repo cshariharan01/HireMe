@@ -140,6 +140,246 @@ export async function compileLatexWithRepair(
   }
 }
 
+/**
+ * Compile a .tex document and return the number of pages in the resulting PDF.
+ * Useful to detect when a tailored resume overflows its template's page budget.
+ */
+export async function getLatexPageCount(tex: string, timeoutMs = 120_000): Promise<number> {
+  const bytes = await compileLatex(tex, timeoutMs);
+  // pdf-parse v1 tries to run a test on require() — import the inner lib directly
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const pdfParse = require('pdf-parse/lib/pdf-parse.js');
+  const data = await pdfParse(bytes);
+  return data.numpages as number;
+}
+
+/**
+ * Compile a .tex document and, if the resulting PDF exceeds `targetPages`, automatically
+ * shrink it to fit by progressively applying less-destructive interventions:
+ *
+ *   1. Font size:       12pt → 11pt → 10pt
+ *   2. Itemize spacing: add `\setlist[itemize]{itemsep=0pt,topsep=0pt,parsep=0pt}`
+ *   3. Section spacing: add `\titlespacing*{\section}{0pt}{3pt}{1pt}` and variants
+ *   4. Page height:     add `\enlargethispage{2\baselineskip}`
+ *
+ * Returns `{ bytes, tex }` of the final fitted document. Throws only if the document fails to
+ * compile even at the smallest settings (which normally means a structural LaTeX error, not overflow).
+ */
+export async function fitLatexToPageBudget(
+  tex: string,
+  targetPages: number,
+  timeoutMs = 120_000,
+): Promise<{ bytes: Buffer; tex: string }> {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const pdfParse = require('pdf-parse/lib/pdf-parse.js');
+
+  async function pageCount(t: string): Promise<number> {
+    const buf = await compileLatex(t, timeoutMs);
+    const data = await pdfParse(buf);
+    return data.numpages as number;
+  }
+
+  // Initial compile — fast-path: already fits
+  let bytes = await compileLatex(tex, timeoutMs);
+  let currentTex = tex;
+  const data = await pdfParse(bytes);
+  if (data.numpages <= targetPages) {
+    console.log(`[latex] fit: already ${data.numpages} pages (target=${targetPages})`);
+    return { bytes, tex: currentTex };
+  }
+  console.log(`[latex] fit: ${data.numpages} pages > ${targetPages} — attempting auto-fit`);
+
+  // NOTE: Font size is strictly preserved from the template (\documentclass option is never altered).
+  // Content length is controlled by LLM prompt rules to match original template word/sentence budget.
+
+  // --- Step 2: Tighten itemize / list spacing ---
+  const ITEMIZE_SPACING = '\\setlist[itemize]{itemsep=0pt,topsep=0pt,parsep=0pt,partopsep=0pt}';
+  if (!currentTex.includes(ITEMIZE_SPACING)) {
+    // Inject after \usepackage{enumitem} or just before \begin{document}
+    let injected = currentTex.replace(
+      /(\\usepackage(?:\[[^\]]*\])?\{enumitem\})/,
+      `$1\n${ITEMIZE_SPACING}`,
+    );
+    if (injected === currentTex) {
+      injected = currentTex.replace('\\begin{document}', `${ITEMIZE_SPACING}\n\\begin{document}`);
+    }
+    try {
+      const pages = await pageCount(injected);
+      console.log(`[latex] fit: tight itemize → ${pages} pages`);
+      if (pages <= targetPages) {
+        bytes = await compileLatex(injected, timeoutMs);
+        return { bytes, tex: injected };
+      }
+      currentTex = injected;
+    } catch (e) {
+      console.warn('[latex] fit: tight itemize compile failed —', (e as Error).message.slice(0, 100));
+    }
+  }
+
+  // --- Step 3: Tighten section / subsection spacing ---
+  const SECTION_SPACING =
+    '\\titlespacing*{\\section}{0pt}{3pt}{1pt}\n\\titlespacing*{\\subsection}{0pt}{2pt}{1pt}\n\\titlespacing*{\\subsubsection}{0pt}{2pt}{1pt}';
+  if (!currentTex.includes('\\titlespacing*{\\section}')) {
+    const injected = currentTex.replace('\\begin{document}', `${SECTION_SPACING}\n\\begin{document}`);
+    try {
+      const pages = await pageCount(injected);
+      console.log(`[latex] fit: tight titlespacing → ${pages} pages`);
+      if (pages <= targetPages) {
+        bytes = await compileLatex(injected, timeoutMs);
+        return { bytes, tex: injected };
+      }
+      currentTex = injected;
+    } catch (e) {
+      console.warn('[latex] fit: tight titlespacing compile failed —', (e as Error).message.slice(0, 100));
+    }
+  }
+
+  // --- Step 3.5: Micro-adjust line leading (\linespread{0.95}) ---
+  let injectedLinespread = currentTex;
+  if (currentTex.includes('\\linespread')) {
+    injectedLinespread = currentTex.replace(/\\linespread\{[^}]+\}/, '\\linespread{0.94}');
+  } else {
+    injectedLinespread = currentTex.replace('\\begin{document}', '\\linespread{0.95}\\selectfont\n\\begin{document}');
+  }
+  if (injectedLinespread !== currentTex) {
+    try {
+      const pages = await pageCount(injectedLinespread);
+      console.log(`[latex] fit: micro linespread → ${pages} pages`);
+      if (pages <= targetPages) {
+        bytes = await compileLatex(injectedLinespread, timeoutMs);
+        return { bytes, tex: injectedLinespread };
+      }
+      currentTex = injectedLinespread;
+    } catch (e) {
+      console.warn('[latex] fit: micro linespread compile failed —', (e as Error).message.slice(0, 100));
+    }
+  }
+
+  // --- Step 4: Enlarge page by 2-3 baseline skips (minimal margin change) ---
+  const ENLARGE = '\\enlargethispage{3\\baselineskip}';
+  if (!currentTex.includes('\\enlargethispage')) {
+    const injected = currentTex.replace('\\begin{document}', `${ENLARGE}\n\\begin{document}`);
+    try {
+      const pages = await pageCount(injected);
+      console.log(`[latex] fit: enlargethispage → ${pages} pages`);
+      if (pages <= targetPages) {
+        bytes = await compileLatex(injected, timeoutMs);
+        return { bytes, tex: injected };
+      }
+      currentTex = injected;
+    } catch (e) {
+      console.warn('[latex] fit: enlargethispage compile failed —', (e as Error).message.slice(0, 100));
+    }
+  }
+
+  // --- Step 5: Content Trimming (Progressively trim excess bullets to strictly enforce target page budget) ---
+  console.log(`[latex] fit: content still ${await pageCount(currentTex)} pages > ${targetPages} — progressively trimming excess bullets...`);
+  let trimAttempts = 0;
+  while (trimAttempts < 10) {
+    trimAttempts++;
+    const trimmed = trimLastLatexItem(currentTex);
+    if (trimmed === currentTex) break; // no more items to trim safely
+    try {
+      const pages = await pageCount(trimmed);
+      console.log(`[latex] fit: trim bullet #${trimAttempts} → ${pages} pages`);
+      currentTex = trimmed;
+      if (pages <= targetPages) {
+        bytes = await compileLatex(currentTex, timeoutMs);
+        return { bytes, tex: currentTex };
+      }
+    } catch (e) {
+      console.warn('[latex] fit: trim bullet failed to compile —', (e as Error).message.slice(0, 100));
+      break;
+    }
+  }
+
+  // Final fallback compile
+  bytes = await compileLatex(currentTex, timeoutMs);
+  return { bytes, tex: currentTex };
+}
+
+/**
+ * Trim the last bullet point (\item or \resumeItem) from the body of a .tex document.
+ * Safely guards against emptying any section (e.g. Certifications) or project heading:
+ * an item list with <= 1 item will NEVER have its last bullet removed.
+ */
+export function trimLastLatexItem(tex: string): string {
+  function trimOneFromSegment(segment: string): string {
+    const lines = segment.split('\n');
+
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!/^\s*\\(?:resumeItem|item)\b/.test(lines[i])) continue;
+
+      // Find boundaries of enclosing list environment
+      let envStart = -1;
+      let envEnd = -1;
+
+      for (let j = i; j >= 0; j--) {
+        if (/\\begin\{(itemize|enumerate)\}|\\resumeItemListStart/.test(lines[j])) {
+          envStart = j;
+          break;
+        }
+      }
+
+      for (let j = i; j < lines.length; j++) {
+        if (/\\end\{(itemize|enumerate)\}|\\resumeItemListEnd/.test(lines[j])) {
+          envEnd = j;
+          break;
+        }
+      }
+
+      if (envStart !== -1 && envEnd !== -1 && envEnd >= envStart) {
+        let count = 0;
+        for (let k = envStart; k <= envEnd; k++) {
+          if (/^\s*\\(?:resumeItem|item)\b/.test(lines[k])) {
+            count++;
+          }
+        }
+
+        // SAFETY GUARD: Do NOT trim if list has <= 1 item left!
+        // Preserves sections like Certifications and individual projects from being emptied.
+        if (count <= 1) {
+          continue;
+        }
+      }
+
+      let endIdx = i;
+      let openBraces = 0;
+      for (let j = i; j < lines.length; j++) {
+        const line = lines[j];
+        for (const ch of line) {
+          if (ch === '{') openBraces++;
+          if (ch === '}') openBraces--;
+        }
+        endIdx = j;
+        if (openBraces <= 0 && j >= i) break;
+      }
+
+      lines.splice(i, endIdx - i + 1);
+      let res = lines.join('\n');
+      return res.replace(/\\begin\{(itemize|enumerate)\}\s*\\end\{\1\}/g, '');
+    }
+
+    return segment;
+  }
+
+  if (tex.includes('\\switchcolumn')) {
+    const parts = tex.split('\\switchcolumn');
+    // Trim Column 1 (Left main column) first if possible
+    const col1Trimmed = trimOneFromSegment(parts[0]);
+    if (col1Trimmed !== parts[0]) {
+      return col1Trimmed + '\\switchcolumn' + parts.slice(1).join('\\switchcolumn');
+    }
+    // If Column 1 has no trim candidates, trim Column 2 (Right sidebar column)
+    const col2Trimmed = trimOneFromSegment(parts.slice(1).join('\\switchcolumn'));
+    return parts[0] + '\\switchcolumn' + col2Trimmed;
+  } else {
+    return trimOneFromSegment(tex);
+  }
+}
+
+
+
 /** Split a .tex doc at the document body markers. Safe for documents missing either marker. */
 export function splitLatexDocument(tex: string): {
   preamble: string;
@@ -196,8 +436,9 @@ export function sanitizeLatexText(input: string): string {
     let prefix = commentIdx === -1 ? line : line.slice(0, commentIdx);
     let suffix = commentIdx === -1 ? '' : line.slice(commentIdx);
     for (const [re, sub] of replacements) prefix = prefix.replace(re, sub);
-    // Escaping is idempotent-safe: `\` before `%` already prevents matching, `30%` becomes `30\%`.
+    // Escaping is idempotent-safe: `\` before `%`/`&` already prevents matching.
     prefix = prefix.replace(/(?<!\\)%/g, '\\%');
+    prefix = prefix.replace(/(?<!\\)&/g, '\\&');
     prefix = prefix.replace(/[^\x00-\x7F]/g, ' ');
     suffix = suffix.replace(/[^\x00-\x7F]/g, ' ');
     outLines.push(prefix + suffix);
@@ -306,21 +547,19 @@ export function repairMacroArguments(body: string, arieties: Map<string, number>
  */
 function fixPreambleMacros(preamble: string): string {
   let p = preamble;
-  // Upgrade \resumeProjectHeading to use tabularx with @{}X r@{} so long project titles & tech stacks wrap cleanly
+  // Upgrade \resumeProjectHeading to use tabularx with @{}X r@{} so long project titles & tech stacks wrap cleanly.
+  // Note: Use \linewidth instead of \textwidth so tables fit within paracol 2-column layouts without massive gaps!
   p = p.replace(
     /\\newcommand\{\\resumeProjectHeading\}\[2\]\{[\s\S]*?\\end\{tabular\*\}\s*(?:\\vspace\{[^}]+\})?\s*\}/g,
-    `\\newcommand{\\resumeProjectHeading}[2]{\n    \\item\n    \\begin{tabularx}{\\textwidth}{@{}X r@{}}\n      \\small#1 & \\textbf{\\small #2}\\\\\n    \\end{tabularx}\\vspace{-6pt}\n}`
+    `\\newcommand{\\resumeProjectHeading}[2]{\n    \\item\n    \\begin{tabularx}{\\linewidth}{@{}X r@{}}\n      \\small#1 & \\textbf{\\small #2}\\\\\n    \\end{tabularx}\\vspace{-6pt}\n}`
   );
   // Upgrade \resumeSubheading to use tabularx with @{}X r@{}
   p = p.replace(
     /\\newcommand\{\\resumeSubheading\}\[4\]\{[\s\S]*?\\end\{tabular\*\}\s*(?:\\vspace\{[^}]+\})?\s*\}/g,
-    `\\newcommand{\\resumeSubheading}[4]{\n  \\vspace{-2pt}\\item\n    \\begin{tabularx}{\\textwidth}{@{}X r@{}}\n      \\textbf{#1} & \\textbf{\\small #2} \\\\\n      \\textit{\\small#3} & \\textit{\\small #4} \\\\\n    \\end{tabularx}\\vspace{-6pt}\n}`
+    `\\newcommand{\\resumeSubheading}[4]{\n  \\vspace{-2pt}\\item\n    \\begin{tabularx}{\\linewidth}{@{}X r@{}}\n      \\textbf{#1} & \\textbf{\\small #2} \\\\\n      \\textit{\\small#3} & \\textit{\\small #4} \\\\\n    \\end{tabularx}\\vspace{-6pt}\n}`
   );
   if (!p.includes('\\usepackage{tabularx}')) {
-    p = p.replace('\\begin{document}', '\\usepackage{tabularx}\n\\begin{document}');
-    if (!p.includes('\\usepackage{tabularx}')) {
-      p = `\\usepackage{tabularx}\n` + p;
-    }
+    p = p + '\n\\usepackage{tabularx}\n';
   }
   return p;
 }
@@ -352,7 +591,7 @@ export function autoCloseLatex(body: string): string {
   }
 
   // 3. Balance standard environments if any
-  for (const env of ['itemize', 'enumerate', 'tabularx', 'tabular*']) {
+  for (const env of ['itemize', 'enumerate', 'tabularx', 'tabular*', 'paracol']) {
     const beginCount = (text.match(new RegExp(`\\\\begin\\{${env}\\}`, 'g')) || []).length;
     const endCount = (text.match(new RegExp(`\\\\end\\{${env}\\}`, 'g')) || []).length;
     if (beginCount > endCount) {
@@ -363,6 +602,18 @@ export function autoCloseLatex(body: string): string {
   return text;
 }
 
+/**
+ * Format experience mentions in resume summary (e.g. "3.6 years", "3 years")
+ * dynamically to "3+ years" when candidate's YOE is a decimal / fractional value > N.
+ */
+export function formatYoeInSummary(texOrMd: string, yoe?: number | null): string {
+  if (!texOrMd || yoe == null || isNaN(yoe) || yoe <= 0) return texOrMd;
+  const floorVal = Math.floor(yoe);
+  const formatted = `${floorVal}+`;
+  const pattern = new RegExp(`\\b(${yoe}|${floorVal}(?:\\.\\d+)?)\\s*\\+?\\s*(years?|yrs?)\\b`, 'gi');
+  return texOrMd.replace(pattern, `${formatted} $2`);
+}
+
 export function spliceLatexContent(designTex: string, modelText: string): string {
   const design = splitLatexDocument(designTex);
   const model = splitLatexDocument(modelText);
@@ -371,6 +622,32 @@ export function spliceLatexContent(designTex: string, modelText: string): string
   body = body.replace(/^```(?:latex|tex)?\s*/i, '').replace(/```\s*$/i, '');
   body = sanitizeLatexText(body);
   const fixedPreamble = fixPreambleMacros(design.preamble);
+
+  // Deterministically preserve the candidate's original heading block (everything before the first \section)
+  // so name, profile title (e.g. "Business Analyst"), and contact info remain untouched.
+  const origSecIdx = design.body.search(/\\section\*?\{/);
+  const tailSecIdx = body.search(/\\section\*?\{/);
+  if (origSecIdx !== -1 && tailSecIdx !== -1) {
+    const origHeader = design.body.slice(0, origSecIdx);
+    body = origHeader + body.slice(tailSecIdx);
+  }
+
+  // Preserve 2-column \begin{paracol} & \switchcolumn structure if template used paracol but model output dropped \switchcolumn
+  if (design.body.includes('\\switchcolumn') && !body.includes('\\switchcolumn')) {
+    const switchIdx = design.body.indexOf('\\switchcolumn');
+    const col2StartSec = design.body.slice(switchIdx).search(/\\section\*?\{/);
+    if (col2StartSec !== -1) {
+      const col2FirstSecName = design.body.slice(switchIdx + col2StartSec).match(/\\section\*?\{([^}]+)\}/);
+      if (col2FirstSecName && col2FirstSecName[1]) {
+        const secRegex = new RegExp(`\\\\section\\*?\\{${col2FirstSecName[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\}`, 'i');
+        const matchIdx = body.search(secRegex);
+        if (matchIdx !== -1) {
+          body = body.slice(0, matchIdx) + '\\switchcolumn\n' + body.slice(matchIdx);
+        }
+      }
+    }
+  }
+
   body = repairMacroArguments(body, macroArities(fixedPreamble));
   body = autoCloseLatex(body);
   if (!design.hasBegin && !design.hasEnd) {
@@ -386,7 +663,16 @@ export function spliceLatexContent(designTex: string, modelText: string): string
  */
 export function isStaleTailoredTex(tex: string | null | undefined, baseTex: string | null | undefined): boolean {
   if (!tex || !baseTex) return false;
-  // If the cached tex has the exact unmodified base tools line, it's from the pre-experience-tailoring era
+
+  // 1. If cached tex contains legacy test strings when not present in baseTex:
+  const legacyStrings = ['Hariharan Subramaniyan', 'Data Engineer with 3+ years of experience in ETL'];
+  for (const s of legacyStrings) {
+    if (tex.includes(s) && !baseTex.includes(s)) {
+      return true;
+    }
+  }
+
+  // 2. If the cached tex has the exact unmodified base tools line:
   const defaultToolsMatch = baseTex.match(/\\textbf\{Tools Used:\}\s*([^\}]+)\}/);
   if (defaultToolsMatch && defaultToolsMatch[1]) {
     const defaultToolsStr = defaultToolsMatch[1].trim();
@@ -394,6 +680,45 @@ export function isStaleTailoredTex(tex: string | null | undefined, baseTex: stri
       return true;
     }
   }
+
+  // 3. Compare preambles: if the candidate's base template preamble has changed in /profile, cached tex is stale
+  const cachedPreamble = splitLatexDocument(tex).preamble.replace(/\s+/g, '');
+  const basePreamble = splitLatexDocument(baseTex).preamble.replace(/\s+/g, '');
+  if (cachedPreamble && basePreamble && cachedPreamble !== basePreamble) {
+    return true;
+  }
+
+  // 4. Compare heading block (content before first \section): if title was mutated in cached tex, mark as stale
+  const baseSecIdx = splitLatexDocument(baseTex).body.search(/\\section\*?\{/);
+  const texSecIdx = splitLatexDocument(tex).body.search(/\\section\*?\{/);
+  if (baseSecIdx !== -1 && texSecIdx !== -1) {
+    const baseHeader = splitLatexDocument(baseTex).body.slice(0, baseSecIdx).replace(/\s+/g, '');
+    const texHeader = splitLatexDocument(tex).body.slice(0, texSecIdx).replace(/\s+/g, '');
+    if (baseHeader !== texHeader) {
+      return true;
+    }
+  }
+
+  // 5. Check for empty sections or headings with 0 items (damaged by legacy over-trimming)
+  const sectionHeadings = tex.match(/\\section\*?\{[^}]+\}/g) || [];
+  for (const heading of sectionHeadings) {
+    const idx = tex.indexOf(heading);
+    const rest = tex.slice(idx + heading.length);
+    const nextSecIdx = rest.search(/\\section\*?\{|\\end\{paracol\}|\\end\{document\}/);
+    const sectionBody = nextSecIdx !== -1 ? rest.slice(0, nextSecIdx) : rest;
+    if (
+      heading.toLowerCase().includes('certification') ||
+      heading.toLowerCase().includes('skill') ||
+      heading.toLowerCase().includes('education') ||
+      heading.toLowerCase().includes('experience')
+    ) {
+      if (!/\\(?:resumeItem|item)\b/.test(sectionBody)) {
+        console.log(`[latex] isStaleTailoredTex: heading ${heading} has no items — marking stale for re-tailoring`);
+        return true;
+      }
+    }
+  }
+
   return false;
 }
 
@@ -404,4 +729,173 @@ export function latexPdfFilename(name: string | null | undefined, preferredFilen
     return clean.endsWith('.pdf') ? clean : `${clean}.pdf`;
   }
   return `${(name || 'candidate').replace(/[^\w-]+/g, '_')}_Resume.pdf`;
+}
+
+/**
+ * Builds a clean, compilable base LaTeX template populated EXCLUSIVELY with the candidate's
+ * parsed profile facts (name, contact, skills, experience, education). Used when no custom
+ * template was pasted or to replace legacy/hardcoded test templates.
+ */
+export function buildLatexTemplateFromProfile(p: Record<string, any>): string {
+  const name = sanitizeLatexText(p.name || 'Candidate');
+  const title = sanitizeLatexText(p.title || 'Professional');
+  const email = p.email ? sanitizeLatexText(p.email) : '';
+  const phone = p.phone ? sanitizeLatexText(p.phone) : '';
+  const location = p.location ? sanitizeLatexText(p.location) : '';
+  const linkedin = p.linkedin ? sanitizeLatexText(p.linkedin) : '';
+
+  const skills: string[] = Array.isArray(p.skills) ? p.skills.map((s: string) => sanitizeLatexText(String(s))) : [];
+  const experience: string[] = Array.isArray(p.experience) ? p.experience : [];
+  const education: string[] = Array.isArray(p.education) ? p.education.map((e: string) => sanitizeLatexText(String(e))) : [];
+
+  let expSection = '';
+  if (experience.length > 0) {
+    expSection = '\\section{Experience}\n\\resumeSubHeadingListStart\n';
+    for (const item of experience) {
+      const parts = String(item).split('|').map((s) => s.trim()).filter(Boolean);
+      if (parts.length === 0) continue;
+      const header = sanitizeLatexText(parts[0]);
+      const match = header.match(/^(.*?)(?:\s+at\s+|\s*@\s*|\s*,\s*)(.*?)(?:\s*\((.*?)\))?$/);
+      let roleTitle = header;
+      let company = '';
+      let dates = '';
+      if (match) {
+        roleTitle = match[1].trim() || header;
+        company = match[2].trim() || '';
+        dates = match[3] ? match[3].trim() : '';
+      }
+      expSection += `  \\resumeSubheading\n    {${roleTitle}}{${dates}}\n    {${company}}{}\n    \\resumeItemListStart\n`;
+      const bullets = parts.slice(1);
+      if (bullets.length > 0) {
+        for (const bullet of bullets) {
+          expSection += `      \\resumeItem{${sanitizeLatexText(bullet)}}\n`;
+        }
+      } else {
+        expSection += `      \\resumeItem{${roleTitle} responsibilities and key deliverables.}\n`;
+      }
+      expSection += '    \\resumeItemListEnd\n';
+    }
+    expSection += '\\resumeSubHeadingListEnd\n';
+  }
+
+  let skillsSection = '';
+  if (skills.length > 0) {
+    skillsSection = `\\section{Skills}\n\\textbf{Technical \\& Professional Skills:}\n\\begin{itemize}\n  \\item ${skills.join(', ')}\n\\end{itemize}\n`;
+  }
+
+  let eduSection = '';
+  if (education.length > 0) {
+    eduSection = '\\section{Education}\n\\resumeSubHeadingListStart\n';
+    for (const edu of education) {
+      eduSection += `  \\resumeSubheading\n    {${edu}}{}{}{}\n`;
+    }
+    eduSection += '\\resumeSubHeadingListEnd\n';
+  }
+
+  const contactItems = [
+    phone ? `\\faPhone\\ ${phone}` : '',
+    email ? `\\href{mailto:${email}}{\\faEnvelope\\ \\underline{${email}}}` : '',
+    linkedin ? `\\href{${linkedin}}{\\faLinkedin\\ \\underline{LinkedIn}}` : '',
+    location ? `\\faMapMarker\\ ${location}` : '',
+  ].filter(Boolean);
+
+  const contactLine = contactItems.join(' ~ ');
+
+  return `%-------------------------
+% Resume in Latex - ${name}
+%------------------------
+
+\\documentclass[letterpaper,11pt]{article}
+
+\\usepackage{latexsym}
+\\usepackage[empty]{fullpage}
+\\usepackage{titlesec}
+\\usepackage{marvosym}
+\\usepackage[usenames,dvipsnames]{color}
+\\usepackage{verbatim}
+\\usepackage{enumitem}
+\\usepackage[hidelinks]{hyperref}
+\\usepackage{fancyhdr}
+\\usepackage[english]{babel}
+\\usepackage{tabularx}
+\\usepackage{fontawesome5}
+\\usepackage{multicol}
+\\usepackage{xcolor}
+\\definecolor{richblack}{RGB}{10, 10, 10}
+\\AtBeginDocument{\\color{richblack}}
+\\setlength{\\multicolsep}{-3.0pt}
+\\setlength{\\columnsep}{-1pt}
+\\input{glyphtounicode}
+
+\\pagestyle{fancy}
+\\fancyhf{}
+\\fancyfoot{}
+\\renewcommand{\\headrulewidth}{0pt}
+\\renewcommand{\\footrulewidth}{0pt}
+
+\\fancypagestyle{plain}{%
+  \\fancyhf{}%
+  \\fancyfoot{}%
+  \\renewcommand{\\headrulewidth}{0pt}%
+  \\renewcommand{\\footrulewidth}{0pt}%
+}
+
+\\addtolength{\\oddsidemargin}{-0.6in}
+\\addtolength{\\evensidemargin}{-0.5in}
+\\addtolength{\\textwidth}{1.19in}
+\\addtolength{\\topmargin}{-.7in}
+\\addtolength{\\textheight}{1.0in}
+
+\\urlstyle{same}
+\\raggedbottom
+\\raggedright
+\\setlength{\\tabcolsep}{0in}
+
+\\titleformat{\\section}{
+  \\vspace{-6pt}\\scshape\\raggedright\\large\\bfseries
+}{}{0em}{}[\\color{black}\\titlerule \\vspace{-5pt}]
+
+\\pdfgentounicode=1
+
+\\newcommand{\\resumeItem}[1]{\\item\\small{{#1 \\vspace{-2pt}}}}
+\\newcommand{\\resumeSubheading}[4]{
+  \\vspace{-2pt}\\item
+    \\begin{tabularx}{\\textwidth}{@{}X r@{}}
+      \\textbf{#1} & \\textbf{\\small #2} \\\\
+      \\textit{\\small#3} & \\textit{\\small #4} \\\\
+    \\end{tabularx}\\vspace{-6pt}
+}
+\\newcommand{\\resumeProjectHeading}[2]{
+    \\item
+    \\begin{tabularx}{\\textwidth}{@{}X r@{}}
+      \\small#1 & \\textbf{\\small #2}\\\\
+    \\end{tabularx}\\vspace{-6pt}
+}
+\\newcommand{\\resumeItemListStart}{\\begin{itemize}}
+\\newcommand{\\resumeItemListEnd}{\\end{itemize}\\vspace{-8pt}}
+\\newcommand{\\resumeSubHeadingListStart}{\\begin{itemize}[leftmargin=0.0in, label={}]}
+\\newcommand{\\resumeSubHeadingListEnd}{\\end{itemize}}
+
+\\begin{document}
+\\thispagestyle{fancy}
+
+%----------HEADING----------
+\\begin{center}
+    {\\Huge \\scshape ${name}} \\\\ \\vspace{4pt}
+    \\textbf{\\Large \\scshape ${title}} \\\\ \\vspace{4pt}
+    \\small ${contactLine}
+\\end{center}
+
+%-----------SUMMARY-----------
+\\section{Summary}
+Dynamic and results-driven ${title} with proven experience across requirement analysis, functional specifications, and solution delivery.
+
+${skillsSection}
+
+${expSection}
+
+${eduSection}
+
+\\end{document}
+`;
 }

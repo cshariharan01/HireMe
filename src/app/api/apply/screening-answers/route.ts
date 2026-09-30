@@ -35,3 +35,15 @@ export async function GET() {
     );
   }
 }
+
+export async function DELETE() {
+  try {
+    db.prepare('DELETE FROM screening_answers').run();
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : 'Failed to clear screening answers' },
+      { status: 500 },
+    );
+  }
+}

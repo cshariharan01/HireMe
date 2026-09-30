@@ -82,7 +82,8 @@ function stripHtml(html: string): string {
 const DATA_DIR = path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, 'hiresignal.db'));
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(DATA_DIR, 'hireme.db');
+const db = new Database(DB_PATH);
 const allowJunior = resolveAllowJunior(db); // experience-aware: keep junior roles for early-career resumes
 sqliteVec.load(db);
 db.pragma('journal_mode = WAL');

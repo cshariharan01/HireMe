@@ -52,9 +52,9 @@ if not exist "data\playwright" mkdir "data\playwright"
 
 :: Launch app + open browser after 10s delay
 echo.
-echo  Starting HireMe at http://localhost:3001
+echo  Starting HireMe at http://127.0.0.1:3001
 echo  Press Ctrl+C to stop.
 echo.
-start /min "" cmd /c "timeout /t 10 /nobreak >nul && start http://localhost:3001"
-call npm run dev -- --port 3001
+start /min "" cmd /c "timeout /t 5 /nobreak >nul && start http://127.0.0.1:3001"
+call npm run dev -- -H 0.0.0.0 -p 3001
 endlocal

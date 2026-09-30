@@ -2,6 +2,7 @@ import db, { jobFtsAvailable } from './db';
 import { blobToEmbedding, embeddingToBlob, generateEmbedding } from './embeddings';
 import { getDomainBoost } from './ontology';
 import { extractPostingFacts, type PostingFacts } from './posting-facts';
+import { getActiveOwnerId } from './apply/screening-owner';
 import {
   analyzeSkillFit,
   buildProfileSkillSet,
@@ -69,6 +70,7 @@ export interface RankedMatch {
   source: string;
   ingestedAt: string;
   postedAt?: string | null;
+  lastSeenAt?: string | null;
   domainPriority: number;
   remotePolicy: string | null;
   visaSponsorship: boolean;
@@ -76,6 +78,7 @@ export interface RankedMatch {
   applyType: 'easy_apply' | 'direct_apply' | 'external' | 'unknown';
   sourcePlatform?: string | null;
   facts: PostingFacts;
+  description?: string;
   locationBadge: LocationBadge;
   locationReason: string;
   archetype: RoleArchetype;
@@ -129,9 +132,8 @@ function freshnessScore(dateStr: string | null): number {
   const ageDays = (Date.now() - t) / 86_400_000;
   if (ageDays < 0) return 0;      // future/clock skew
   if (ageDays <= 7) return 0.05;
-  if (ageDays <= 30) return 0.02;
-  if (ageDays <= 90) return 0;
-  return -0.10;                   // >90 days — likely filled/dead
+  if (ageDays <= 14) return 0.02; // Jobs up to 2 weeks (14 days) old
+  return -0.10;                   // >14 days — past 2 weeks threshold
 }
 
 // Heuristic posting-level legitimacy. Cheap: derived from age + JD quality patterns.
@@ -201,7 +203,7 @@ interface LocationAssessment {
   reason: string;
 }
 
-export const INDIA_LOCATIONS_REGEX = /\b(india|bengaluru|bangalore|mumbai|bombay|delhi|new delhi|ncr|gurugram|gurgaon|noida|hyderabad|secunderabad|chennai|madras|pune|kolkata|calcutta|ahmedabad|kochi|cochin|thiruvananthapuram|trivandrum|karnataka|maharashtra|telangana|tamil nadu|tamilnadu|kerala|haryana|uttar pradesh|chandigarh|jaipur|indore)\b/i;
+export const INDIA_LOCATIONS_REGEX = /\b(india|bengaluru|bangalore|mumbai|bombay|delhi|new delhi|ncr|gurugram|gurgaon|noida|hyderabad|secunderabad|chennai|madras|pune|kolkata|calcutta|ahmedabad|kochi|cochin|thiruvananthapuram|trivandrum|karnataka|maharashtra|telangana|tamil nadu|tamilnadu|kerala|haryana|uttar pradesh|chandigarh|jaipur|indore|coimbatore|dindigul|madurai|trichy|tiruchirappalli|salem|tirunelveli|vellore|erode)\b/i;
 
 const REMOTE_KEYWORD_REGEX = /\b(remote|work from home|wfh|worldwide|anywhere|global)\b/i;
 
@@ -219,7 +221,7 @@ function getLocationAssessment(
   const loc = (jobLocation || '').toLowerCase();
   const title = (jobTitle || '').toLowerCase();
   const prof = (profileLocation || '').toLowerCase();
-  const indiaUser = prof.includes('india');
+  const indiaUser = prof.includes('india') || INDIA_LOCATIONS_REGEX.test(prof);
 
   // If user isn't India-based, skip location-specific scoring
   if (!indiaUser) return { score: 0, badge: 'remote-neutral', reason: 'non-india profile' };
@@ -340,7 +342,8 @@ interface RankOpts {
 }
 
 function cacheKey(o: RankOpts): string {
-  return `${o.includeHidden ? 'h' : '-'}${o.includeExpired ? 'e' : '-'}${o.includeApplied ? 'a' : '-'}`;
+  const owner = getActiveOwnerId();
+  return `${owner}:${o.includeHidden ? 'h' : '-'}${o.includeExpired ? 'e' : '-'}${o.includeApplied ? 'a' : '-'}`;
 }
 
 /**
@@ -371,6 +374,7 @@ function buildFtsQuery(terms: string[]): string | null {
 // cache was written, the cached payload is still valid. Two aggregate scans + one PK lookup —
 // far cheaper than the vector scan + re-rank they guard.
 function computeSignature(o: RankOpts): string {
+  const ownerId = getActiveOwnerId();
   const p = db.prepare('SELECT updated_at FROM my_profile WHERE id = 1').get() as { updated_at: string } | undefined;
   const j = db.prepare(
     `SELECT COUNT(embedding) e, MAX(ingested_at) mi, MAX(last_seen_at) ml,
@@ -385,9 +389,10 @@ function computeSignature(o: RankOpts): string {
      ORDER BY type`,
   ).all() as Array<{ type: string; count: number }>;
   const ev = db.prepare('SELECT COUNT(*) c, MAX(computed_at) m FROM job_evaluations').get() as { c: number; m: string | null };
-  // Applications too — applying to / changing a job's status must re-badge it in the list.
-  const ap = db.prepare('SELECT COUNT(*) c, MAX(last_status_change_at) m, MAX(applied_at) a FROM my_applications').get() as { c: number; m: string | null; a: string | null };
+  // Applications too — applying to / changing a job's status must re-badge it in the list (scoped to active owner).
+  const ap = db.prepare('SELECT COUNT(*) c, MAX(last_status_change_at) m, MAX(applied_at) a FROM my_applications WHERE (owner_id = ? OR (owner_id IS NULL AND ? = \'default\'))').get(ownerId, ownerId) as { c: number; m: string | null; a: string | null };
   return [
+    ownerId,
     o.includeHidden, o.includeExpired, o.includeApplied ?? false,
     // Bumped whenever the scoring model changes, so an old cached payload built by the previous
     // formula is never served. Without this, switching to the composite score would leave stale
@@ -403,7 +408,7 @@ function computeSignature(o: RankOpts): string {
 
 // v2 = hybrid retrieval (BM25 + vector via RRF) + bounded composite score + skill fit.
 // v1 was `cosine + stacked boosts` clamped to 100.
-const SCORING_VERSION = 'score-v9-jd-experience';
+const SCORING_VERSION = 'score-v10-india-locations';
 
 // The heavy path — runs only on a cold/stale cache. Returns null when there is no usable profile.
 // `profileOverride` lets a caller re-rank the pool against a DIFFERENT profile — specifically an
@@ -456,7 +461,8 @@ function computeRanked(o: RankOpts, profileOverride?: ProfileRow | null): Ranked
   const profileEmbedding = blobToEmbedding(profile.embedding);
   const queryBlob = Buffer.from(profileEmbedding.buffer, profileEmbedding.byteOffset, profileEmbedding.byteLength);
   const hiddenFilter = o.includeHidden ? '' : ' AND j.hidden_at IS NULL';
-  const expiredFilter = o.includeExpired ? '' : " AND j.expired_at IS NULL AND (j.url_status IS NULL OR j.url_status != 'dead')";
+  const fourteenDaysFilter = o.includeExpired ? '' : " AND (j.posted_at >= datetime('now', '-14 days') OR j.ingested_at >= datetime('now', '-14 days') OR j.last_seen_at >= datetime('now', '-14 days'))";
+  const expiredFilter = o.includeExpired ? '' : ` AND j.expired_at IS NULL AND (j.url_status IS NULL OR j.url_status != 'dead')${fourteenDaysFilter}`;
   // Applied jobs leave the active list entirely (not just get badged), so the page BACKFILLS with
   // real candidates. Previously `applied` was decoration only and the client hid them from an
   // already-truncated 30 rows, which made the list shorter instead of better.
@@ -564,6 +570,7 @@ function computeRanked(o: RankOpts, profileOverride?: ProfileRow | null): Ranked
 
   const distanceById = new Map(vectorLeg.map((r) => [r.id, r.distance]));
   const placeholders = candidateIds.map(() => '?').join(',');
+  const ownerId = getActiveOwnerId();
   const jobs = db.prepare(`
     SELECT j.id, j.company, j.title, j.location, j.url, j.description, j.domain_priority,
       j.remote_policy, j.visa_sponsorship, j.relocation_offered, j.apply_type, j.source, j.source_platform, j.ingested_at,
@@ -571,7 +578,7 @@ function computeRanked(o: RankOpts, profileOverride?: ProfileRow | null): Ranked
       e.overall_score as eval_overall,
       e.recommendation as eval_recommendation,
       j.hidden_at,
-      (SELECT a.status FROM my_applications a WHERE a.job_id = j.id
+      (SELECT a.status FROM my_applications a WHERE a.job_id = j.id AND (a.owner_id = ? OR (a.owner_id IS NULL AND ? = 'default'))
        ORDER BY a.last_status_change_at DESC LIMIT 1) as application_status
     FROM job_postings j
     LEFT JOIN job_evaluations e ON e.job_id = j.id
@@ -587,7 +594,7 @@ function computeRanked(o: RankOpts, profileOverride?: ProfileRow | null): Ranked
           )
         )
       )
-  `).all(...candidateIds, o.includeJobId ?? 0).map((r) => {
+  `).all(ownerId, ownerId, ...candidateIds, o.includeJobId ?? 0).map((r) => {
     const row = r as Omit<JobRow, 'distance'> & { distance?: number };
     // Rows found only by the lexical leg have no cosine; treat them as "far" rather than 0
     // distance, so a pure keyword hit can't masquerade as a perfect semantic match.
@@ -744,6 +751,7 @@ function computeRanked(o: RankOpts, profileOverride?: ProfileRow | null): Ranked
       source: job.source,
       ingestedAt: job.ingested_at,
       postedAt: job.posted_at || null,
+      lastSeenAt: job.last_seen_at || null,
       domainPriority: job.domain_priority,
       remotePolicy: job.remote_policy,
       visaSponsorship: Boolean(job.visa_sponsorship),
@@ -751,6 +759,7 @@ function computeRanked(o: RankOpts, profileOverride?: ProfileRow | null): Ranked
       applyType: (job.apply_type as RankedMatch['applyType']) || 'unknown',
       sourcePlatform: job.source_platform || (job.url.includes('linkedin.com') ? 'linkedin' : job.url.includes('naukri.com') ? 'naukri' : job.url.includes('indeed.com') ? 'indeed' : null),
       facts,
+      description: job.description || '',
       locationBadge: locationAssessment.badge,
       locationReason: locationAssessment.reason,
       archetype: classifyArchetype(job.title || ''),
@@ -864,7 +873,7 @@ export async function getTailoredMatchScore(
  *
  * Input must already be sorted best-first — the survivor of each group is the first one seen.
  */
-function diversify(sorted: RankedMatch[]): RankedMatch[] {
+export function diversify(sorted: RankedMatch[]): RankedMatch[] {
   const norm = (s: string) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
   const byGroup = new Map<string, RankedMatch>();
   const order: RankedMatch[] = [];
@@ -1044,97 +1053,38 @@ export function invalidateMatchCache(
   }
 ): void {
   try {
-    if (!targetJobId || !delta) {
-      // Full invalidation
+    // Surgically update every in-memory memo entry so the UI sees the change immediately,
+    // without waiting for the background recompute to finish.
+    if (targetJobId !== undefined && delta) {
+      for (const [, entry] of matchMemo) {
+        // Patch the cached ranked array in-place
+        for (const match of entry.result.ranked) {
+          if (match.id === targetJobId) {
+            if (delta.hidden !== undefined) match.hidden = delta.hidden;
+            if (delta.applied !== undefined) match.applied = delta.applied;
+            if (delta.applicationStatus !== undefined) match.applicationStatus = delta.applicationStatus;
+          }
+        }
+        // Also patch the byId fast-lookup map
+        const byIdEntry = entry.byId.get(targetJobId);
+        if (byIdEntry) {
+          if (delta.hidden !== undefined) byIdEntry.hidden = delta.hidden;
+          if (delta.applied !== undefined) byIdEntry.applied = delta.applied;
+          if (delta.applicationStatus !== undefined) byIdEntry.applicationStatus = delta.applicationStatus;
+        }
+      }
+    } else {
+      // Full invalidation: clear everything so next request does a blocking recompute.
       matchMemo.clear();
+    }
+    // Always wipe the SQLite cache so the next recompute picks up the latest state.
+    try {
       db.prepare('DELETE FROM match_cache').run();
-      return;
-    }
-
-    // If restoring an unhidden job or unapplying, a full recompute is needed on next request to bring it back into ranked pool
-    if (delta.hidden === false || delta.applied === false) {
-      matchMemo.clear();
-      db.prepare('DELETE FROM match_cache').run();
-      return;
-    }
-
-    // 1. Update any entries currently in matchMemo
-    for (const [key, entry] of matchMemo.entries()) {
-      const o: RankOpts = {
-        includeHidden: key[0] === 'h',
-        includeExpired: key[1] === 'e',
-        includeApplied: key[2] === 'a',
-      };
-
-      const m = entry.byId.get(targetJobId);
-
-      if (delta.hidden !== undefined) {
-        if (m) {
-          m.hidden = delta.hidden;
-        }
-        if (delta.hidden) {
-          entry.result.hiddenCount = (entry.result.hiddenCount || 0) + 1;
-          if (!o.includeHidden) {
-            entry.result.ranked = entry.result.ranked.filter((r) => r.id !== targetJobId);
-          }
-        }
-      }
-
-      if (delta.applied !== undefined || delta.applicationStatus !== undefined) {
-        if (m) {
-          if (delta.applied !== undefined) m.applied = delta.applied;
-          m.applicationStatus = delta.applicationStatus ?? (delta.applied ? 'applied' : null);
-        }
-        if (delta.applied && !o.includeApplied) {
-          entry.result.ranked = entry.result.ranked.filter((r) => r.id !== targetJobId);
-        }
-      }
-
-      const newSig = computeSignature(o);
-      entry.signature = newSig;
-      persist(key, newSig, entry.result);
-    }
-
-    // 2. Also update SQLite match_cache rows that may not be loaded in matchMemo
-    const cachedRows = db.prepare('SELECT cache_key, payload FROM match_cache').all() as Array<{ cache_key: string; payload: string }>;
-    for (const row of cachedRows) {
-      if (matchMemo.has(row.cache_key)) continue; // already updated above
-      try {
-        const parsed = JSON.parse(row.payload) as RankedResult;
-        const o: RankOpts = {
-          includeHidden: row.cache_key[0] === 'h',
-          includeExpired: row.cache_key[1] === 'e',
-          includeApplied: row.cache_key[2] === 'a',
-        };
-        const m = parsed.ranked.find((r) => r.id === targetJobId);
-        if (delta.hidden !== undefined) {
-          if (m) m.hidden = delta.hidden;
-          if (delta.hidden) {
-            parsed.hiddenCount = (parsed.hiddenCount || 0) + 1;
-            if (!o.includeHidden) {
-              parsed.ranked = parsed.ranked.filter((r) => r.id !== targetJobId);
-            }
-          }
-        }
-        if (delta.applied !== undefined || delta.applicationStatus !== undefined) {
-          if (m) {
-            if (delta.applied !== undefined) m.applied = delta.applied;
-            m.applicationStatus = delta.applicationStatus ?? (delta.applied ? 'applied' : null);
-          }
-          if (delta.applied && !o.includeApplied) {
-            parsed.ranked = parsed.ranked.filter((r) => r.id !== targetJobId);
-          }
-        }
-        const newSig = computeSignature(o);
-        persist(row.cache_key, newSig, parsed);
-      } catch {
-        db.prepare('DELETE FROM match_cache WHERE cache_key = ?').run(row.cache_key);
-      }
+    } catch {
+      // ignore
     }
   } catch (e) {
-    console.warn('[matches] cache invalidation fallback:', e);
-    matchMemo.clear();
-    try { db.prepare('DELETE FROM match_cache').run(); } catch {}
+    console.warn('[matches] cache invalidation error:', e);
   }
 }
 
@@ -1234,3 +1184,198 @@ export function getRankedMatches(o: RankOpts): RankedResult | null {
   }
   return result;
 }
+
+/**
+ * Real-time match synthesis for freshly ingested jobs that haven't been batched into match_cache yet.
+ * Queries job_postings for recently added active jobs and formats them as RankedMatches so they
+ * appear immediately in the Matches feed without waiting for the full sync to finish.
+ */
+export function buildFreshRankedMatches(existingIds: Set<number>): RankedMatch[] {
+  try {
+    const profile = db.prepare('SELECT * FROM my_profile WHERE id = 1').get() as ProfileRow | undefined;
+    if (!profile) return [];
+    const parsedProfile = JSON.parse(profile.parsed_json || '{}');
+    const profileSkills: string[] = parsedProfile.skills || [];
+    const profileSkillSet = buildProfileSkillSet(profileSkills);
+    const profileLocation: string = parsedProfile.location || '';
+    const domainTerms: string[] = Array.isArray(parsedProfile.domain_terms) ? parsedProfile.domain_terms : [];
+    const targets = parsedProfile.targets || {};
+    const mustHaves = splitTerms(targets.must_haves);
+    const dealBreakers = splitTerms(targets.deal_breakers);
+    const targetLocations: string[] = Array.isArray(targets.locations) ? targets.locations.filter(Boolean) : [];
+    const compMin = Number(targets.comp_min);
+    const hasCompFloor = Number.isFinite(compMin) && compMin > 0;
+
+    const rows = db.prepare(`
+      SELECT j.id, j.company, j.title, j.location, j.url, j.description, j.domain_priority,
+             j.remote_policy, j.visa_sponsorship, j.relocation_offered, j.apply_type, j.source, j.source_platform,
+             j.ingested_at, j.last_seen_at, j.posted_at, j.url_status, j.expired_at, j.hidden_at,
+             (SELECT a.status FROM my_applications a WHERE a.job_id = j.id AND (a.owner_id = ? OR (a.owner_id IS NULL AND ? = 'default')) ORDER BY a.last_status_change_at DESC LIMIT 1) as application_status
+      FROM job_postings j
+      WHERE (
+        j.posted_at >= datetime('now', '-14 days')
+        OR j.ingested_at >= datetime('now', '-14 days')
+        OR j.last_seen_at >= datetime('now', '-14 days')
+      )
+        AND j.expired_at IS NULL
+        AND j.hidden_at IS NULL
+        AND (j.url_status IS NULL OR j.url_status != 'dead')
+        AND (
+          COALESCE(j.apply_type, 'unknown') != 'external'
+          AND (
+            (j.source NOT IN ('linkedin', 'naukri') AND COALESCE(j.source_platform, '') NOT IN ('linkedin', 'naukri') AND j.url NOT LIKE '%linkedin.com%' AND j.url NOT LIKE '%naukri.com%')
+            OR ((j.source = 'linkedin' OR j.source_platform = 'linkedin' OR j.url LIKE '%linkedin.com%') AND j.apply_type = 'easy_apply')
+            OR ((j.source = 'naukri' OR j.source_platform = 'naukri' OR j.url LIKE '%naukri.com%') AND j.apply_type = 'direct_apply')
+          )
+        )
+      ORDER BY j.id DESC
+      LIMIT 300
+    `).all(getActiveOwnerId(), getActiveOwnerId()) as Array<{
+      id: number;
+      company: string;
+      title: string;
+      location: string;
+      url: string;
+      description: string;
+      domain_priority: number;
+      remote_policy: string | null;
+      visa_sponsorship: number;
+      relocation_offered: number;
+      apply_type: string | null;
+      source: string;
+      source_platform: string | null;
+      ingested_at: string;
+      last_seen_at: string | null;
+      posted_at: string | null;
+      url_status: string | null;
+      expired_at: string | null;
+      hidden_at: string | null;
+      application_status: string | null;
+    }>;
+
+    const out: RankedMatch[] = [];
+    for (const job of rows) {
+      if (existingIds.has(job.id)) continue;
+
+      const ontologyBoost = getDomainBoost((job.title || '') + ' ' + (job.description || ''), domainTerms);
+      const rolePenalty = getRolePenalty(job.title);
+      const locationAssessment = getLocationAssessment(
+        job.location,
+        profileLocation,
+        job.remote_policy,
+        Boolean(job.visa_sponsorship),
+        Boolean(job.relocation_offered),
+        job.title,
+      );
+      const freshnessRef = job.posted_at || job.last_seen_at || job.ingested_at;
+      const freshnessBoost = freshnessScore(freshnessRef);
+      const legitimacy = classifyLegitimacy({
+        ingestedAt: job.last_seen_at || job.ingested_at,
+        description: job.description || '',
+        title: job.title || '',
+        source: job.source,
+      });
+      const legitimacyPenalty =
+        legitimacy.signal === 'suspicious' ? -0.30 :
+        legitimacy.signal === 'caution' ? -0.05 :
+        0;
+
+      const facts = extractPostingFacts(job.description || '', job.location || '', job.title || '', job.url || '');
+      const jobText = `${job.title || ''}\n${job.description || ''}`;
+
+      const fit = analyzeSkillFit({
+        jobTitle: job.title || '',
+        jobDescription: job.description || '',
+        profileSkills,
+        profileSkillSet,
+      });
+
+      const dealBreakerHits = termsPresent(jobText, dealBreakers);
+      const missingMustHaves = termsAbsent(jobText, mustHaves);
+      const belowCompFloor = hasCompFloor && facts.salaryMax != null && facts.salaryMax < compMin;
+      const targetLocationHit = targetLocations.length > 0
+        ? termsPresent(`${job.location || ''} ${job.remote_policy || ''}`, targetLocations).length > 0
+        : false;
+
+      const ageRef = job.posted_at || job.last_seen_at || job.ingested_at;
+      const ageMs = ageRef ? Date.now() - new Date(ageRef).getTime() : NaN;
+      const ageDays = Number.isFinite(ageMs) && ageMs >= 0 ? Math.round(ageMs / 86_400_000) : null;
+
+      const retrieval = 0.85;
+
+      const compositeInput = {
+        retrieval,
+        skillFit: fit,
+        llmScore: null,
+        llmRecommendation: null,
+        locationScore: locationAssessment.score + (targetLocationHit ? 0.05 : 0),
+        freshnessScore: freshnessBoost,
+        legitimacyPenalty,
+        dealBreakerHits,
+        missingMustHaves,
+        belowCompFloor,
+        domainHit: ontologyBoost > 0,
+        roleTargetHit: false,
+        rolePenalty,
+      };
+      const composite = scoreComposite(compositeInput);
+
+      const reasons = buildReasons({
+        fit,
+        composite,
+        input: compositeInput,
+        locationBadge: locationAssessment.badge,
+        locationReason: locationAssessment.reason,
+        ageDays,
+        duplicateCount: 1,
+      });
+
+      out.push({
+        id: job.id,
+        company: job.company,
+        title: job.title,
+        location: job.location,
+        url: job.url,
+        source: job.source,
+        ingestedAt: job.ingested_at,
+        postedAt: job.posted_at || null,
+        lastSeenAt: job.last_seen_at || null,
+        domainPriority: job.domain_priority,
+        remotePolicy: job.remote_policy,
+        visaSponsorship: Boolean(job.visa_sponsorship),
+        relocationOffered: Boolean(job.relocation_offered),
+        applyType: (job.apply_type as RankedMatch['applyType']) || 'unknown',
+        sourcePlatform: job.source_platform || null,
+        facts,
+        description: job.description,
+        locationBadge: locationAssessment.badge,
+        locationReason: locationAssessment.reason,
+        archetype: classifyArchetype(job.title),
+        ontologyBoost,
+        rolePenalty,
+        finalScore: composite.score / 100,
+        score: composite.score,
+        skillFit: fit,
+        reasons,
+        ageDays,
+        variants: [],
+        evaluation: null,
+        legitimacy: legitimacy.signal,
+        legitimacyReason: legitimacy.reason,
+        hidden: Boolean(job.hidden_at),
+        applied: Boolean(job.application_status),
+        applicationStatus: (job.application_status as RankedMatch['applicationStatus']) || null,
+        gapAnalysis: {
+          matchedSkills: fit.matched,
+          missingKeywords: fit.missing,
+        },
+      });
+    }
+
+    return out;
+  } catch (e) {
+    console.warn('[matches] buildFreshRankedMatches failed:', e);
+    return [];
+  }
+}
+

@@ -75,6 +75,7 @@ function initDb(): Database.Database {
   CREATE TABLE IF NOT EXISTS my_applications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id INTEGER REFERENCES job_postings(id),
+    owner_id TEXT,
     status TEXT CHECK(status IN ('applied','screening','interview','offer','rejected')),
     cover_letter TEXT,
     resume_variant TEXT,
@@ -248,6 +249,28 @@ function initDb(): Database.Database {
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
+  -- System notifications (for auto-switch model alerts, warnings, toasts)
+  CREATE TABLE IF NOT EXISTS system_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    read INTEGER DEFAULT 0
+  );
+
+  -- LLM usage tracking: daily hits, tokens, and model stats
+  CREATE TABLE IF NOT EXISTS llm_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider_id INTEGER,
+    provider_kind TEXT NOT NULL,
+    model TEXT NOT NULL,
+    date TEXT NOT NULL,
+    hits INTEGER DEFAULT 0,
+    tokens INTEGER DEFAULT 0,
+    last_used_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(provider_kind, model, date)
+  );
+
   -- Employer-specific application "recipes" — the app's memory of each external ATS process.
   -- Keyed by the employer's site host. Learns which reveal labels produced a step, whether the
   -- flow needs a manual sign-in / CAPTCHA, and the outcome, so the next apply to the same
@@ -337,6 +360,30 @@ try {
     }
   }
 } catch { /* resumes table may not be ready on a brand-new DB — safe to skip */ }
+
+// Auto-seed default Gemini provider if llm_providers table is empty and GEMINI_API_KEY is set
+try {
+  const providerCount = (db.prepare('SELECT COUNT(*) AS c FROM llm_providers').get() as { c: number })?.c || 0;
+  let geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const envPath = path.join(process.cwd(), '.env.local');
+      if (fs.existsSync(envPath)) {
+        const content = fs.readFileSync(envPath, 'utf8');
+        const match = content.match(/^GEMINI_API_KEY=(.+)$/m);
+        if (match && match[1]) geminiKey = match[1].trim().replace(/^['"]|['"]$/g, '');
+      }
+    } catch {}
+  }
+  if (providerCount === 0 && geminiKey) {
+    db.prepare(`
+      INSERT INTO llm_providers (kind, display_name, model, api_key, is_active)
+      VALUES ('gemini', 'Google Gemini', ?, ?, 1)
+    `).run(process.env.GEMINI_MODEL || 'gemini-3.8-flash', geminiKey);
+  }
+} catch { /* llm_providers table may not be ready — safe to skip */ }
 
   // One-time backfill of the embedding signature. Before embeddings became provider-configurable,
   // everything was embedded with Ollama. If a DB already has embeddings but no recorded signature,
@@ -464,6 +511,7 @@ const ADDITIVE_COLUMNS: Array<[string, string]> = [
   ['my_applications', 'resume_source TEXT'],
   ['my_applications', 'tailored_score REAL'],
   ['my_applications', 'default_score REAL'],
+  ['my_applications', 'owner_id TEXT'],
   ['job_documents', 'tailored_score REAL'],
   ['job_documents', 'default_score REAL'],
   // Live sync progress — persisted so the UI reads true state even if the Next dev server
@@ -511,6 +559,7 @@ const ADDITIVE_COLUMNS: Array<[string, string]> = [
     CREATE INDEX IF NOT EXISTS job_hidden_idx ON job_postings(hidden_at);
     CREATE INDEX IF NOT EXISTS job_expired_idx ON job_postings(expired_at);
     CREATE INDEX IF NOT EXISTS job_url_status_idx ON job_postings(url_status);
+    CREATE INDEX IF NOT EXISTS my_applications_owner_idx ON my_applications(owner_id);
     -- source + last_seen_at: markSourceAbsent() runs
     -- "UPDATE job_postings SET source_present=0 WHERE source=?" once per ingest script (12-13x
     -- per full sync), which was a full scan + rewrite each time. prune filters on last_seen_at.
@@ -530,6 +579,52 @@ const ADDITIVE_COLUMNS: Array<[string, string]> = [
     `);
   } catch {
     /* ignore */
+  }
+
+  // Backfill legacy applications with owner_id if missing.
+  // When multiple candidate profiles exist in resumes, maps each application's applied_at
+  // to the resume that was active at that time.
+  try {
+    const unowned = db.prepare('SELECT COUNT(*) AS c FROM my_applications WHERE owner_id IS NULL').get() as { c: number } | undefined;
+    if (unowned && unowned.c > 0) {
+      const resumes = (db.prepare("SELECT id, created_at, parsed_json FROM resumes ORDER BY REPLACE(created_at, ' ', 'T') ASC").all() as Array<{ id: number; created_at: string; parsed_json: string | null }>).map((r) => {
+        let owner = 'default';
+        try {
+          if (r.parsed_json) {
+            const p = JSON.parse(r.parsed_json);
+            owner = (p.email || p.name || 'default').toLowerCase().trim();
+          }
+        } catch {}
+        return { id: r.id, createdAt: (r.created_at || '').replace(' ', 'T'), owner };
+      });
+
+      let activeOwner = 'default';
+      try {
+        const prof = db.prepare('SELECT parsed_json FROM my_profile WHERE id = 1').get() as { parsed_json: string } | undefined;
+        if (prof?.parsed_json) {
+          const p = JSON.parse(prof.parsed_json);
+          activeOwner = (p.email || p.name || 'default').toLowerCase().trim();
+        }
+      } catch {}
+
+      const apps = db.prepare('SELECT id, applied_at FROM my_applications WHERE owner_id IS NULL').all() as Array<{ id: number; applied_at: string | null }>;
+      const updateStmt = db.prepare('UPDATE my_applications SET owner_id = ? WHERE id = ?');
+      const tx = db.transaction(() => {
+        for (const app of apps) {
+          const appTime = (app.applied_at || '').replace(' ', 'T');
+          let matchedOwner = resumes[0]?.owner || activeOwner;
+          for (const r of resumes) {
+            if (r.createdAt <= appTime) {
+              matchedOwner = r.owner;
+            }
+          }
+          updateStmt.run(matchedOwner, app.id);
+        }
+      });
+      tx();
+    }
+  } catch (e) {
+    console.warn('[db] owner_id backfill warning:', e);
   }
 
   // Per-job skill extraction cache. Scanning a description against the ~175-entry skill
@@ -727,6 +822,40 @@ export function jobFtsAvailable(): boolean {
     return !!row;
   } catch {
     return false;
+  }
+}
+
+export interface SystemNotification {
+  id: number;
+  type: string;
+  message: string;
+  created_at: string;
+  read: number;
+}
+
+export function addSystemNotification(type: string, message: string): void {
+  try {
+    db.prepare('INSERT INTO system_notifications (type, message) VALUES (?, ?)').run(type, message);
+  } catch (e) {
+    console.error('[db] Failed to add system notification:', e);
+  }
+}
+
+export function getUnreadSystemNotifications(): SystemNotification[] {
+  try {
+    return db.prepare('SELECT id, type, message, created_at, read FROM system_notifications WHERE read = 0 ORDER BY id ASC').all() as SystemNotification[];
+  } catch {
+    return [];
+  }
+}
+
+export function markSystemNotificationsRead(ids: number[]): void {
+  if (!ids || ids.length === 0) return;
+  try {
+    const placeholders = ids.map(() => '?').join(',');
+    db.prepare(`UPDATE system_notifications SET read = 1 WHERE id IN (${placeholders})`).run(...ids);
+  } catch (e) {
+    console.error('[db] Failed to mark system notifications read:', e);
   }
 }
 

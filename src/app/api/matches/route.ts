@@ -15,6 +15,10 @@ export async function GET(request: Request) {
     const norm = (v: string | null): string | null => (v && v !== 'all' ? v : null);
     const envLimit = defaultPageLimit();
 
+    const applyScoreFilter = url.searchParams.get('apply_score_filter') !== '0';
+    const thresholdParam = url.searchParams.get('score_threshold');
+    const customMinScore = (applyScoreFilter && thresholdParam) ? parseInt(thresholdParam, 10) : null;
+
     const payload = buildMatchesPage({
       includeHidden: url.searchParams.get('include_hidden') === '1',
       includeExpired: url.searchParams.get('include_expired') === '1',
@@ -24,8 +28,8 @@ export async function GET(request: Request) {
       limit: Math.min(Math.max(parseInt(url.searchParams.get('limit') || String(envLimit), 10) || envLimit, 1), 200),
       offset: Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0),
       // applyScoreFilter: read apply_mode from user_settings and apply the threshold automatically.
-      // Pass apply_score_filter=0 to bypass (e.g. for the Tracker view).
-      applyScoreFilter: url.searchParams.get('apply_score_filter') !== '0',
+      // Pass apply_score_filter=0 to bypass (e.g. for the Tracker view or Apply All mode).
+      applyScoreFilter,
       filters: {
         badge: norm(url.searchParams.get('badge')),
         place: norm(url.searchParams.get('place')),
@@ -33,6 +37,7 @@ export async function GET(request: Request) {
         evaluation: norm(url.searchParams.get('eval')),
         platform: norm(url.searchParams.get('platform')),
         q: (url.searchParams.get('q') || '').trim().toLowerCase() || null,
+        minScore: Number.isFinite(customMinScore) ? customMinScore : null,
       },
     });
 

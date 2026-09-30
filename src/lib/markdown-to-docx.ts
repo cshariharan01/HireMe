@@ -111,7 +111,7 @@ export async function markdownToDocxBlob(markdown: string, fileName = 'document'
   }
 
   const doc = new Document({
-    creator: 'HireSignal',
+    creator: 'HireMe',
     title: fileName,
     styles: {
       default: {

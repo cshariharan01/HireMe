@@ -21,13 +21,13 @@ describe('first-paint seed key', () => {
     const filterQS = '';
     const baseQS = includeHidden ? '?include_hidden=1' : '';
     const sep = includeHidden ? '&' : '?';
-    const hookKey = `/api/matches${baseQS}${sep}offset=0&limit=${PAGE_SIZE}${filterQS ? `&${filterQS}` : ''}`;
+    const hookKey = `/api/matches${baseQS}${sep}offset=0&limit=${PAGE_SIZE}&apply_score_filter=1${filterQS ? `&${filterQS}` : ''}`;
 
     expect(matchesFallbackKey()).toBe(hookKey);
   });
 
   it('is a plain path with no trailing separator surprises', () => {
-    expect(matchesFallbackKey()).toBe('/api/matches?offset=0&limit=30');
+    expect(matchesFallbackKey()).toBe('/api/matches?offset=0&limit=30&apply_score_filter=1');
   });
 
   it('lives in a module that does NOT import client-only runtime', () => {

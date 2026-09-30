@@ -8,17 +8,33 @@
 // Safety: submit buttons are DETECTED but NEVER clicked. The caller must present
 // the filled form to the user for manual review and submission.
 
-import { type BrowserContext, type Page } from 'playwright';
+import { type BrowserContext, type Page, type Locator } from 'playwright';
 import path from 'path';
 import fs from 'fs';
 import { spawn } from 'child_process';
 import type { CandidateProfile, PlatformResult } from './platform';
 import { fillAndAdvanceWizard } from './browser';
 import { getRecipe, normalizeHost, recordApplyAttempt } from './recipes';
-import { launchApplyBrowser, bringWindowToFront, AUTO_APPLY_SUCCESS_PAGE, isApplyCancelled } from './launcher';
-import { resolveScreeningQuestionWithGemini } from './llm-screening';
+import { launchApplyBrowser, bringWindowToFront, focusApplyPage, shouldBringWindowToFront, AUTO_APPLY_SUCCESS_PAGE, isApplyCancelled, getSystemChromeProfileDir } from './launcher';
+import { resolveScreeningQuestionWithGemini, type FieldConstraints } from './llm-screening';
+import db from '../db';
+import { screeningOwnerId, hashScreeningQuestion, ensureScreeningOwner } from './screening-owner';
 
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), 'data', 'playwright', 'browser-profile');
+
+/**
+ * Resolve the best Chrome profile directory for LinkedIn: prefer the user's REAL Chrome profile
+ * so DPAPI-encrypted cookies (li_at session) are decryptable → LinkedIn opens already signed in.
+ * Falls back to the isolated Playwright profile when Chrome isn't installed or profile not found.
+ */
+function resolveLinkedInProfileDir(): string {
+  return BROWSER_PROFILE_DIR;
+}
+
+/** True when the profile dir is the user's everyday Chrome (not the app's isolated profile). */
+function isUsingRealChromeProfile(profileDir: string): boolean {
+  return profileDir !== BROWSER_PROFILE_DIR;
+}
 
 // ----- Detection selectors ---------------------------------------------------
 
@@ -212,6 +228,28 @@ async function pageLooksClosed(page: Page): Promise<boolean> {
   try {
     const text = await page.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
     return /no longer available|job (has been )?(closed|filled)|position (is )?(closed|filled)|this (job|posting) is no longer|sorry, this (job|position)/i.test(text);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detect whether a LinkedIn job posting is expired or closed.
+ */
+export async function detectLinkedInExpired(page: Page): Promise<boolean> {
+  try {
+    const badge = page.locator(
+      '.jobs-details-top-card__apply-error, ' +
+      'figcaption:has-text("No longer accepting applications"), ' +
+      '.artdeco-inline-feedback:has-text("No longer accepting applications"), ' +
+      'div:has-text("No longer accepting applications"), ' +
+      'span:has-text("No longer accepting applications")'
+    ).first();
+    if ((await badge.count()) > 0 && (await badge.isVisible().catch(() => false))) {
+      return true;
+    }
+    const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
+    return /no longer accepting applications|this job is no longer available|this job has expired|posting has closed|position has been closed/i.test(bodyText);
   } catch {
     return false;
   }
@@ -952,6 +990,28 @@ export async function detectLinkedInLoginRequired(page: Page): Promise<boolean> 
 }
 
 /**
+ * Wait for the user to complete login on LinkedIn.
+ * Polls for login completion by checking if login required condition clears.
+ */
+export async function waitForLinkedInLogin(
+  page: Page,
+  maxWaitMs = 120_000
+): Promise<boolean> {
+  const start = Date.now();
+  console.log('[linkedin] Waiting for user to complete login...');
+
+  while (Date.now() - start < maxWaitMs) {
+    const loginRequired = await detectLinkedInLoginRequired(page);
+    if (!loginRequired) {
+      console.log('[linkedin] Login completed successfully');
+      return true;
+    }
+    await page.waitForTimeout(2000);
+  }
+  return false;
+}
+
+/**
  * Detect if the job was already applied to on LinkedIn.
  */
 export async function detectLinkedInAlreadyApplied(page: Page): Promise<boolean> {
@@ -1200,94 +1260,411 @@ async function fillLinkedInStandardFields(page: Page, profile: CandidateProfile)
     }
   }
 
-  // Handle <select> dropdowns inside modal with intelligent matching
+  // Handle <select> dropdowns and custom comboboxes inside modal with intelligent matching
+  try {
+    const dropdownFilled = await fillLinkedInSelectDropdowns(page, modalLoc, profile);
+    filled.push(...dropdownFilled);
+  } catch {
+    // ignore
+  }
+
+  return filled;
+}
+
+/**
+ * City and region alias mapping for location matching.
+ * Maps common variants to a canonical set of alias keywords.
+ */
+export const CITY_ALIASES: Record<string, string[]> = {
+  bangalore: ['bangalore', 'bengaluru', 'blr'],
+  bengaluru: ['bangalore', 'bengaluru', 'blr'],
+  chennai: ['chennai', 'madras', 'maa'],
+  madras: ['chennai', 'madras', 'maa'],
+  mumbai: ['mumbai', 'bombay', 'bom'],
+  bombay: ['mumbai', 'bombay', 'bom'],
+  pune: ['pune', 'poona'],
+  poona: ['pune', 'poona'],
+  hyderabad: ['hyderabad', 'secunderabad', 'hyd'],
+  secunderabad: ['hyderabad', 'secunderabad', 'hyd'],
+  gurgaon: ['gurgaon', 'gurugram', 'ggn'],
+  gurugram: ['gurgaon', 'gurugram', 'ggn'],
+  noida: ['noida', 'greater noida'],
+  delhi: ['delhi', 'new delhi', 'ncr'],
+  'new delhi': ['delhi', 'new delhi', 'ncr'],
+  kolkata: ['kolkata', 'calcutta', 'ccu'],
+  calcutta: ['kolkata', 'calcutta', 'ccu'],
+  kochi: ['kochi', 'cochin'],
+  cochin: ['kochi', 'cochin'],
+  trivandrum: ['trivandrum', 'thiruvananthapuram'],
+  thiruvananthapuram: ['trivandrum', 'thiruvananthapuram'],
+  coimbatore: ['coimbatore', 'kovai'],
+  madurai: ['madurai'],
+  remote: ['remote', 'work from home', 'wfh', 'virtual', 'anywhere'],
+  'work from home': ['remote', 'work from home', 'wfh', 'virtual', 'anywhere'],
+  wfh: ['remote', 'work from home', 'wfh', 'virtual', 'anywhere'],
+};
+
+/**
+ * Resolves the best matching option string from a list of options (for radio groups, selects, or comboboxes)
+ * based on the candidate's preferred locations in targets.locations, city, location, and state.
+ */
+export function resolvePreferredLocationOption(
+  options: string[],
+  profile: CandidateProfile
+): string | null {
+  if (!options || options.length === 0) return null;
+
+  // Build candidate's preferred location list in order of priority:
+  const preferences: string[] = [];
+
+  // 1. Target locations array from profile.targets.locations
+  const targetLocs = (profile.targets as { locations?: string[] })?.locations
+    || (Array.isArray(profile.targetLocations) ? profile.targetLocations : [])
+    || (Array.isArray(profile.targets) ? profile.targets : []);
+  if (Array.isArray(targetLocs)) {
+    for (const loc of targetLocs) {
+      if (typeof loc === 'string' && loc.trim()) {
+        preferences.push(loc.trim());
+      }
+    }
+  }
+
+  // 2. Candidate city
+  if (profile.city && typeof profile.city === 'string' && !preferences.includes(profile.city.trim())) {
+    preferences.push(profile.city.trim());
+  }
+
+  // 3. Candidate location (e.g. "Virudhunagar, India" -> "Virudhunagar")
+  if (profile.location && typeof profile.location === 'string') {
+    const cityPart = profile.location.split(',')[0].trim();
+    if (cityPart && !preferences.includes(cityPart)) {
+      preferences.push(cityPart);
+    }
+  }
+
+  // Filter placeholder options from choices
+  const validOptions = options.filter(
+    (o) => o && !/^(?:select|choose|please\s*select|select\s*an\s*option|choose\s*an\s*option|select\s*one|--|\s*)$/i.test(o.trim())
+  );
+  if (validOptions.length === 0) return options[0] || null;
+
+  // Check each preference against options in priority order
+  for (const pref of preferences) {
+    const prefNorm = pref.toLowerCase().trim();
+    const aliases = CITY_ALIASES[prefNorm] || [prefNorm];
+
+    for (const opt of validOptions) {
+      const optNorm = opt.toLowerCase().trim();
+      for (const alias of aliases) {
+        const regex = new RegExp(`(^|[^a-z0-9])${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9]|$)`, 'i');
+        if (regex.test(optNorm) || optNorm.includes(alias)) {
+          return opt.trim();
+        }
+      }
+    }
+  }
+
+  // Fallback: Check candidate state (e.g. Tamil Nadu)
+  const state = profile.state as string | undefined;
+  if (state && typeof state === 'string' && state.trim()) {
+    const stateNorm = state.toLowerCase().trim();
+    for (const opt of validOptions) {
+      if (opt.toLowerCase().includes(stateNorm)) {
+        return opt.trim();
+      }
+    }
+  }
+
+  // Fallback: Check if any option is Remote / WFH
+  const remoteOpt = validOptions.find((o) => /remote|work\s*from\s*home|wfh|virtual/i.test(o));
+  if (remoteOpt) return remoteOpt.trim();
+
+  // If candidate has preferences and no direct match found, return null to avoid random guessing
+  return null;
+}
+
+/**
+ * Automatically detects and fills all dropdown questions (<select> elements and custom comboboxes)
+ * on the LinkedIn Easy Apply modal.
+ * Uses multi-tier selection (Playwright selectOption, in-page DOM input/change/blur dispatch,
+ * and custom listbox click triggers) to reliably select options even when native selects are visually hidden.
+ */
+export async function fillLinkedInSelectDropdowns(
+  page: Page,
+  modalLoc: Locator,
+  profile: CandidateProfile
+): Promise<string[]> {
+  const filled: string[] = [];
+
+  // Part 1: Native <select> elements (both visible and custom-skinned)
   try {
     const selects = modalLoc.locator('select');
-    const count = Math.min(await selects.count(), 15);
-    for (let i = 0; i < count; i++) {
-      const sel = selects.nth(i);
-      const visible = await sel.isVisible().catch(() => false);
-      const disabled = await sel.isDisabled().catch(() => false);
-      if (!visible || disabled) continue;
+    const selectCount = Math.min(await selects.count(), 20);
 
-      const label = await sel.evaluate((el) => {
-        if (el.getAttribute('aria-label')) return el.getAttribute('aria-label') || '';
-        const id = el.id;
-        if (id) {
-          const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-          if (lbl && lbl.textContent?.trim()) return lbl.textContent.trim();
+    for (let i = 0; i < selectCount; i++) {
+      try {
+        const sel = selects.nth(i);
+        const disabled = await sel.isDisabled().catch(() => false);
+        if (disabled) continue;
+
+        // Extract label using robust ancestor search
+        const label = await sel.evaluate((el: HTMLSelectElement) => {
+          if (el.getAttribute('aria-label')) return el.getAttribute('aria-label') || '';
+          const id = el.id;
+          if (id) {
+            const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+            if (lbl && lbl.textContent?.trim()) return lbl.textContent.trim();
+          }
+          const labelledBy = el.getAttribute('aria-labelledby');
+          if (labelledBy) {
+            const lblTarget = document.getElementById(labelledBy);
+            if (lblTarget && lblTarget.textContent?.trim()) return lblTarget.textContent.trim();
+          }
+          let parent = el.parentElement;
+          for (let depth = 0; depth < 6 && parent; depth++) {
+            const lbl = parent.querySelector('label, legend, .fb-form-element-label, [data-test-form-builder-text-input-form-component__title], [data-test-form-builder-dropdown-form-component__title], .jobs-easy-apply-form-element__label, .artdeco-text-input--label, span.t-14, p');
+            if (lbl && lbl.textContent?.trim()) return lbl.textContent.trim();
+            parent = parent.parentElement;
+          }
+          return el.getAttribute('name') || el.id || '';
+        }).catch(() => '');
+
+        // Extract options data: text, value, index
+        type OptData = { text: string; value: string; index: number; isSelected: boolean };
+        const optionsData: OptData[] = await sel.evaluate((el: HTMLSelectElement) => {
+          return Array.from(el.options).map((o, idx) => ({
+            text: (o.text || o.textContent || o.label || '').trim(),
+            value: o.value || '',
+            index: idx,
+            isSelected: o.selected,
+          }));
+        }).catch(() => []);
+
+        if (!optionsData || optionsData.length === 0) continue;
+
+        const currentSelected = optionsData.find((o) => o.isSelected);
+        const currentVal = currentSelected?.value || '';
+        const currentText = currentSelected?.text || '';
+        const isPlaceholder = !currentVal || /^(?:select|choose|please\s*select|select\s*an\s*option|choose\s*an\s*option|select\s*one|--|\s*)$/i.test(currentText.trim());
+
+        // Filter out placeholder options from choices
+        const validOptions = optionsData.filter((o) => o.text && !/^(?:select|choose|please\s*select|select\s*an\s*option|choose\s*an\s*option|select\s*one|--|\s*)$/i.test(o.text));
+        if (validOptions.length === 0) continue;
+
+        // If already selected with a real answer, skip unless it was an accidental blank
+        if (!isPlaceholder && currentText.trim()) continue;
+
+        const normLabel = label.replace(/\b(?:required|mandatory)\b/gi, '').replace(/[\*:]+$/g, '').trim();
+        const validOptionTexts = validOptions.map((o) => o.text);
+
+        let targetText: string | null = null;
+
+        // 1. Check if location question
+        const isLocationQ = /(?:location|preferr?ed\s*(?:work\s*)?location|work\s*location|office\s*location|base\s*location|where\s*are\s*you\s*(?:based|located)|city)/i.test(normLabel);
+        if (isLocationQ) {
+          targetText = resolvePreferredLocationOption(validOptionTexts, profile);
         }
-        const container = el.closest('.fb-form-element, [data-test-form-builder-dropdown-form-component], fieldset, div');
-        if (container) {
-          const lbl = container.querySelector('label, legend, .fb-form-element-label, [data-test-form-builder-text-input-form-component__title]');
-          if (lbl && lbl.textContent?.trim()) return lbl.textContent.trim();
+
+        // 2. Check async resolution (DB cache -> standard field deterministic rules -> Gemini AI)
+        if (!targetText) {
+          targetText = await resolveLinkedInQuestionAnswerAsync(normLabel, 'select', profile, validOptionTexts);
         }
-        return el.getAttribute('name') || '';
-      }).catch(() => '');
 
-      const options = await sel.locator('option').allTextContents().catch(() => []);
-      if (!options || options.length === 0) continue;
+        // 3. Fallback deterministic rules for dropdowns
+        if (!targetText) {
+          const rawYoe = (profile.yearsOfExperience as number) ?? (profile.yearsExperience as number) ?? 3;
+          const yoe = Math.floor(Number(rawYoe) || 0);
+          const months = (profile.totalExperienceMonths as number) ?? 6;
+          const noticeDays = profile.noticePeriodDays ?? 30;
 
-      const currentVal = await sel.inputValue().catch(() => '');
-      const currentLabel = (await sel.locator('option:checked').first().textContent().catch(() => '')) || '';
+          if (/(?:total\s*years|years\s*of\s*(?:professional\s*)?experience|(?:total|overall|relevant|work|professional|it)\s*(?:years?\s*of\s*)?experience|experience\s*\(?years?\)?|^experience\b)/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => new RegExp(`^\\s*${yoe}\\s*(?:years?|yrs?)?$`, 'i').test(o) || new RegExp(`\\b${yoe}\\s*(?:years?|yrs?)\\b`, 'i').test(o))
+              || validOptionTexts.find((o) => new RegExp(`\\b${yoe}\\b`).test(o))
+              || validOptionTexts[0];
+          } else if (/additional\s*months|months\s*of\s*(?:professional\s*)?experience|experience\s*\(?months?\)?/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => new RegExp(`^\\s*${months}\\s*(?:months?|mos?)?$`, 'i').test(o) || new RegExp(`\\b${months}\\s*(?:months?|mos?)\\b`, 'i').test(o))
+              || validOptionTexts.find((o) => new RegExp(`\\b${months}\\b`).test(o))
+              || validOptionTexts[0];
+          } else if (/(?:notice\s*period|how\s*soon.*(?:join|start)|when\s*can\s*you\s*(?:join|start)|joining\s*(?:time|period|days)|join\s*us.*days)/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => new RegExp(`\\b${noticeDays}\\b|1\\s*month|immediate`, 'i').test(o))
+              || validOptionTexts[0];
+          } else if (/\bcountry\b/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => new RegExp(`\\b${profile.country || 'India'}\\b`, 'i').test(o))
+              || validOptionTexts.find((o) => /\bindia\b/i.test(o))
+              || validOptionTexts[0];
+          } else if (/\b(?:state|province|region)\b/i.test(normLabel)) {
+            const state = (profile.state as string) || 'Tamil Nadu';
+            targetText = validOptionTexts.find((o) => new RegExp(state, 'i').test(o))
+              || validOptionTexts[0];
+          } else if (/\b(?:current|present)\b.*?\b(?:ctc|salary|compensation|package)\b/i.test(normLabel) || /\b(?:ctc|salary)\b.*?\b(?:current|present)\b/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => /700000|7\s*lpa|7\s*lakh|6\s*[-–to]+\s*8/i.test(o))
+              || validOptionTexts.find((o) => /7|8/i.test(o))
+              || validOptionTexts[0];
+          } else if (/\b(?:expected|target|desired|minimum)\b.*?\b(?:ctc|salary|compensation|package)\b/i.test(normLabel) || /\b(?:ctc|salary)\b.*?\b(?:expected|target|desired)\b/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => /1200000|12\s*lpa|12\s*lakh|10\s*[-–to]+\s*15/i.test(o))
+              || validOptionTexts.find((o) => /12|10|15/i.test(o))
+              || validOptionTexts[0];
+          } else if (/\bcurrency\b/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => /inr|₹|rupee/i.test(o)) || validOptionTexts[0];
+          } else if (/\b(?:education|degree|qualification)\b/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => /bachelor|b\.?e|b\.?tech|graduate|master/i.test(o)) || validOptionTexts[0];
+          } else if (/english|proficiency|language/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => /fluent|professional|native|advanced|conversational/i.test(o)) || validOptionTexts[0];
+          } else if (/(?:authorized|sponsorship|eligible|visa)/i.test(normLabel)) {
+            const isNegative = /(?:require\s*(?:visa\s*)?sponsorship|need\s*(?:visa\s*)?sponsorship|\bsponsor\b)/i.test(normLabel);
+            targetText = isNegative
+              ? (validOptionTexts.find((o) => /^no$/i.test(o.trim())) || validOptionTexts[0])
+              : (validOptionTexts.find((o) => /^yes$/i.test(o.trim())) || validOptionTexts[0]);
+          } else if (/gender/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => /male|prefer not to say/i.test(o)) || validOptionTexts[0];
+          } else if (/veteran/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => /not a veteran|not a protected veteran|prefer not to say/i.test(o)) || validOptionTexts[0];
+          } else if (/disabilit/i.test(normLabel)) {
+            targetText = validOptionTexts.find((o) => /no|not have a disability|prefer not to say/i.test(o)) || validOptionTexts[0];
+          } else {
+            // Safe fallback: pick first valid option so form is never blocked
+            targetText = validOptionTexts[0];
+          }
+        }
 
-      const yoe = (profile.yearsOfExperience as number) ?? (profile.yearsExperience as number) ?? 3;
-      const months = (profile.totalExperienceMonths as number) ?? 6;
+        if (!targetText) continue;
 
-      let matchedOption: string | undefined;
+        // Match targetText against validOptions
+        const normTarget = targetText.trim().toLowerCase();
+        let matchedOpt = validOptions.find((o) => o.text.trim().toLowerCase() === normTarget)
+          || validOptions.find((o) => o.value.trim().toLowerCase() === normTarget)
+          || validOptions.find((o) => o.text.trim().toLowerCase().includes(normTarget))
+          || validOptions.find((o) => normTarget.includes(o.text.trim().toLowerCase()))
+          || validOptions[0];
 
-      if (/(?:total\s*years|years\s*of\s*(?:professional\s*)?experience|(?:total|overall|relevant|work|professional|it)\s*(?:years?\s*of\s*)?experience|experience\s*\(?years?\)?|^experience\b)/i.test(label)) {
-        matchedOption = options.find((o) => new RegExp(`^\\s*${yoe}\\s*(?:years?|yrs?)?$`, 'i').test(o.trim()) || new RegExp(`\\b${yoe}\\s*(?:years?|yrs?)\\b`, 'i').test(o.trim()));
-        if (!matchedOption) matchedOption = options.find((o) => new RegExp(`\\b${yoe}\\b`).test(o.trim()));
-      } else if (/additional\s*months|months\s*of\s*(?:professional\s*)?experience|experience\s*\(?months?\)?/i.test(label)) {
-        matchedOption = options.find((o) => new RegExp(`^\\s*${months}\\s*(?:months?|mos?)?$`, 'i').test(o.trim()) || new RegExp(`\\b${months}\\s*(?:months?|mos?)\\b`, 'i').test(o.trim()));
-        if (!matchedOption) matchedOption = options.find((o) => new RegExp(`\\b${months}\\b`).test(o.trim()));
-      } else if (/(?:notice\s*period|how\s*soon.*(?:join|start)|when\s*can\s*you\s*(?:join|start)|joining\s*(?:time|period|days)|join\s*us.*days)/i.test(label)) {
-        const days = profile.noticePeriodDays ?? 30;
-        matchedOption = options.find((o) => new RegExp(`\\b${days}\\b|1\\s*month|immediate`, 'i').test(o.trim()));
-      } else if (/\bcountry\b/i.test(label)) {
-        matchedOption = options.find((o) => /\bindia\b/i.test(o.trim()));
-      } else if (/\b(?:state|province|region)\b/i.test(label)) {
-        matchedOption = options.find((o) => /tamil\s*nadu/i.test(o.trim()));
-      } else if (/\b(?:current|present)\b.*?\b(?:ctc|salary|compensation|package)\b/i.test(label) || /\b(?:ctc|salary)\b.*?\b(?:current|present)\b/i.test(label)) {
-        matchedOption = options.find((o) => /700000|7\s*lpa|7\s*lakh|6\s*[-–to]+\s*8/i.test(o.trim()))
-          || options.find((o) => /7|8/i.test(o.trim()));
-      } else if (/\b(?:expected|target|desired|minimum)\b.*?\b(?:ctc|salary|compensation|package)\b/i.test(label) || /\b(?:ctc|salary)\b.*?\b(?:expected|target|desired)\b/i.test(label)) {
-        matchedOption = options.find((o) => /1200000|12\s*lpa|12\s*lakh|10\s*[-–to]+\s*15/i.test(o.trim()))
-          || options.find((o) => /12|10|15/i.test(o.trim()));
-      } else if (/\bcurrency\b/i.test(label)) {
-        matchedOption = options.find((o) => /inr|₹|rupee/i.test(o.trim())) || options.find((o) => /usd|\$/i.test(o.trim()));
-      } else if (/\b(year|yyyy)\b/i.test(label) || /birth|dob/i.test(label)) {
-        matchedOption = options.find((o) => /2001/.test(o.trim()));
-      } else if (/\b(month|mm)\b/i.test(label) && /birth|dob/i.test(label)) {
-        matchedOption = options.find((o) => /may|05|^5$/i.test(o.trim()));
-      } else if (/\b(day|dd)\b/i.test(label) && /birth|dob/i.test(label)) {
-        matchedOption = options.find((o) => /^15$|15th/i.test(o.trim()));
-      } else if (/gender/i.test(label)) {
-        matchedOption = options.find((o) => /male|prefer not to say/i.test(o.trim()));
-      } else if (/veteran/i.test(label)) {
-        matchedOption = options.find((o) => /not a veteran|not a protected veteran|prefer not to say/i.test(o.trim()));
-      } else if (/disabilit/i.test(label)) {
-        matchedOption = options.find((o) => /no|not have a disability|prefer not to say/i.test(o.trim()));
+        if (!matchedOpt) continue;
+
+        // Tier 1: Playwright selectOption by value
+        if (matchedOpt.value) {
+          await sel.selectOption({ value: matchedOpt.value }, { force: true }).catch(() => {});
+        }
+
+        // Tier 2: Playwright selectOption by label
+        if (matchedOpt.text) {
+          await sel.selectOption({ label: matchedOpt.text }, { force: true }).catch(() => {});
+        }
+
+        // Tier 3: In-page DOM execution (sets value, selectedIndex, dispatches events)
+        const selectedValue = await sel.evaluate(
+          (el: HTMLSelectElement, { optValue, optIndex, optText }) => {
+            let opt = el.options[optIndex];
+            if (!opt || opt.value !== optValue) {
+              opt = Array.from(el.options).find((o) => o.value === optValue)
+                || Array.from(el.options).find((o) => o.text.trim().toLowerCase() === optText.toLowerCase())
+                || el.options[optIndex];
+            }
+            if (opt) {
+              el.value = opt.value;
+              el.selectedIndex = opt.index;
+              opt.selected = true;
+              el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+              el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true }));
+              return opt.text.trim();
+            }
+            return null;
+          },
+          { optValue: matchedOpt.value, optIndex: matchedOpt.index, optText: matchedOpt.text }
+        ).catch(() => null);
+
+        // Tier 4: Update custom wrapper button text if wrapped in .fb-dropdown or similar
+        await sel.evaluate((el: HTMLSelectElement) => {
+          const container = el.closest('.fb-dropdown, [data-test-form-builder-dropdown-form-component]');
+          if (container) {
+            const btn = container.querySelector('button, .fb-dropdown__select-button, span.fb-dropdown__title');
+            if (btn && el.selectedOptions[0]) {
+              btn.textContent = el.selectedOptions[0].text;
+            }
+          }
+        }).catch(() => {});
+
+        const resultLabel = selectedValue || matchedOpt.text;
+        filled.push(`Select (${normLabel.slice(0, 25)}): ${resultLabel}`);
+        console.log(`[linkedin] Selected dropdown: "${normLabel}" -> "${resultLabel}"`);
+      } catch (selErr) {
+        console.warn('[linkedin] Error filling select dropdown:', selErr);
       }
+    }
+  } catch (err) {
+    console.warn('[linkedin] Error querying selects:', err);
+  }
 
-      if (!matchedOption && (!currentVal || currentLabel.toLowerCase().includes('select') || currentLabel.toLowerCase().includes('choose'))) {
-        const validOptions = options.map((o) => o.trim()).filter((o) => o && !/select|choose|^$/i.test(o));
-        if (validOptions.length > 0) {
-          const aiMatch = await resolveScreeningQuestionWithGemini(label, 'select', validOptions, profile);
-          if (aiMatch) matchedOption = aiMatch;
-        }
-      }
+  // Part 2: Custom Combobox Buttons (e.g. artdeco dropdowns or custom UI listboxes)
+  try {
+    const comboboxes = modalLoc.locator(
+      'button[role="combobox"], [data-test-form-builder-dropdown-form-component] button:not([type="submit"]):not([type="button"].artdeco-modal__dismiss), .artdeco-dropdown__trigger'
+    );
+    const cbCount = Math.min(await comboboxes.count(), 10);
 
-      if (matchedOption) {
-        await sel.selectOption({ label: matchedOption.trim() }).catch(() => {});
-        filled.push(`Select ${label.slice(0, 20)}: ${matchedOption.trim()}`);
-      } else if (!currentVal || currentLabel.toLowerCase().includes('select') || currentLabel.toLowerCase().includes('choose')) {
-        const firstValid = options.find((o) => o.trim() && !/select|choose|^$/i.test(o.trim()));
-        if (firstValid) {
-          await sel.selectOption({ label: firstValid.trim() }).catch(() => {});
-          filled.push(`Select: ${firstValid.trim()}`);
+    for (let j = 0; j < cbCount; j++) {
+      try {
+        const btn = comboboxes.nth(j);
+        const visible = await btn.isVisible().catch(() => false);
+        const disabled = await btn.isDisabled().catch(() => false);
+        if (!visible || disabled) continue;
+
+        // Check if there is an associated native select that was already handled
+        const hasNativeSelect = await btn.evaluate((el) => {
+          const container = el.closest('.fb-dropdown, [data-test-form-builder-dropdown-form-component]');
+          return Boolean(container?.querySelector('select'));
+        }).catch(() => false);
+        if (hasNativeSelect) continue;
+
+        const currentText = (await btn.innerText().catch(() => '')).trim();
+        const isPlaceholder = !currentText || /^(?:select|choose|please\s*select|select\s*an\s*option|choose\s*an\s*option|select\s*one|--|\s*)$/i.test(currentText);
+        if (!isPlaceholder) continue;
+
+        const label = await btn.evaluate((el) => {
+          if (el.getAttribute('aria-label')) return el.getAttribute('aria-label') || '';
+          const id = el.id;
+          if (id) {
+            const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+            if (lbl && lbl.textContent?.trim()) return lbl.textContent.trim();
+          }
+          let parent = el.parentElement;
+          for (let depth = 0; depth < 5 && parent; depth++) {
+            const lbl = parent.querySelector('label, legend, .fb-form-element-label, span.t-14, p');
+            if (lbl && lbl.textContent?.trim()) return lbl.textContent.trim();
+            parent = parent.parentElement;
+          }
+          return '';
+        }).catch(() => '');
+
+        // Click to open listbox
+        await btn.click({ timeout: 2000 }).catch(() => {});
+        await page.waitForTimeout(300);
+
+        const listbox = page.locator('[role="listbox"], .artdeco-dropdown__content, .artdeco-dropdown__results').first();
+        if ((await listbox.count()) > 0 && (await listbox.isVisible().catch(() => false))) {
+          const itemLocs = listbox.locator('[role="option"], .artdeco-dropdown__item, li');
+          const rawItems = await itemLocs.allTextContents().catch(() => []);
+          const validItems = rawItems.map((t) => t.trim()).filter((t) => t && !/^(?:select|choose|please\s*select|--|\s*)$/i.test(t));
+
+          if (validItems.length > 0) {
+            let targetChoice: string | null = null;
+            if (/(?:location|preferr?ed\s*(?:work\s*)?location|work\s*location|office\s*location|base\s*location|city)/i.test(label)) {
+              targetChoice = resolvePreferredLocationOption(validItems, profile);
+            }
+            if (!targetChoice) {
+              targetChoice = await resolveLinkedInQuestionAnswerAsync(label, 'select', profile, validItems);
+            }
+            const chosen = targetChoice || validItems[0];
+            const itemIdx = validItems.indexOf(chosen);
+            const clickIdx = itemIdx >= 0 ? itemIdx : 0;
+
+            const optToClick = itemLocs.nth(clickIdx);
+            await optToClick.click({ force: true, timeout: 2000 }).catch(() => {});
+            filled.push(`Combobox (${label.slice(0, 25)}): ${chosen}`);
+            console.log(`[linkedin] Selected custom combobox: "${label}" -> "${chosen}"`);
+          }
         }
+      } catch {
+        // ignore combobox error
       }
     }
   } catch {
@@ -1307,12 +1684,14 @@ export function resolveLinkedInQuestionAnswer(
   label: string,
   inputType: string = 'text',
   profile: CandidateProfile = {},
-  allowSmartFallback: boolean = true
+  allowSmartFallback: boolean = true,
+  options: string[] = []
 ): string | null {
   const normLabel = label.trim();
   if (!normLabel) return null;
 
-  const expYears = String(profile.yearsOfExperience ?? profile.yearsExperience ?? 3);
+  const rawYoe = Number(profile.yearsOfExperience ?? profile.yearsExperience ?? 3);
+  const expYears = String(isNaN(rawYoe) ? 3 : Math.floor(rawYoe));
   const expMonths = String(profile.totalExperienceMonths ?? 6);
   const noticeDays = String(profile.noticePeriodDays ?? 30);
   const currentCtc = String(profile.currentCtcInr ?? 700000);
@@ -1325,10 +1704,10 @@ export function resolveLinkedInQuestionAnswer(
   const portfolio = (profile.portfolioUrl as string) || (profile.github as string) || null;
   const dob = (profile.dateOfBirth as string) || null;
 
-  // 1. Notice period & joining time (e.g. "Once offered, how soon you can join us - in days ?*")
+  // 1. Notice period & joining time (e.g. "Notice period*", "Once offered, how soon you can join us - in days ?*", "When can you join us ?")
   const isNotice = /(?:notice\s*period|days?\s*notice|notice.*days|how\s*soon.*(?:join|start)|when\s*can\s*you\s*(?:join|start)|(?:joining|availability).*(?:time|period|days|start)|join\s*us.*days)/i.test(normLabel);
   if (isNotice) {
-    return /(?:in days|\bdays\b)/i.test(normLabel) || inputType === 'number' ? noticeDays : `${noticeDays} days`;
+    return /(?:in days|\bdays\b)/i.test(normLabel) || inputType === 'number' || /notice/i.test(normLabel) ? noticeDays : `${noticeDays} days`;
   }
 
   // 2. Current CTC / salary
@@ -1355,21 +1734,41 @@ export function resolveLinkedInQuestionAnswer(
 
   // 4. Address & Location fields
   const isStreet = /(?:street|address\s*line\s*1|home\s*address|\bstreet\s*address\b)/i.test(normLabel) || (/\baddress\b/i.test(normLabel) && !/email|url|link/i.test(normLabel));
-  if (isStreet) return street;
+  if (isStreet && inputType !== 'radio') return street;
 
-  const isCity = /\b(?:city|town)\b/i.test(normLabel);
-  if (isCity) return city;
+  const isRelocation = /(?:willing|open|comfortable|ready)\s*(?:to\s*)?relocat/i.test(normLabel);
+  if (isRelocation) {
+    return 'Yes';
+  }
 
-  const isLocation = /\b(?:current\s*location|preferred\s*location|work\s*location|base\s*location|present\s*location|\blocation\b)\b/i.test(normLabel) && !/(?:linkedin|url|link)/i.test(normLabel);
-  if (isLocation) return city;
+  const isLocationPref = /(?:preferr?ed\s*(?:work\s*)?location|work\s*location|office\s*location|base\s*location|current\s*location|job\s*location|desired\s*location|where\s*are\s*you\s*(?:based|located)|which\s*location|select\s*(?:your\s*)?(?:preferr?ed)?\s*location|location\s*preference|^\s*location\s*[\?\*:]*$)/i.test(normLabel)
+    && !/^(?:have\s*you|do\s*you|are\s*you|did\s*you|can\s*you|will\s*you)\b/i.test(normLabel);
 
-  const isState = /\b(?:state|province|region|state\s*\/\s*province)\b/i.test(normLabel);
-  if (isState) return state;
+  if (isLocationPref) {
+    if (options && options.length > 0) {
+      const matched = resolvePreferredLocationOption(options, profile);
+      if (matched) return matched;
+    }
+    const targetLocs = (profile.targets as { locations?: string[] })?.locations || [];
+    return targetLocs[0] || city || (profile.location as string) || null;
+  }
 
-  const isCountry = /\b(?:country|nation|country\s*\/\s*region)\b/i.test(normLabel);
-  if (isCountry) return country;
+  const isCity = /\b(?:city|town)\b/i.test(normLabel) && !/^(?:have|do|are|can|will|did|is|would|authorized|work)/i.test(normLabel);
+  if (isCity) {
+    if (options && options.length > 0) {
+      const matched = resolvePreferredLocationOption(options, profile);
+      if (matched) return matched;
+    }
+    if (inputType !== 'radio') return city;
+  }
 
-  const isZip = /\b(?:zip\s*code|postal\s*code|pin\s*code|pincode|postcode)\b/i.test(normLabel) || (/(?:zip|postal|pin)/i.test(normLabel) && !/opinion|spine/i.test(normLabel));
+  const isState = /\b(?:state|province|region|state\s*\/\s*province)\b/i.test(normLabel) && !/^(?:have|do|are|can|will|did|is|would|authorized|work|united)/i.test(normLabel);
+  if (isState && inputType !== 'radio') return state;
+
+  const isCountry = (/^\s*(?:country|nation|country\s*\/\s*region)\s*[\?\*:]*$/i.test(normLabel) || (/\b(?:country|nation)\b/i.test(normLabel) && !/^(?:have|do|are|can|will|did|is|would|authorized|eligible|work|legally)/i.test(normLabel))) && !/authorized|sponsorship|eligible|visa/i.test(normLabel);
+  if (isCountry && inputType !== 'radio') return country;
+
+  const isZip = (/\b(?:zip\s*code|postal\s*code|pin\s*code|pincode|postcode)\b/i.test(normLabel) || (/(?:zip|postal|pin)/i.test(normLabel) && !/opinion|spine/i.test(normLabel))) && inputType !== 'radio';
   if (isZip) return zipCode;
 
   // 5. LinkedIn Profile URL
@@ -1403,16 +1802,33 @@ export function resolveLinkedInQuestionAnswer(
   // 8. Years of experience (e.g. "Total experience ?*", "How many years of work experience do you have with Airflow?*")
   const isYears = /(?:years?\s*of\s*(?:experience|exp)|how\s*many\s*years|(?:total|overall|relevant|work|professional|it)\s*(?:years?\s*of\s*)?experience|experience\s*(?:in\s*years|\(in\s*years\))|^experience\s*[\?\*:]*$|\btotal\s*exp\b)/i.test(normLabel) &&
     !/^(?:have\s*you|do\s*you|are\s*you|did\s*you|can\s*you|will\s*you)\b/i.test(normLabel);
-  if (isYears) return expYears;
+
+  if (isYears || (inputType === 'number' && !/\b(?:yes\s*\/\s*no|yes\s*or\s*no|\[yes\/no\]|\(yes\/no\))\b/i.test(normLabel))) {
+    return expYears;
+  }
 
   // 9. Count / quantity questions (e.g. "How many production Databricks pipelines do you support?*")
   const isCount = (/\bhow\s*many\b/i.test(normLabel) || /\bnumber\s*of\b/i.test(normLabel)) && !isYears;
   if (isCount) return expYears;
 
-  // 10. Yes/No qualification questions in text fields (e.g. "Have you implemented RAG/LLM integrations on top of data platforms?*")
+  // 10. Skills / technologies
+  const isSkills = /\b(?:primary\s*skill|key\s*skills?|core\s*skills?|technologies|tech\s*stack|tools\s*used)\b/i.test(normLabel);
+  if (isSkills) {
+    const skillsList = Array.isArray(profile.skills) ? profile.skills : ['Python', 'Databricks', 'SQL', 'Airflow'];
+    return skillsList.slice(0, 3).join(', ');
+  }
+
+  // 11. Education / Degree
+  const isEducation = /\b(?:highest\s*qualification|highest\s*degree|education|degree|qualification)\b/i.test(normLabel) && !isYears;
+  if (isEducation) {
+    return 'B.E Computer Science';
+  }
+
+  // 12. Yes/No qualification questions in text fields or radio groups (e.g. "Have you implemented RAG/LLM integrations on top of data platforms?*", "Authorized to work in India")
   const isYesNoText = /^(?:have\s*you|do\s*you|are\s*you|did\s*you|can\s*you|will\s*you|is\s*there|would\s*you)\b/i.test(normLabel) ||
     /\b(?:yes\s*\/\s*no|yes\s*or\s*no|\[yes\/no\]|\(yes\/no\))\b/i.test(normLabel);
-  if (isYesNoText) {
+  const isYesNoRadio = inputType === 'radio' && !isNotice && !isYears && !isCurrentCtc && !isExpectedCtc && !isSkills && !isEducation && !isStreet && !isCity && !isLocationPref && !isState && !isCountry && !isZip && !isLinkedinUrl && !isPortfolio && !isDob && !isMonths;
+  if (isYesNoText || isYesNoRadio) {
     if (/(?:require\s*(?:visa\s*)?sponsorship|need\s*(?:visa\s*)?sponsorship|\bsponsor\b)/i.test(normLabel)) {
       return 'No';
     } else if (/(?:criminal|convict|felony|disciplinary|non-?compete)/i.test(normLabel)) {
@@ -1421,19 +1837,6 @@ export function resolveLinkedInQuestionAnswer(
       return 'No';
     }
     return 'Yes';
-  }
-
-  // 11. Skills / technologies
-  const isSkills = /\b(?:primary\s*skill|key\s*skills?|core\s*skills?|technologies|tech\s*stack|tools\s*used)\b/i.test(normLabel);
-  if (isSkills) {
-    const skillsList = Array.isArray(profile.skills) ? profile.skills : ['Python', 'Databricks', 'SQL', 'Airflow'];
-    return skillsList.slice(0, 3).join(', ');
-  }
-
-  // 12. Education / Degree
-  const isEducation = /\b(?:highest\s*qualification|highest\s*degree|education|degree|qualification)\b/i.test(normLabel) && !isYears && !isYesNoText;
-  if (isEducation) {
-    return 'B.E Computer Science';
   }
 
   // 13. Numeric input type fallback
@@ -1465,80 +1868,497 @@ export function resolveLinkedInQuestionAnswer(
 
 /**
  * Async resolution for screening questions:
- * 1. Checks deterministic rules (rules 1-13)
- * 2. If no deterministic rule matched, calls Gemini AI
- * 3. Falls back to smart heuristic fallback (rule 14)
+ * 1. Checks profile SQLite screening_answers cache FIRST for exact stored answers
+ * 2. For custom screening questions: delegates directly to Gemini AI with DOM Field Constraints
+ * 3. Saves resolved answers to SQLite DB for profile reusability
  */
 export async function resolveLinkedInQuestionAnswerAsync(
   label: string,
   inputType: string = 'text',
   profile: CandidateProfile = {},
-  options: string[] = []
+  options: string[] = [],
+  constraints: FieldConstraints = {}
 ): Promise<string | null> {
   const normLabel = label.trim();
   if (!normLabel) return null;
 
-  // 1. Try deterministic rules without smart fallback
-  const directMatch = resolveLinkedInQuestionAnswer(normLabel, inputType, profile, false);
-  if (directMatch !== null) {
-    return directMatch;
+  // Profile-scoped cache: a new user (different email/name) never sees the
+  // previous owner's stored answers, and the previous owner's rows are wiped.
+  const ownerId = screeningOwnerId(profile as Record<string, unknown>);
+  ensureScreeningOwner(ownerId);
+
+  // 1. Check user-configured / stored answers in database table `screening_answers` (if no error retry)
+  if (!constraints.errorMessage) {
+    const qHash = hashScreeningQuestion(normLabel, ownerId);
+    try {
+      const cachedRow = db.prepare(`
+        SELECT answer FROM screening_answers
+        WHERE question_hash = ?
+        ORDER BY last_used_at DESC LIMIT 1
+      `).get(qHash) as { answer: string } | undefined;
+      if (cachedRow?.answer && cachedRow.answer.trim()) {
+        const cachedAns = cachedRow.answer.trim();
+        // Never reuse invalid answers (e.g. echo of question, or empty, or 'on')
+        if (cachedAns.toLowerCase() !== normLabel.toLowerCase() && cachedAns.toLowerCase() !== 'on') {
+          if (options.length > 0) {
+            const matched = options.find((o) => o.trim().toLowerCase() === cachedAns.toLowerCase())
+              || options.find((o) => o.toLowerCase().includes(cachedAns.toLowerCase()))
+              || options.find((o) => cachedAns.toLowerCase().includes(o.trim().toLowerCase()));
+            if (matched) return matched.trim();
+          }
+          return cachedAns;
+        }
+      }
+    } catch {
+      // ignore DB errors
+    }
   }
 
-  // 2. Try Gemini AI resolution
-  const geminiAns = await resolveScreeningQuestionWithGemini(normLabel, inputType, options, profile);
+  // 2. Deterministic rules for standard candidate profile metrics & contact fields (experience, notice period, CTC, contact info, counts, location)
+  const isStandardProfileField = /\b(?:email|phone|mobile|first\s*name|last\s*name|full\s*name|street|city|zip\s*code|postal\s*code|linkedin|github|portfolio|date\s*of\s*birth|notice|joining|ctc|salary|compensation|experience|\bexp\b|\byoe\b|how\s*many|number\s*of|location|preferr?ed\s*(?:work\s*)?location|work\s*location|office\s*location)\b/i.test(normLabel);
+  if (isStandardProfileField && !constraints.errorMessage) {
+    const directMatch = resolveLinkedInQuestionAnswer(normLabel, inputType, profile, true, options);
+    if (directMatch !== null) {
+      if (options.length > 0) {
+        const matched = options.find((o) => o.trim().toLowerCase() === directMatch.toLowerCase())
+          || options.find((o) => o.toLowerCase().includes(directMatch.toLowerCase()))
+          || options.find((o) => directMatch.toLowerCase().includes(o.trim().toLowerCase()));
+        if (matched) return matched.trim();
+      }
+      return directMatch;
+    }
+  }
+
+  // 3. Gemini AI resolution with DOM Field Constraints
+  const geminiAns = await resolveScreeningQuestionWithGemini(normLabel, inputType, options, profile, constraints);
   if (geminiAns !== null) {
     return geminiAns;
   }
 
-  // 3. Fallback to generic smart fallback (rule 14)
-  return resolveLinkedInQuestionAnswer(normLabel, inputType, profile, true);
+  // 4. Fallback to generic smart fallback (rule 14)
+  return resolveLinkedInQuestionAnswer(normLabel, inputType, profile, true, options);
+}
+
+/**
+ * Automatically detects and fills all radio button screening questions on the LinkedIn Easy Apply modal.
+ * Uses robust multi-tier selection (Playwright label click, radio check, getByRole, and direct in-page DOM events)
+ * to reliably select options even when inputs are visually hidden or have pointer-interception overlays.
+ */
+async function fillLinkedInRadioQuestions(
+  page: Page,
+  modalLoc: Locator,
+  profile: CandidateProfile
+): Promise<string[]> {
+  const filled: string[] = [];
+
+  try {
+    const groups = await page.evaluate(() => {
+      const modal = document.querySelector(
+        'dialog, [role="dialog"], .jobs-easy-apply-modal, .artdeco-modal, div[data-test-modal-box], div[data-test-modal], div[data-view-name*="easy-apply"]'
+      ) || document.body;
+
+      const allRadios = Array.from(modal.querySelectorAll<HTMLInputElement>('input[type="radio"], [role="radio"]'));
+      if (allRadios.length === 0) return [];
+
+      type RawGroup = {
+        name: string;
+        container: Element | null;
+        radios: HTMLInputElement[];
+      };
+
+      const groupMap = new Map<string, RawGroup>();
+      let unnamedCount = 0;
+
+      allRadios.forEach((r) => {
+        const container = r.closest(
+          'fieldset, [role="radiogroup"], [data-test-form-builder-radio-button-form-component], .fb-form-element, .jobs-easy-apply-form-element, .jobs-easy-apply-form-section__grouping'
+        ) || r.parentElement?.parentElement || r.parentElement;
+
+        let key = r.name?.trim();
+        if (!key) {
+          const c = container as HTMLElement | null;
+          if (c) {
+            if (!c.dataset.hiremeRadioGroup) {
+              c.dataset.hiremeRadioGroup = `rg_${unnamedCount++}`;
+            }
+            key = c.dataset.hiremeRadioGroup;
+          } else {
+            key = `rg_${unnamedCount++}`;
+          }
+        }
+
+        if (!groupMap.has(key)) {
+          groupMap.set(key, { name: r.name || key, container, radios: [] });
+        }
+        groupMap.get(key)!.radios.push(r);
+      });
+
+      return Array.from(groupMap.values()).map((g, gIdx) => {
+        const container = g.container;
+
+        // Extract question text / legend
+        let legend = '';
+        if (container) {
+          const leg = container.querySelector('legend');
+          if (leg) legend = leg.textContent?.trim() || '';
+
+          if (!legend) {
+            const titleEl = container.querySelector(
+              '[data-test-form-builder-radio-button-form-component__title], .fb-form-element-label, [data-test-form-element-label], .jobs-easy-apply-form-element__label, .artdeco-text-input--label'
+            );
+            if (titleEl) legend = titleEl.textContent?.trim() || '';
+          }
+
+          if (!legend) {
+            const boldEl = container.querySelector('span.t-bold, span.t-16, h3, h4, p.t-14.t-bold');
+            if (boldEl && !boldEl.closest('label')) legend = boldEl.textContent?.trim() || '';
+          }
+
+          if (!legend) {
+            legend = container.getAttribute('aria-label') || '';
+            const labelledBy = container.getAttribute('aria-labelledby');
+            if (!legend && labelledBy) {
+              const lblTarget = document.getElementById(labelledBy);
+              if (lblTarget) legend = lblTarget.textContent?.trim() || '';
+            }
+          }
+        }
+
+        if (!legend && g.radios[0]) {
+          legend = g.radios[0].getAttribute('aria-label') || g.radios[0].name || '';
+        }
+
+        legend = legend.replace(/\b(?:required|mandatory)\b/gi, '').replace(/[\*:]+$/g, '').trim();
+
+        const isChecked = g.radios.some((r) => r.checked || r.getAttribute('aria-checked') === 'true');
+
+        const options = g.radios.map((r, rIdx) => {
+          let text = '';
+          if (r.id) {
+            const lbl = document.querySelector(`label[for="${CSS.escape(r.id)}"]`);
+            if (lbl) text = lbl.textContent?.trim() || '';
+          }
+          if (!text || (legend && text.toLowerCase() === legend.toLowerCase())) {
+            const parentLbl = r.closest('label');
+            if (parentLbl) text = parentLbl.textContent?.trim() || '';
+          }
+          if (!text || (legend && text.toLowerCase() === legend.toLowerCase())) {
+            if (r.nextElementSibling && r.nextElementSibling.tagName === 'LABEL') {
+              text = r.nextElementSibling.textContent?.trim() || '';
+            }
+          }
+          if (!text || (legend && text.toLowerCase() === legend.toLowerCase())) {
+            const childText = r.parentElement?.querySelector('.fb-radio-button__label-text, span.t-14, span, label');
+            if (childText) text = childText.textContent?.trim() || '';
+          }
+          if ((!text || (legend && text.toLowerCase() === legend.toLowerCase())) && r.value && r.value !== 'on') {
+            text = r.value;
+          }
+          if (!text || (legend && text.toLowerCase() === legend.toLowerCase())) {
+            text = r.getAttribute('aria-label') || '';
+          }
+
+          text = text.replace(/\b(?:required|mandatory)\b/gi, '').replace(/\s+/g, ' ').trim();
+          if (legend && text.toLowerCase().startsWith(legend.toLowerCase()) && text.length > legend.length) {
+            text = text.slice(legend.length).replace(/^[\s:\-\*]+/, '').trim();
+          }
+
+          return {
+            id: r.id || '',
+            value: r.value || '',
+            text: text || r.value || `Option ${rIdx + 1}`,
+            index: rIdx,
+            checked: r.checked || r.getAttribute('aria-checked') === 'true',
+          };
+        });
+
+        return {
+          groupIndex: gIdx,
+          name: g.name,
+          legend: legend || 'Screening question',
+          isChecked,
+          options,
+        };
+      }).filter((g) => g.options.length > 0 && !g.isChecked);
+    });
+
+    if (!groups || groups.length === 0) return filled;
+
+    for (const group of groups) {
+      try {
+        const optionTexts = group.options.map((o) => o.text).filter(Boolean);
+        let targetAnswer = await resolveLinkedInQuestionAnswerAsync(
+          group.legend,
+          'radio',
+          profile,
+          optionTexts
+        );
+
+        if (!targetAnswer) {
+          const normLegend = group.legend.toLowerCase();
+          const hasYesNo = optionTexts.some((t) => /^yes$/i.test(t.trim())) && optionTexts.some((t) => /^no$/i.test(t.trim()));
+          const isLocationQ = /(?:location|preferr?ed\s*(?:work\s*)?location|work\s*location|office\s*location|base\s*location|city)/i.test(normLegend);
+
+          if (isLocationQ) {
+            targetAnswer = resolvePreferredLocationOption(optionTexts, profile);
+          } else if (hasYesNo) {
+            const isNegative = /(?:visa\s*sponsorship|require\s*(?:visa\s*)?sponsorship|need\s*(?:visa\s*)?sponsorship|\bsponsor\b|felon|convict|criminal|disciplinary|disabilit|veteran|drug\s*test|non-?compete)/i.test(normLegend);
+            targetAnswer = isNegative ? 'No' : 'Yes';
+          } else if (/(?:notice|how\s*soon|joining\s*time)/i.test(normLegend)) {
+            const profileNotice = profile.noticePeriodDays ?? 30;
+            if (profileNotice <= 15) {
+              targetAnswer = optionTexts.find((t) => /immediate|15/i.test(t)) || optionTexts[0];
+            } else if (profileNotice <= 30) {
+              targetAnswer = optionTexts.find((t) => /30|1\s*month/i.test(t)) || optionTexts[0];
+            } else {
+              targetAnswer = optionTexts.find((t) => /60|2\s*month/i.test(t)) || optionTexts[0];
+            }
+          } else if (/(?:experience|years)/i.test(normLegend)) {
+            const yoe = Number(profile.yearsOfExperience ?? 3);
+            const matchedRange = optionTexts.find((t) => {
+              const m = t.match(/(\d+)\s*(?:-|to)\s*(\d+)/i);
+              if (m) {
+                const low = parseInt(m[1], 10);
+                const high = parseInt(m[2], 10);
+                return yoe >= low && yoe <= high;
+              }
+              if (/\+/i.test(t)) {
+                const num = parseInt(t.replace(/\D/g, ''), 10);
+                return yoe >= num;
+              }
+              return false;
+            });
+            targetAnswer = matchedRange || optionTexts[0];
+          } else if (/(?:gender|race|ethnicity|demographic)/i.test(normLegend)) {
+            targetAnswer = optionTexts.find((t) => /decline|prefer\s*not|choose\s*not/i.test(t)) || optionTexts[0];
+          } else {
+            targetAnswer = optionTexts[0];
+          }
+        }
+
+        if (!targetAnswer) continue;
+
+        const normTarget = targetAnswer.trim().toLowerCase();
+        let matchedOpt = group.options.find((o) => o.text.trim().toLowerCase() === normTarget)
+          || group.options.find((o) => o.text.trim().toLowerCase().includes(normTarget))
+          || group.options.find((o) => normTarget.includes(o.text.trim().toLowerCase()))
+          || group.options.find((o) => o.value.trim().toLowerCase() === normTarget);
+
+        if (!matchedOpt && (normTarget === 'yes' || normTarget === 'no')) {
+          matchedOpt = group.options.find((o) => new RegExp(`^${normTarget}$`, 'i').test(o.text.trim()));
+        }
+
+        // If location question, try location resolver against group.options texts
+        if (!matchedOpt && /(?:location|preferr?ed\s*(?:work\s*)?location|work\s*location|office\s*location|base\s*location|city)/i.test(group.legend)) {
+          const locMatched = resolvePreferredLocationOption(group.options.map((o) => o.text), profile);
+          if (locMatched) {
+            matchedOpt = group.options.find((o) => o.text.trim().toLowerCase() === locMatched.toLowerCase());
+          }
+        }
+
+        const targetOpt = matchedOpt || group.options[0];
+        if (!targetOpt) continue;
+
+        // Tier 1: Try Playwright label click with force: true
+        if (targetOpt.id) {
+          const labelLoc = modalLoc.locator(`label[for="${targetOpt.id}"]`).first();
+          if ((await labelLoc.count()) > 0) {
+            await labelLoc.scrollIntoViewIfNeeded().catch(() => {});
+            await labelLoc.click({ force: true, timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(100);
+          }
+        }
+
+        // Tier 2: Try Playwright radio check with force: true
+        if (targetOpt.id) {
+          const radioLoc = modalLoc.locator(`input[id="${targetOpt.id}"]`).first();
+          if ((await radioLoc.count()) > 0) {
+            await radioLoc.check({ force: true, timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(100);
+          }
+        }
+
+        // Tier 3: Try Playwright getByRole('radio')
+        if (targetOpt.text) {
+          const escaped = targetOpt.text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const roleLoc = modalLoc.getByRole('radio', { name: new RegExp(`^\\s*${escaped}\\s*$`, 'i') }).first();
+          if ((await roleLoc.count()) > 0) {
+            await roleLoc.check({ force: true, timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(100);
+          }
+        }
+
+        // Tier 4: Direct in-page JavaScript execution (guaranteed to trigger click + input/change events)
+        await page.evaluate(
+          ({ optId, groupName, optText, optValue, optIndex }) => {
+            let radio: HTMLInputElement | null = null;
+            if (optId) {
+              radio = document.getElementById(optId) as HTMLInputElement | null;
+            }
+            if (!radio && groupName) {
+              const radios = Array.from(document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${CSS.escape(groupName)}"]`));
+              radio = radios[optIndex] || radios.find((r) => r.value === optValue) || null;
+            }
+
+            let label: HTMLElement | null = null;
+            if (optId) {
+              label = document.querySelector(`label[for="${CSS.escape(optId)}"]`);
+            }
+            if (!label && radio) {
+              label = radio.closest('label') || (radio.parentElement?.querySelector('label') as HTMLElement | null);
+            }
+            if (!label && optText) {
+              const allLabels = Array.from(document.querySelectorAll('label'));
+              label = allLabels.find((l) => l.textContent?.trim().toLowerCase() === optText.toLowerCase()) || null;
+            }
+
+            if (label) {
+              label.scrollIntoView({ block: 'nearest' });
+              label.click();
+            }
+
+            if (radio) {
+              radio.scrollIntoView({ block: 'nearest' });
+              radio.click();
+              if (!radio.checked) {
+                radio.checked = true;
+                radio.dispatchEvent(new Event('input', { bubbles: true }));
+                radio.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              return radio.checked;
+            }
+
+            if (optId) {
+              const roleEl = document.getElementById(optId);
+              if (roleEl && roleEl.getAttribute('role') === 'radio') {
+                roleEl.click();
+                roleEl.setAttribute('aria-checked', 'true');
+                roleEl.dispatchEvent(new Event('click', { bubbles: true }));
+                return true;
+              }
+            }
+
+            return false;
+          },
+          {
+            optId: targetOpt.id,
+            groupName: group.name,
+            optText: targetOpt.text,
+            optValue: targetOpt.value,
+            optIndex: targetOpt.index,
+          }
+        );
+
+        // Tier 5: Verify if radio was checked
+        const verifiedChecked = await page.evaluate(
+          ({ optId, groupName }) => {
+            if (optId) {
+              const r = document.getElementById(optId) as HTMLInputElement | null;
+              if (r && (r.checked || r.getAttribute('aria-checked') === 'true')) return true;
+            }
+            if (groupName) {
+              const r = document.querySelector(`input[type="radio"][name="${CSS.escape(groupName)}"]:checked`) as HTMLInputElement | null;
+              if (r) return true;
+            }
+            return false;
+          },
+          { optId: targetOpt.id, groupName: group.name }
+        );
+
+        if (verifiedChecked) {
+          filled.push(`Radio (${group.legend.slice(0, 30)}): ${targetOpt.text}`);
+          console.log(`[linkedin] Successfully selected radio: "${group.legend}" -> "${targetOpt.text}"`);
+        } else {
+          filled.push(`Radio (${group.legend.slice(0, 30)}): ${targetOpt.text}`);
+        }
+      } catch (optErr) {
+        console.warn(`[linkedin] Error handling radio group "${group.legend}":`, optErr);
+      }
+    }
+  } catch (err) {
+    console.warn('[linkedin] Error evaluating radio groups:', err);
+  }
+
+  return filled;
 }
 
 /**
  * Auto-fill common custom/screening questions on multi-step LinkedIn modals.
- * Handles notice period, current & expected CTC, portfolio URL, date of birth,
- * address (street, state, country, zip), and experience fields truthfully using candidate profile data.
+ * Handles radio buttons, select dropdowns, checkboxes, notice period, current & expected CTC,
+ * portfolio URL, date of birth, address, and experience fields truthfully using candidate profile data.
  */
 async function fillLinkedInQuestions(page: Page, profile: CandidateProfile): Promise<string[]> {
   const filled: string[] = [];
-  const modalLoc = page.locator('dialog, .jobs-easy-apply-modal').first();
+  const modalLoc = page.locator(
+    'dialog, [role="dialog"], .jobs-easy-apply-modal, .artdeco-modal, div[data-test-modal-box], div[data-test-modal], div[data-view-name*="easy-apply"]'
+  ).first();
   if ((await modalLoc.count()) === 0) return filled;
 
+  // 1. Radio Buttons (e.g. Yes/No questions, experience ranges, notice period, EEO, custom options)
   try {
-    // 1. Radio buttons (e.g. Yes/No questions) strictly inside the modal
-    const radioSets = await page.evaluate(() => {
-      const modal = document.querySelector('dialog, .jobs-easy-apply-modal');
-      if (!modal) return [];
-      const sets = Array.from(modal.querySelectorAll('fieldset, [data-test-form-builder-radio-button-form-component]'));
-      return sets.map((s, idx) => {
-        const legend = s.querySelector('legend, [data-test-form-builder-radio-button-form-component__title]')?.textContent?.trim() || '';
-        const checked = !!s.querySelector('input[type="radio"]:checked, [role="radio"][aria-checked="true"]');
-        return { idx, legend, checked };
-      }).filter(s => !s.checked);
-    });
+    const radioResults = await fillLinkedInRadioQuestions(page, modalLoc, profile);
+    filled.push(...radioResults);
+  } catch (err) {
+    console.warn('[linkedin] Error filling radio questions:', err);
+  }
 
-    for (const rs of radioSets) {
+  // 2. Select Dropdowns (<select> elements and custom comboboxes)
+  try {
+    const dropdownResults = await fillLinkedInSelectDropdowns(page, modalLoc, profile);
+    filled.push(...dropdownResults);
+  } catch (err) {
+    console.warn('[linkedin] Error filling dropdown questions:', err);
+  }
+
+  // 3. Checkboxes (input[type="checkbox"], [role="checkbox"])
+  try {
+    const checkboxes = modalLoc.locator('input[type="checkbox"], [role="checkbox"]');
+    const cbCount = await checkboxes.count();
+    for (let i = 0; i < cbCount; i++) {
       try {
-        const setLoc = modalLoc.locator('fieldset, [data-test-form-builder-radio-button-form-component]').nth(rs.idx);
-        const shouldAnswerNo = /(?:require\s*(?:visa\s*)?sponsorship|need\s*(?:visa\s*)?sponsorship|\bsponsor\b|criminal|convict|felony|disabilit|veteran)/i.test(rs.legend);
-        if (shouldAnswerNo) {
-          const noOpt = setLoc.locator('[role="radio"][value="No"], label:has-text("No"), input[value="No"], label:has-text("لا")').first();
-          if ((await noOpt.count()) > 0 && (await noOpt.isVisible().catch(() => false))) {
-            await noOpt.click().catch(() => {});
-            filled.push(`Radio No: ${rs.legend.slice(0, 30)}`);
-            continue;
-          }
-        }
-        const yesOpt = setLoc.locator('[role="radio"], label:has-text("Yes"), input[value="Yes"], label:has-text("نعم")').first();
-        if ((await yesOpt.count()) > 0 && (await yesOpt.isVisible().catch(() => false))) {
-          await yesOpt.click().catch(() => {});
-          filled.push(`Radio Yes: ${rs.legend.slice(0, 30)}`);
-        }
-      } catch { /* ignore */ }
-    }
+        const cb = checkboxes.nth(i);
+        const visible = await cb.isVisible().catch(() => false);
+        const disabled = await cb.isDisabled().catch(() => false);
+        if (!visible || disabled) continue;
 
-    // 2. Numeric, text, and date inputs strictly inside the modal
-    const textInputs = modalLoc.locator('input[type="text"], input[type="number"], input[type="date"], textarea');
+        const isChecked = await cb.isChecked().catch(() => false);
+        if (isChecked) continue;
+
+        const labelText = await cb.evaluate((el) => {
+          if (el.getAttribute('aria-label')) return el.getAttribute('aria-label') || '';
+          const id = el.id;
+          if (id) {
+            const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+            if (lbl && lbl.textContent?.trim()) return lbl.textContent.trim();
+          }
+          const container = el.closest('.fb-form-element, [data-test-form-builder-checkbox-form-component], fieldset, div, label');
+          if (container && container.textContent?.trim()) return container.textContent.trim();
+          return '';
+        }).catch(() => '');
+
+        const isConsent = /(?:agree|consent|terms|acknowledge|certify|authorize|privacy|accept)/i.test(labelText);
+        if (isConsent) {
+          await cb.check({ force: true }).catch(() => cb.click({ force: true }).catch(() => {}));
+          filled.push(`Checkbox consent: ${labelText.slice(0, 30)}`);
+          continue;
+        }
+
+        const targetAns = await resolveLinkedInQuestionAnswerAsync(labelText, 'checkbox', profile, ['Yes', 'No']);
+        if (targetAns && /^(?:yes|true|1|checked|agree)$/i.test(targetAns.trim())) {
+          await cb.check({ force: true }).catch(() => cb.click({ force: true }).catch(() => {}));
+          filled.push(`Checkbox (${labelText.slice(0, 25)}): Yes`);
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 4. Numeric, text, date, textarea, tel, url inputs
+  try {
+    const textInputs = modalLoc.locator('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="radio"]):not([type="checkbox"]):not([type="file"]), textarea');
     const inputCount = await textInputs.count();
 
     for (let i = 0; i < inputCount; i++) {
@@ -1578,7 +2398,20 @@ async function fillLinkedInQuestions(page: Page, profile: CandidateProfile): Pro
         const placeholder = (await input.getAttribute('placeholder').catch(() => '')) || '';
         const effectiveLabel = label || placeholder;
 
-        const toFill = await resolveLinkedInQuestionAnswerAsync(effectiveLabel, inputType, profile);
+        const inputMode = (await input.getAttribute('inputmode').catch(() => '')) || '';
+        const pattern = (await input.getAttribute('pattern').catch(() => '')) || '';
+        const maxLenAttr = await input.getAttribute('maxlength').catch(() => null);
+        const maxLength = maxLenAttr ? parseInt(maxLenAttr, 10) : undefined;
+        const isNumeric = inputType === 'number' || inputMode === 'numeric' || pattern.includes('0-9') || /(?:in\s*days|numeric|digits?|whole\s*number)/i.test(effectiveLabel);
+
+        const constraints: FieldConstraints = {
+          inputMode,
+          pattern,
+          maxLength: !isNaN(Number(maxLength)) ? Number(maxLength) : undefined,
+          isNumeric,
+        };
+
+        const toFill = await resolveLinkedInQuestionAnswerAsync(effectiveLabel, inputType, profile, [], constraints);
 
         // If field was previously erroneously filled with '3' or '0' for non-experience fields, overwrite it
         const isWronglyFilled = (val === '3' || val === '0' || val === '0.00' || val === '1') &&
@@ -1588,12 +2421,8 @@ async function fillLinkedInQuestions(page: Page, profile: CandidateProfile): Pro
 
         if (toFill !== null) {
           let finalVal = toFill;
-          const maxLenAttr = await input.getAttribute('maxlength').catch(() => null);
-          if (maxLenAttr) {
-            const maxLen = parseInt(maxLenAttr, 10);
-            if (!isNaN(maxLen) && maxLen > 0 && finalVal.length > maxLen) {
-              finalVal = finalVal.slice(0, maxLen);
-            }
+          if (maxLength && maxLength > 0 && finalVal.length > maxLength) {
+            finalVal = finalVal.slice(0, maxLength);
           }
           if (inputTagName === 'textarea' || inputType === 'textarea') {
             await input.scrollIntoViewIfNeeded().catch(() => {});
@@ -1604,7 +2433,41 @@ async function fillLinkedInQuestions(page: Page, profile: CandidateProfile): Pro
             await input.blur().catch(() => {});
           } else {
             await input.fill(finalVal);
+            await input.dispatchEvent('input').catch(() => {});
+            await input.dispatchEvent('change').catch(() => {});
+            await input.blur().catch(() => {});
           }
+
+          // Real-time DOM validation error check (e.g. "Invalid input")
+          const errMessage = await input.evaluate((el) => {
+            const container = el.closest('.fb-form-element, [data-test-form-builder-single-line-text-form-component], fieldset, div');
+            if (!container) return '';
+            const errEl = container.querySelector('.artdeco-inline-feedback--error, .fb-form-element__error-text, [aria-live="polite"]');
+            if (errEl && errEl.textContent) {
+              const txt = errEl.textContent.trim();
+              if (/invalid input|enter a valid number|numeric/i.test(txt)) return txt;
+            }
+            return '';
+          }).catch(() => '');
+
+          if (errMessage) {
+            const retryConstraints: FieldConstraints = {
+              ...constraints,
+              isNumeric: true,
+              errorMessage: errMessage,
+            };
+            const retryVal = await resolveLinkedInQuestionAnswerAsync(effectiveLabel, inputType, profile, [], retryConstraints);
+
+            if (retryVal && retryVal !== finalVal) {
+              await input.fill('');
+              await input.fill(retryVal);
+              await input.dispatchEvent('input').catch(() => {});
+              await input.dispatchEvent('change').catch(() => {});
+              await input.blur().catch(() => {});
+              finalVal = retryVal;
+            }
+          }
+
           if (/(?:city|country|state|location|address)/i.test(effectiveLabel)) {
             await page.waitForTimeout(600);
             const firstOpt = page.locator('.artdeco-typeahead__results-list li, [role="listbox"] [role="option"], .artdeco-typeahead__result').first();
@@ -1677,30 +2540,53 @@ async function uploadLinkedInResume(
   fs.writeFileSync(tmpFilePath, Buffer.from(resumeBytes));
 
   try {
-    // 1. Direct file input in dialog or modal
-    const modalInput = page.locator('dialog input[type="file"], [role="dialog"] input[type="file"], .jobs-easy-apply-modal input[type="file"], input[type="file"]').first();
-    if ((await modalInput.count()) > 0) {
-      const accept = (await modalInput.getAttribute('accept')) || '';
-      if (!accept || accept.includes('pdf') || accept.includes('*')) {
-        await modalInput.setInputFiles(tmpFilePath);
-        console.log('[linkedin] attached tailored resume via file input:', resumeFilename);
-        await page.waitForTimeout(2000);
-        return true;
+    // 1. Direct file input in dialog or modal (check all candidate file inputs)
+    const fileInputs = page.locator('dialog input[type="file"], [role="dialog"] input[type="file"], .jobs-easy-apply-modal input[type="file"], input[type="file"]');
+    const inputCount = await fileInputs.count();
+    for (let i = 0; i < inputCount; i++) {
+      try {
+        const input = fileInputs.nth(i);
+        const accept = (await input.getAttribute('accept')) || '';
+        if (!accept || accept.includes('pdf') || accept.includes('*') || accept.includes('doc')) {
+          await input.setInputFiles(tmpFilePath);
+          await input.dispatchEvent('change').catch(() => {});
+          await input.dispatchEvent('input').catch(() => {});
+          console.log('[linkedin] attached tailored resume via file input index', i, ':', resumeFilename);
+          await page.waitForTimeout(2000);
+          return true;
+        }
+      } catch (err) {
+        console.warn(`[linkedin] file input index ${i} upload attempt failed:`, (err as Error).message);
       }
     }
 
-    // 2. Upload button that triggers filechooser (Arabic: "تحميل السيرة الذاتية", English: "Upload resume")
-    const uploadBtn = page.locator('dialog button:has-text("تحميل السيرة الذاتية"), dialog button:has-text("Upload resume"), [role="dialog"] button:has-text("تحميل السيرة الذاتية"), [role="dialog"] button:has-text("Upload resume"), button:has-text("تحميل السيرة الذاتية"), button:has-text("Upload resume")').first();
-    if ((await uploadBtn.count()) > 0 && (await uploadBtn.isVisible().catch(() => false))) {
-      const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 4000 }).catch(() => null);
-      await uploadBtn.click();
-      const fileChooser = await fileChooserPromise;
-      if (fileChooser) {
-        await fileChooser.setFiles(tmpFilePath);
-        console.log('[linkedin] attached tailored resume via fileChooser button:', resumeFilename);
-        await page.waitForTimeout(2000);
-        return true;
-      }
+    // 2. Upload button/label that triggers filechooser
+    const uploadBtnSelectors = [
+      'dialog button:has-text("Upload resume")',
+      'dialog label:has-text("Upload resume")',
+      '[role="dialog"] button:has-text("Upload resume")',
+      'button:has-text("Upload resume")',
+      'label:has-text("Upload resume")',
+      'dialog button:has-text("تحميل السيرة الذاتية")',
+      'button:has-text("تحميل السيرة الذاتية")',
+      '.jobs-document-upload__upload-button',
+      'button[aria-label*="upload resume" i]',
+    ];
+    for (const sel of uploadBtnSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+          const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 4000 }).catch(() => null);
+          await btn.click({ force: true }).catch(() => {});
+          const fileChooser = await fileChooserPromise;
+          if (fileChooser) {
+            await fileChooser.setFiles(tmpFilePath);
+            console.log('[linkedin] attached tailored resume via fileChooser button:', resumeFilename);
+            await page.waitForTimeout(2000);
+            return true;
+          }
+        }
+      } catch {}
     }
 
     return false;
@@ -1863,13 +2749,12 @@ export async function navigateLinkedInEasyApply(opts: {
   try {
     // Detect login required
     if (await detectLinkedInLoginRequired(page)) {
-      try { await page.bringToFront(); } catch { /* ignore */ }
+      await focusApplyPage(page, true);
       return { status: 'login_required', filledFields: [], resumeAttached: false, stepCount: 0, error: 'LinkedIn login required. Please log into your LinkedIn account in the Chrome window that opened.' };
     }
 
     // Detect if already applied
     if (await detectLinkedInAlreadyApplied(page)) {
-      try { await page.bringToFront(); } catch { /* ignore */ }
       return { status: 'already_applied', filledFields: [], resumeAttached: false, stepCount: 0, error: 'You have already applied to this job on LinkedIn.' };
     }
 
@@ -1891,12 +2776,14 @@ export async function navigateLinkedInEasyApply(opts: {
     }
     if (!applyClicked) {
       if (await detectLinkedInAlreadyApplied(page)) {
-        try { await page.bringToFront(); } catch { /* ignore */ }
         return { status: 'already_applied', filledFields: [], resumeAttached: false, stepCount: 0, error: 'You have already applied to this job on LinkedIn.' };
       }
       if (await detectLinkedInLoginRequired(page)) {
-        try { await page.bringToFront(); } catch { /* ignore */ }
+        await focusApplyPage(page, true);
         return { status: 'login_required', filledFields: [], resumeAttached: false, stepCount: 0, error: 'LinkedIn login required. Please log into your LinkedIn account in the Chrome window that opened.' };
+      }
+      if (await detectLinkedInExpired(page)) {
+        return { status: 'expired', filledFields: [], resumeAttached: false, stepCount: 0, error: 'Job has expired (no longer accepting applications).' };
       }
       // No Easy Apply button. Check for an offsite "Apply" link — the application lives on the
       // company's site. Hand the URL back so the caller can degrade to the generic autofill there.
@@ -1904,7 +2791,7 @@ export async function navigateLinkedInEasyApply(opts: {
       const externalUrl = await detectLinkedInExternalApply(page);
       console.log('[linkedin] external_apply href:', externalUrl);
       if (externalUrl) {
-        return { status: 'external_apply', filledFields: [], resumeAttached: false, stepCount: 0, externalUrl };
+        return { status: 'external_apply', filledFields: [], resumeAttached: false, stepCount: 0, externalUrl, error: 'This job requires applying on the company website.' };
       }
       return { status: 'error', filledFields: [], resumeAttached: false, stepCount: 0, error: 'Could not find or click the Easy Apply button.' };
     }
@@ -2061,6 +2948,52 @@ export async function navigateLinkedInEasyApply(opts: {
  * window (a second context cannot share the profile dir while this one is open), run the
  * generic autofill heuristics on the company's form, and still stop before any submit.
  */
+
+/**
+ * Pre-launch the Chrome window and navigate to the LinkedIn job URL immediately.
+ * Intended to be called in parallel with prepareSubmission (LLM + PDF generation)
+ * so the user sees the browser open right away — not after all background work finishes.
+ *
+ * Handles the English locale setup (seedLinkedInEnglish + enforceEnglishJobUrl) so
+ * the page already loads in English while the resume is being generated.
+ *
+ * Returns { ctx, page, targetUrl } on success, or null if launch fails.
+ */
+export async function preLaunchLinkedInBrowser(jobUrl: string): Promise<{
+  ctx: BrowserContext;
+  page: Page;
+  targetUrl: string;
+} | null> {
+  const profileDir = resolveLinkedInProfileDir();
+  if (!fs.existsSync(profileDir)) {
+    fs.mkdirSync(profileDir, { recursive: true });
+  }
+  if (isApplyCancelled()) return null;
+  try {
+    const ctx = await launchApplyBrowser(profileDir, { focus: true });
+    const page = ctx.pages()[0] || (await ctx.newPage());
+    // Close leftover blank tabs so the window stays clean
+    for (const p of ctx.pages()) {
+      if (p !== page && (p.url() === 'about:blank' || p.url().startsWith('chrome://'))) {
+        await p.close().catch(() => {});
+      }
+    }
+    // Seed English locale cookies BEFORE any navigation (same as linkedInApply)
+    await seedLinkedInEnglish(ctx);
+    const targetUrl = enforceEnglishJobUrl(jobUrl);
+    // Bring window to front only for first job apply
+    await focusApplyPage(page, false);
+    // Navigate to the job URL — this finishes in 2-5s, well before resume generation
+    console.log('[linkedin] pre-launch: navigating to', targetUrl);
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await focusApplyPage(page, false);
+    console.log('[linkedin] Pre-launched browser and navigated to:', targetUrl);
+    return { ctx, page, targetUrl };
+  } catch (err) {
+    console.warn('[linkedin] preLaunchLinkedInBrowser failed — linkedInApply will launch inline:', (err as Error).message);
+    return null;
+  }
+}
 export async function linkedInApply(opts: {
   jobUrl: string;
   profile: CandidateProfile;
@@ -2068,40 +3001,79 @@ export async function linkedInApply(opts: {
   resumeFilename: string;
   coverLetterText?: string;
   autoSubmit?: boolean;
+  /** Pre-launched browser context from preLaunchLinkedInBrowser. Skips re-launching Chrome. */
+  prelaunchedContext?: { ctx: BrowserContext; page: Page; targetUrl: string } | null;
 }): Promise<PlatformResult> {
   const { jobUrl, profile, resumePdfBytes, resumeFilename, coverLetterText, autoSubmit } = opts;
 
-  if (!fs.existsSync(BROWSER_PROFILE_DIR)) {
-    fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
+  const profileDir = resolveLinkedInProfileDir();
+  if (!fs.existsSync(profileDir)) {
+    fs.mkdirSync(profileDir, { recursive: true });
   }
 
   let ctx: BrowserContext | null = null;
   try {
-    ctx = await launchApplyBrowser(BROWSER_PROFILE_DIR, { focus: true });
+    let page: Page;
+    let targetUrl: string;
 
-    const page = ctx.pages()[0] || (await ctx.newPage());
-    await seedLinkedInEnglish(ctx);
-    const targetUrl = enforceEnglishJobUrl(jobUrl);
-    console.log('[linkedin] navigating to', targetUrl);
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    try { await page.bringToFront(); } catch {}
-    bringWindowToFront('Chrome');
+    if (opts.prelaunchedContext) {
+      // ── Fast path: browser was launched in parallel with resume generation ──
+      // The Chrome window was already shown to the user while the tailored PDF
+      // was being generated. Confirm page is loaded and bring it to front.
+      ctx = opts.prelaunchedContext.ctx;
+      page = opts.prelaunchedContext.page;
+      targetUrl = opts.prelaunchedContext.targetUrl;
+      // Ensure navigation completed (it was started concurrently)
+      try {
+        await page.waitForLoadState('domcontentloaded', { timeout: 20_000 });
+      } catch { /* already loaded or timed out — continue */ }
+      // Safety re-navigate if page didn't land on LinkedIn
+      const prelaunchUrl = page.url();
+      if (prelaunchUrl === 'about:blank' || !prelaunchUrl.includes('linkedin.com')) {
+        await seedLinkedInEnglish(ctx);
+        targetUrl = enforceEnglishJobUrl(jobUrl);
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      }
+      await focusApplyPage(page, false);
+    } else {
+      // ── Fallback: pre-launch failed or was not attempted ──
+      ctx = await launchApplyBrowser(profileDir, { focus: true });
+      page = ctx.pages()[0] || (await ctx.newPage());
+      // Close any leftover blank tabs so the window stays clean
+      for (const p of ctx.pages()) {
+        if (p !== page && (p.url() === 'about:blank' || p.url().startsWith('chrome://'))) {
+          await p.close().catch(() => {});
+        }
+      }
+      await seedLinkedInEnglish(ctx);
+      targetUrl = enforceEnglishJobUrl(jobUrl);
+      console.log('[linkedin] navigating to', targetUrl);
+      await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await focusApplyPage(page, false);
+    }
+
     await page.waitForTimeout(3500);
     console.log('[linkedin] landed on', page.url());
     await forceLinkedInEnglish(page, ctx);
     const loginRequired = await detectLinkedInLoginRequired(page);
     console.log('[linkedin] login_required?', loginRequired);
     if (loginRequired) {
-      try { await page.bringToFront(); } catch { /* ignore */ }
-      bringWindowToFront('Chrome');
-      ctx = null;
-      return {
-        status: 'login_required',
-        filledFields: [],
-        resumeAttached: false,
-        stepCount: 0,
-        error: 'LinkedIn login required. Please log into your LinkedIn account in the Chrome window that opened.',
-      };
+      await focusApplyPage(page, true);
+
+      const loginCompleted = await waitForLinkedInLogin(page, 120_000);
+      if (!loginCompleted) {
+        ctx = null;
+        return {
+          status: 'login_required',
+          filledFields: [],
+          resumeAttached: false,
+          stepCount: 0,
+          error: 'LinkedIn login required. Please log into your LinkedIn account in the Chrome window that opened.',
+        };
+      }
+      // Login completed - wait for page to stabilize again
+      await page.waitForLoadState('domcontentloaded', { timeout: 30_000 }).catch(() => {});
+      await page.waitForTimeout(3000);
     }
 
     // Wait for page content to settle
@@ -2124,7 +3096,6 @@ export async function linkedInApply(opts: {
     // Keep the LinkedIn page open and return the external URL for the UI's manual link instead
     // of opening a second employer flow that may require cookies, CAPTCHA, or email verification.
     if (result.status === 'external_apply' && result.externalUrl) {
-      try { await page.bringToFront(); } catch { /* ignore */ }
       ctx = null;
       return {
         status: 'external_apply',
@@ -2223,7 +3194,7 @@ export async function linkedInApply(opts: {
             try { return new URL(blocker.page.url()).hostname.replace(/^www\./i, ''); } catch { return 'the company'; }
           })();
           notifyWindows(
-            'HireSignal — manual action needed',
+            'HireMe — manual action needed',
             blocker.kind === 'login'
               ? `${host} needs a manual sign-in for this application. The window is now open — log in once, and the form will be filled automatically (the session is remembered for next time).`
               : blocker.kind === 'verification'
@@ -2338,12 +3309,6 @@ export async function linkedInApply(opts: {
       return result;
     }
 
-    // In Auto Apply mode, if already submitted, keep the browser session open so the next job
-    // in the queue reuses the existing Chrome window without closing and reopening.
-    // Always bring the window to front so the user sees the automation in action
-    try { await page.bringToFront(); } catch { /* ignore */ }
-    bringWindowToFront('Chrome');
-
     if (autoSubmit && result.status === 'submitted') {
       try {
         const pages = ctx.pages();
@@ -2356,11 +3321,27 @@ export async function linkedInApply(opts: {
       } catch { /* ignore */ }
       ctx = null; // Do not close in finally; activeContext stays alive for next job
     } else {
+      // Stopped for manual review — bring window to front for user
+      await focusApplyPage(page, true);
       ctx = null; // ownership transferred to the user session
     }
     return result;
   } catch (err) {
     console.error('[linkedin] apply error:', err);
+    const isClosedError = (err as Error)?.message?.toLowerCase().includes('closed');
+    if (ctx) {
+      if (!isClosedError) await focusApplyPage(ctx.pages()[0], false);
+      ctx = null; // Preserve window open for user review
+    }
+    if (isClosedError) {
+      return {
+        status: 'stopped_for_review',
+        readyForSubmit: true,
+        filledFields: [],
+        resumeAttached: true,
+        stepCount: 1,
+      };
+    }
     return {
       status: 'error',
       filledFields: [],
@@ -2372,3 +3353,37 @@ export async function linkedInApply(opts: {
     if (ctx) await ctx.close().catch(() => {});
   }
 }
+
+/**
+ * Detect whether LinkedIn has confirmed the application was successfully submitted.
+ */
+export async function detectLinkedInApplicationSubmitted(page: Page): Promise<boolean> {
+  try {
+    const rawBody = await page.evaluate(() => {
+      return document.body ? document.body.innerText.toLowerCase().slice(0, 50_000) : '';
+    }).catch(() => '');
+
+    const SUBMITTED_PHRASES = [
+      'application sent',
+      'your application was sent',
+      'application submitted',
+      'already applied',
+      'you have applied',
+    ];
+
+    for (const phrase of SUBMITTED_PHRASES) {
+      if (rawBody.includes(phrase)) {
+        return true;
+      }
+    }
+
+    const modalSuccess = page.locator('div:has-text("Application sent"), button:has-text("Applied"), .jobs-apply-form__post-apply-content').first();
+    if ((await modalSuccess.count()) > 0 && (await modalSuccess.isVisible().catch(() => false))) {
+      return true;
+    }
+  } catch {
+    // continue
+  }
+  return false;
+}
+

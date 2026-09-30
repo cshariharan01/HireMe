@@ -76,6 +76,18 @@ export async function checkJobUrl(url: string): Promise<UrlStatus> {
     try {
       const status = await fetchStatus(url, 5000);
       if (status === 404 || status === 410) return 'dead';
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(url, {
+        headers: { 'User-Agent': UA },
+        signal: controller.signal,
+      }).finally(() => clearTimeout(timer));
+      if (res.ok) {
+        const text = await res.text();
+        if (/this job is no longer available|this job has expired|job has expired|job is expired|applications are closed|vacancy has expired|listing has expired/i.test(text)) {
+          return 'dead';
+        }
+      }
     } catch {
       return 'unknown';
     }

@@ -44,23 +44,44 @@ const scripts =
   mode === 'rate' ? RATE :
   QUICK;
 
-const db = new Database(path.join(process.cwd(), 'data', 'hiresignal.db'));
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(process.cwd(), 'data', 'hireme.db');
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 // Per-connection: the NORMAL set in src/lib/db.ts does not reach a standalone script, and
 // better-sqlite3 defaults to FULL — one fsync per autocommit write.
 db.pragma('synchronous = NORMAL');
-for (const spec of ['current_step TEXT', 'step_index INTEGER DEFAULT 0', 'steps_json TEXT', 'log_tail TEXT', 'updated_at DATETIME', 'pid INTEGER', 'cancel_requested INTEGER DEFAULT 0']) {
+db.pragma('busy_timeout = 15000');
+for (const spec of [
+  'current_step TEXT',
+  'step_index INTEGER DEFAULT 0',
+  'steps_json TEXT',
+  'log_tail TEXT',
+  'updated_at DATETIME',
+  'pid INTEGER',
+  'cancel_requested INTEGER DEFAULT 0',
+  'initial_dashboard_matches INTEGER DEFAULT 0',
+  'scanned_direct_count INTEGER DEFAULT 0',
+]) {
   try { db.exec(`ALTER TABLE sync_runs ADD COLUMN ${spec}`); } catch (e) { if (!(e instanceof Error) || !/duplicate column/i.test(e.message)) throw e; }
 }
 
 type StepStatus = 'pending' | 'running' | 'done' | 'error' | 'skipped';
 const steps = scripts.map((s) => ({ script: s, label: STEP_DEFS[s] || s, status: 'pending' as StepStatus }));
 const logTail: string[] = [];
-const LOG_CAP = 60;
+const LOG_CAP = 150;
+let scannedDirectCount = 0;
+
+try {
+  const row = db.prepare('SELECT scanned_direct_count FROM sync_runs WHERE id=?').get(runId) as { scanned_direct_count: number } | undefined;
+  if (row?.scanned_direct_count) scannedDirectCount = row.scanned_direct_count;
+} catch { /* ignore */ }
 
 function pushLog(line: string) {
   const t = line.replace(/\s+$/, '');
   if (!t) return;
+  if (t.includes('Found Direct Apply') || t.includes('Found Easy Apply')) {
+    scannedDirectCount++;
+  }
   logTail.push(t);
   if (logTail.length > LOG_CAP) logTail.splice(0, logTail.length - LOG_CAP);
 }
@@ -74,8 +95,8 @@ function persist(force = false) {
   const done = steps.filter((s) => s.status === 'done').length;
   try {
     db.prepare(
-      `UPDATE sync_runs SET current_step=?, step_index=?, steps_done=?, steps_total=?, steps_json=?, log_tail=?, updated_at=datetime('now') WHERE id=?`
-    ).run(steps[stepIndex]?.label || null, stepIndex, done, steps.length, JSON.stringify(steps), JSON.stringify(logTail), runId);
+      `UPDATE sync_runs SET current_step=?, step_index=?, steps_done=?, steps_total=?, steps_json=?, log_tail=?, scanned_direct_count=?, updated_at=datetime('now') WHERE id=?`
+    ).run(steps[stepIndex]?.label || null, stepIndex, done, steps.length, JSON.stringify(steps), JSON.stringify(logTail), scannedDirectCount, runId);
   } catch { /* best-effort */ }
 }
 
@@ -87,16 +108,29 @@ function isCancelled(): boolean {
 function runStep(script: string): Promise<number> {
   return new Promise((resolve) => {
     const child = spawn(`npm run ${script}`, { cwd: process.cwd(), shell: true, windowsHide: true });
+    let resolved = false;
+    const done = (code: number | null) => {
+      if (resolved) return;
+      resolved = true;
+      clearInterval(cancelTimer);
+      resolve(code ?? 0);
+    };
+
     const cancelTimer = setInterval(() => {
       if (isCancelled()) { try { if (process.platform === 'win32' && child.pid) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F']); else child.kill(); } catch {} }
       persist(); // heartbeat even if the child is quiet
     }, 2000);
     child.stdout?.on('data', (d) => { String(d).split('\n').forEach(pushLog); persist(); });
     child.stderr?.on('data', (d) => { String(d).split('\n').forEach(pushLog); persist(); });
-    child.on('close', (code) => { clearInterval(cancelTimer); resolve(code ?? 0); });
-    child.on('error', (err) => { clearInterval(cancelTimer); pushLog(`spawn error: ${err.message}`); resolve(1); });
+    child.on('close', (code) => done(code));
+    child.on('exit', (code) => {
+      // Drain timeout: ensure process completion resolves even if grandchild pipes remain open
+      setTimeout(() => done(code), 2500);
+    });
+    child.on('error', (err) => { pushLog(`spawn error: ${err.message}`); done(1); });
   });
 }
+
 
 
 async function main() {
@@ -130,7 +164,14 @@ async function main() {
   }
   const cancelled = isCancelled();
   const status = cancelled ? 'cancelled' : hadError ? 'error' : 'done';
-  const errMsg = hadError ? `A step failed — ${steps.find((s) => s.status === 'error')?.label}` : null;
+  const failedStep = steps.find((s) => s.status === 'error');
+  const errDetail = logTail.slice().reverse().find((l) => l && (l.includes('✗') || /error|failed|denied/i.test(l)));
+  const cleanDetail = errDetail ? errDetail.replace(/^[✗▶⚠·\s]+/, '').trim() : null;
+  const errMsg = hadError
+    ? cleanDetail
+      ? `Step failed (${failedStep?.label || 'Sync'}): ${cleanDetail}`
+      : `A step failed - ${failedStep?.label}`
+    : null;
   try {
     db.prepare(`UPDATE sync_runs SET status=?, error=?, finished_at=datetime('now'), updated_at=datetime('now'), steps_json=?, steps_done=? WHERE id=?`)
       .run(status, errMsg, JSON.stringify(steps), steps.filter((s) => s.status === 'done').length, runId);
@@ -139,4 +180,11 @@ async function main() {
   process.exit(0);
 }
 
-main();
+main().catch((err) => {
+  console.error('Fatal error in run-sync:', err);
+  try {
+    db.prepare(`UPDATE sync_runs SET status='error', error=?, finished_at=datetime('now'), updated_at=datetime('now') WHERE id=?`)
+      .run(err instanceof Error ? err.message : String(err), runId);
+  } catch { /* ignore */ }
+  process.exit(1);
+});

@@ -60,3 +60,7 @@ hireme-*.zip
 # Local env (contains personal API keys - never commit)
 .env
 
+# Scratch scripts and temporary diagnostic files (contains cookies, test files - never commit)
+/scratch/
+scratch/
+

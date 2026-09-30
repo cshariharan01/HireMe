@@ -1,5 +1,6 @@
 import db from '@/lib/db';
 import { getTailoredMatchScore } from '@/lib/matches';
+import { getActiveOwnerId } from '@/lib/apply/screening-owner';
 
 export function stripLatexToText(tex: string): string {
   const beginIdx = tex.indexOf('\\begin{document}');
@@ -52,9 +53,10 @@ export async function calculateAndStoreTailoredScore(
     const cached = db
       .prepare('SELECT resume_variant, resume_tex FROM job_documents WHERE job_id = ?')
       .get(jobId) as { resume_variant: string | null; resume_tex: string | null } | undefined;
+    const activeOwner = getActiveOwnerId();
     const applied = db
-      .prepare('SELECT resume_variant, resume_tex FROM my_applications WHERE job_id = ?')
-      .get(jobId) as { resume_variant: string | null; resume_tex: string | null } | undefined;
+      .prepare('SELECT resume_variant, resume_tex FROM my_applications WHERE job_id = ? AND (owner_id = ? OR (owner_id IS NULL AND ? = \'default\'))')
+      .get(jobId, activeOwner, activeOwner) as { resume_variant: string | null; resume_tex: string | null } | undefined;
 
     const candidateVariant = (applied?.resume_variant || cached?.resume_variant || '').trim();
     const candidateTex = (applied?.resume_tex || cached?.resume_tex || '').trim();
@@ -79,10 +81,12 @@ export async function calculateAndStoreTailoredScore(
     const defaultScore = defaultMatch?.score ?? null;
 
     try {
-      db.prepare('UPDATE my_applications SET tailored_score = ?, default_score = ? WHERE job_id = ?').run(
+      const activeOwner = getActiveOwnerId();
+      db.prepare('UPDATE my_applications SET tailored_score = ?, default_score = ? WHERE job_id = ? AND (owner_id = ? OR owner_id IS NULL)').run(
         score,
         defaultScore,
         jobId,
+        activeOwner,
       );
     } catch {
       /* safe fallback */
@@ -104,7 +108,7 @@ export async function calculateAndStoreTailoredScore(
       delta: defaultScore != null ? score - defaultScore : null,
     };
   } catch (e) {
-    console.error('[calculateAndStoreTailoredScore] error for jobId', jobId, ':', e);
+    console.warn(`[tailored-score] failed to compute score for jobId ${jobId}:`, e instanceof Error ? e.message : e);
     return null;
   }
 }

@@ -38,7 +38,8 @@
     ".next/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "scratch"
   ],
   "ts-node": {
     // `@/*` path-alias support for ts-node scripts. `src/lib/apply/*` imports siblings via the

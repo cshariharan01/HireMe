@@ -8,6 +8,7 @@
 //   npm run reembed -- --dry # preview counts, write nothing
 //
 // It clears match_cache so matches recompute on next app load.
+import './shared/env';
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import path from 'path';
@@ -16,7 +17,8 @@ import { readEmbeddingSignature, recordEmbeddingSignature } from '../src/lib/emb
 
 const DRY = process.argv.includes('--dry') || process.env.DRY === '1';
 
-const db = new Database(path.join(process.cwd(), 'data', 'hiresignal.db'));
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(process.cwd(), 'data', 'hireme.db');
+const db = new Database(DB_PATH);
 sqliteVec.load(db);
 
 interface JobRow { id: number; title: string; company: string; description: string }

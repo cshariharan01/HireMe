@@ -8,7 +8,17 @@ import { PAGE_SIZE } from './match-keys';
 // preloading with a different one would populate a cache entry SWR then ignores.
 export const fetcher = async (url: string) => {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = `HTTP ${res.status}`;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed.error) msg = parsed.error;
+    } catch {
+      if (text) msg = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100);
+    }
+    throw new Error(msg);
+  }
   return res.json();
 };
 
@@ -47,6 +57,7 @@ export interface Match {
   source: string;
   ingestedAt: string;
   postedAt?: string | null;
+  lastSeenAt?: string | null;
   domainPriority: number;
   remotePolicy: string | null;
   visaSponsorship: boolean;
@@ -102,9 +113,11 @@ export interface Application {
   status: string;
   cover_letter: string | null;
   resume_variant: string | null;
+  resume_source?: string | null;
   notes: string | null;
   applied_at: string;
   applied_date: string | null;
+  submitted_at?: string | null;
   recruiter_name: string | null;
   recruiter_contact: string | null;
   next_follow_up_at: string | null;
@@ -136,6 +149,7 @@ export interface ProfileShape {
   seniority?: string;
   title?: string;
   yearsOfExperience?: number;
+  noticePeriodDays?: number;
   name?: string;
   email?: string;
   phone?: string;
@@ -143,6 +157,14 @@ export interface ProfileShape {
   targets?: ProfileTargets;
   suggested_roles?: string[];
   domain_terms?: string[];
+  street?: string;
+  city?: string;
+  state?: string;
+  country?: string;
+  zipCode?: string;
+  pincode?: string;
+  currentCtcInr?: number;
+  expectedCtcInr?: number;
 }
 
 interface MatchesResponse {
@@ -180,6 +202,8 @@ export interface MatchFilters {
   eval?: string;
   platform?: string;
   q?: string;
+  apply_score_filter?: number | string | boolean;
+  score_threshold?: number;
 }
 
 /**
@@ -191,7 +215,7 @@ export interface MatchFilters {
 export function useMatches(includeHidden = false, filters: MatchFilters = {}) {
   // Page 0 is the canonical SWR-cached page; subsequent pages are appended into local state.
   const filterQS = Object.entries(filters)
-    .filter(([, v]) => v && v !== 'all')
+    .filter(([, v]) => v !== undefined && v !== null && v !== '' && v !== 'all')
     .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
     .join('&');
   const baseQS = includeHidden ? '?include_hidden=1' : '';
@@ -396,14 +420,16 @@ export function useProfile() {
   };
 }
 
-export function useApplications() {
-  const { data, error, isLoading, mutate: m } = useSWR<{ applications?: Application[] }>(
-    '/api/outcomes',
+export function useApplications(scope?: string) {
+  const url = scope ? `/api/outcomes?scope=${encodeURIComponent(scope)}` : '/api/outcomes';
+  const { data, error, isLoading, mutate: m } = useSWR<{ applications?: Application[]; activeOwner?: string }>(
+    url,
     fetcher,
     baseConfig
   );
   return {
     applications: data?.applications || [],
+    activeOwner: data?.activeOwner,
     error: error?.message,
     isLoading,
     refresh: m,
@@ -469,7 +495,7 @@ export const revalidateMatches = () =>
   mutate((key) => typeof key === 'string' && (key.startsWith('/api/matches?') || key === '/api/matches'), undefined, { revalidate: true });
 export const revalidateDigest = () => mutate('/api/digest');
 export const revalidateApplications = () => {
-  mutate('/api/outcomes');
+  mutate((key) => typeof key === 'string' && key.startsWith('/api/outcomes'), undefined, { revalidate: true });
   mutate('/api/stats');
 };
 export const revalidateDashboardStats = () => mutate('/api/stats');

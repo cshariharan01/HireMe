@@ -1,5 +1,5 @@
 import { seedJob } from './setup-db';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import db from '@/lib/db';
@@ -10,10 +10,29 @@ import { invalidateMatchCache } from '@/lib/matches';
 import { NextRequest } from 'next/server';
 
 describe('Dashboard Actions Behavior: Remove from dashboard & Mark as Applied', () => {
+  let origJson: string | null = null;
+  beforeAll(() => {
+    try {
+      const row = db.prepare('SELECT parsed_json FROM my_profile WHERE id = 1').get() as { parsed_json: string } | undefined;
+      origJson = row?.parsed_json ?? null;
+      db.prepare(`UPDATE my_profile SET parsed_json = json_set(parsed_json, '$.targets.locations', json('["India", "Remote", "Bangalore", "Chennai", "Hyderabad", "Pune", "Mumbai", "Noida", "Gurgaon", "Delhi"]')) WHERE id = 1`).run();
+      invalidateMatchCache();
+    } catch {}
+  });
+
+  afterAll(() => {
+    try {
+      if (origJson) {
+        db.prepare('UPDATE my_profile SET parsed_json = ? WHERE id = 1').run(origJson);
+      }
+      invalidateMatchCache();
+    } catch {}
+  });
+
   it('instantly excludes a hidden job from the matches feed and restores it on unhide', async () => {
     // Invalidate any leftover cache first
     invalidateMatchCache();
-    const initialPage = buildMatchesPage({ limit: 10 });
+    const initialPage = buildMatchesPage({ limit: 10, applyScoreFilter: false });
     expect(initialPage.matches.length).toBeGreaterThan(0);
 
     const testJob = initialPage.matches[0];
@@ -26,7 +45,7 @@ describe('Dashboard Actions Behavior: Remove from dashboard & Mark as Applied', 
       expect(hideRes.status).toBe(200);
 
       // Verify that buildMatchesPage IMMEDIATELY excludes the hidden job without stale cache
-      const pageAfterHide = buildMatchesPage({ limit: 10 });
+      const pageAfterHide = buildMatchesPage({ limit: 10, applyScoreFilter: false });
       const isPresentAfterHide = pageAfterHide.matches.some((m) => m.id === jobId);
       expect(isPresentAfterHide).toBe(false);
 
@@ -36,7 +55,7 @@ describe('Dashboard Actions Behavior: Remove from dashboard & Mark as Applied', 
       expect(delRes.status).toBe(200);
 
       // Verify that the job is restored
-      const pageAfterRestore = buildMatchesPage({ limit: 10 });
+      const pageAfterRestore = buildMatchesPage({ limit: 10, applyScoreFilter: false });
       const isPresentAfterRestore = pageAfterRestore.matches.some((m) => m.id === jobId);
       expect(isPresentAfterRestore).toBe(true);
     } finally {
@@ -47,7 +66,8 @@ describe('Dashboard Actions Behavior: Remove from dashboard & Mark as Applied', 
 
   it('marks a job as applied, excludes it from active feed, and updates stats', async () => {
     invalidateMatchCache();
-    const initialPage = buildMatchesPage({ limit: 10 });
+    const initialPage = buildMatchesPage({ limit: 10, applyScoreFilter: false });
+    expect(initialPage.matches.length).toBeGreaterThan(0);
     const testJob = initialPage.matches[0];
     const jobId = testJob.id;
 

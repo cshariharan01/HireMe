@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import { FileUp, Loader2, GraduationCap, Briefcase, Mail, Phone, Link2, MapPin, User, Save, Target as TargetIcon, DollarSign, Check, Ban, Trash2, Star, FileText } from 'lucide-react';
+import { FileUp, Loader2, GraduationCap, Briefcase, Mail, Phone, Link2, MapPin, User, Save, Target as TargetIcon, DollarSign, Check, Ban, Trash2, Star, FileText, Clock } from 'lucide-react';
 import { toast } from 'sonner';
 import { LatexTemplatePanel } from '@/components/latex-template-panel';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 import { useProfile, revalidateMatches, revalidateDigest } from '@/lib/hooks';
+import { LocationInput } from '@/components/location-input';
 
 interface Targets {
   roles?: string[];
@@ -29,6 +30,7 @@ interface Profile {
   seniority?: string;
   title?: string;
   yearsOfExperience?: number;
+  noticePeriodDays?: number;
   name?: string;
   email?: string;
   phone?: string;
@@ -76,6 +78,8 @@ export default function ProfilePage() {
     state: '',
     country: '',
     zipCode: '',
+    yearsOfExperience: '',
+    noticePeriodDays: '',
     currentCtcInr: '',
     expectedCtcInr: '',
   });
@@ -110,6 +114,8 @@ export default function ProfilePage() {
         state: profile.state || '',
         country: profile.country || '',
         zipCode: profile.zipCode || profile.pincode || '',
+        yearsOfExperience: profile.yearsOfExperience != null ? String(profile.yearsOfExperience) : '',
+        noticePeriodDays: profile.noticePeriodDays != null ? String(profile.noticePeriodDays) : '',
         currentCtcInr: profile.currentCtcInr ? String(profile.currentCtcInr) : '',
         expectedCtcInr: profile.expectedCtcInr ? String(profile.expectedCtcInr) : '',
       });
@@ -161,6 +167,8 @@ export default function ProfilePage() {
     try {
       const payload = {
         ...contact,
+        yearsOfExperience: contact.yearsOfExperience ? Number(contact.yearsOfExperience) : undefined,
+        noticePeriodDays: contact.noticePeriodDays !== '' && !isNaN(Number(contact.noticePeriodDays)) ? Number(contact.noticePeriodDays) : undefined,
         currentCtcInr: contact.currentCtcInr ? Number(contact.currentCtcInr) : undefined,
         expectedCtcInr: contact.expectedCtcInr ? Number(contact.expectedCtcInr) : undefined,
         pincode: contact.zipCode,
@@ -174,7 +182,9 @@ export default function ProfilePage() {
       if (data.error) toast.error(data.error);
       else {
         await refresh();
-        toast.success('Contact & auto-apply details saved');
+        revalidateMatches();
+        revalidateDigest();
+        toast.success('Contact & profile details saved — matches re-filtered');
       }
     } catch {
       toast.error('Failed to save');
@@ -426,7 +436,7 @@ export default function ProfilePage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 w-full max-w-full">
       <div>
         <h1 className="text-3xl font-semibold tracking-tight">Profile</h1>
         <p className="mt-1 text-sm text-muted-foreground">
@@ -434,9 +444,9 @@ export default function ProfilePage() {
         </p>
       </div>
 
-      <div className="grid gap-6 lg:grid-cols-2 lg:items-start">
+      <div className="grid gap-6 lg:grid-cols-2 lg:items-start w-full min-w-0">
       {/* Left column: edit contact + targets */}
-      <div className="space-y-6">
+      <div className="space-y-6 min-w-0 w-full">
       {profile && (
         <Card>
           <CardHeader>
@@ -484,7 +494,13 @@ export default function ProfilePage() {
                 <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground flex items-center gap-1">
                   <MapPin className="h-3 w-3" /> City
                 </label>
-                <Input value={contact.city} onChange={(e) => setContact({ ...contact, city: e.target.value, location: e.target.value ? `${e.target.value}, India` : contact.location })} placeholder="Madurai" />
+                <LocationInput
+                  value={contact.city}
+                  onChange={(val) => setContact({ ...contact, city: val, location: val ? `${val}, India` : contact.location })}
+                  placeholder="e.g. Chennai, Madurai, Bangalore"
+                  isMulti={false}
+                  showQuickPills={false}
+                />
               </div>
               <div className="space-y-1">
                 <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground flex items-center gap-1">
@@ -500,9 +516,40 @@ export default function ProfilePage() {
               </div>
               <div className="space-y-1">
                 <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground flex items-center gap-1">
-                  <MapPin className="h-3 w-3" /> Postal / Zip Code
+                  <Briefcase className="h-3 w-3" /> Total Experience (Years)
                 </label>
-                <Input value={contact.zipCode} onChange={(e) => setContact({ ...contact, zipCode: e.target.value })} placeholder="625001" />
+                <Input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  max="50"
+                  value={contact.yearsOfExperience}
+                  onChange={(e) => setContact({ ...contact, yearsOfExperience: e.target.value })}
+                  placeholder="3.0 (e.g. 3.1, 3.2, 3.5)"
+                />
+                {contact.yearsOfExperience && !isNaN(Number(contact.yearsOfExperience)) && (
+                  <span className="text-[11px] text-muted-foreground">
+                    {Number(contact.yearsOfExperience).toFixed(1)} YOE — drives experience filtering
+                  </span>
+                )}
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground flex items-center gap-1">
+                  <Clock className="h-3 w-3" /> Notice Period (Days)
+                </label>
+                <Input
+                  type="number"
+                  min="0"
+                  max="180"
+                  value={contact.noticePeriodDays}
+                  onChange={(e) => setContact({ ...contact, noticePeriodDays: e.target.value })}
+                  placeholder="30 (e.g. 0 for Immediate, 15, 30, 60)"
+                />
+                {contact.noticePeriodDays !== '' && !isNaN(Number(contact.noticePeriodDays)) && (
+                  <span className="text-[11px] text-muted-foreground">
+                    {Number(contact.noticePeriodDays) === 0 ? 'Immediate joining' : `${contact.noticePeriodDays} days notice`} — used for auto-fill
+                  </span>
+                )}
               </div>
               <div className="space-y-1">
                 <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground flex items-center gap-1">
@@ -687,10 +734,12 @@ export default function ProfilePage() {
               <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground flex items-center gap-1">
                 <MapPin className="h-3 w-3" /> Target locations (comma-separated)
               </label>
-              <Input
+              <LocationInput
                 value={targets.locations}
-                onChange={(e) => setTargets({ ...targets, locations: e.target.value })}
-                placeholder="Remote, India, Global remote"
+                onChange={(val) => setTargets({ ...targets, locations: val })}
+                placeholder="e.g. Remote, Chennai, Bangalore, Coimbatore"
+                isMulti={true}
+                showQuickPills={true}
               />
             </div>
             <div className="space-y-1">
@@ -772,7 +821,7 @@ export default function ProfilePage() {
       </div>
 
       {/* Right column: view profile + resume library + upload */}
-      <div className="space-y-6">
+      <div className="space-y-6 min-w-0 w-full">
       {profile && (
         <Card>
           <CardHeader>

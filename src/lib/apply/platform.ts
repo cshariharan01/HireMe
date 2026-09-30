@@ -68,6 +68,9 @@ export type PlatformStatus =
   | 'external_apply'           // no in-app form; job hands off to an offsite apply link
   | 'captcha'                  // CAPTCHA detected; user must solve manually
   | 'login_required'           // redirected to login page
+  | 'skipped'                  // unanswered question skipped; job kept on dashboard
+  | 'expired'                  // posting has expired or closed; no longer accepting applications
+  | 'timeout_skipped'          // apply button not found within time limit; skipped to next
   | 'error'                    // something went wrong
   | 'no_form';                // no fillable form found on page
 

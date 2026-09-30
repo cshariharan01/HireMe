@@ -23,6 +23,20 @@ export function screeningOwnerId(profile: Record<string, unknown>): string {
   return String(id).toLowerCase().trim() || 'default';
 }
 
+/** Get the owner id of the currently active profile (my_profile id=1). */
+export function getActiveOwnerId(dbInstance: any = db): string {
+  try {
+    const row = dbInstance.prepare('SELECT parsed_json FROM my_profile WHERE id = 1').get() as
+      | { parsed_json: string }
+      | undefined;
+    if (!row?.parsed_json) return 'default';
+    const parsed = JSON.parse(row.parsed_json);
+    return screeningOwnerId(parsed);
+  } catch {
+    return 'default';
+  }
+}
+
 /** sha256 of the normalized question, salted with the owning profile id. */
 export function hashScreeningQuestion(question: string, ownerId: string): string {
   const norm = question.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -48,6 +62,10 @@ export function ensureScreeningOwner(ownerId: string): void {
     if (row.value !== ownerId) {
       db.prepare('DELETE FROM screening_answers').run();
       db.prepare('UPDATE app_meta SET value = ? WHERE key = ?').run(ownerId, OWNER_KEY);
+      try {
+        const { clearPlatformSession } = require('./auth-session');
+        void clearPlatformSession('all');
+      } catch {}
     }
   } catch {
     // app_meta unavailable — the salted hash still isolates profiles.

@@ -4,7 +4,7 @@ import {
   ListFilter, Database,
 } from 'lucide-react';
 
-export const metadata = { title: 'Guide — HireSignal' };
+export const metadata = { title: 'Guide — HireMe' };
 
 function Section({ icon: Icon, title, children }: { icon: React.ElementType; title: string; children: React.ReactNode }) {
   return (
@@ -22,7 +22,7 @@ export default function GuidePage() {
     <div className="w-full space-y-6 pb-16">
       <header className="space-y-1">
         <h1 className="flex items-center gap-2 text-xl font-semibold">
-          <BookOpen className="h-5 w-5 text-primary" /> HireSignal — User Guide
+          <BookOpen className="h-5 w-5 text-primary" /> HireMe — User Guide
         </h1>
         <p className="text-sm text-muted-foreground">
           A personal, private job-search tool. Everything runs on your machine — your résumé, jobs, and matches
@@ -48,9 +48,9 @@ export default function GuidePage() {
         </ol>
         <p>
           <strong className="text-foreground">Prerequisite — an embedding source.</strong> Matching needs embeddings.
-          By default they run on local <strong className="text-foreground">Ollama</strong> (free, CPU-only) — pull{' '}
+          Embeddings run on <strong className="text-foreground">Gemini</strong> (cloud, fast, 1500 req/day free) — no local install needed.{' '}
           <code className="rounded bg-muted px-1">nomic-embed-text</code> (and optionally{' '}
-          <code className="rounded bg-muted px-1">llama3.2</code> for a local chat fallback). Prefer not to run Ollama?
+
           Point embeddings at a cloud provider instead via <code className="rounded bg-muted px-1">EMBEDDING_PROVIDER</code>{' '}
           in <code className="rounded bg-muted px-1">.env.local</code> — see <em>Providers &amp; embeddings</em> below.
         </p>
@@ -62,7 +62,7 @@ export default function GuidePage() {
           <li><strong className="text-foreground">Full sync</strong> — everything Quick does, plus fetch new jobs from all sources and discover company career pages.</li>
           <li><strong className="text-foreground">Rate top matches</strong> — AI-scores your top matches (fit, comp, culture, strategy). Run this when your LLM quota is fresh; it&apos;s the quota-sensitive step, kept separate on purpose.</li>
         </ul>
-        <p><strong className="text-foreground">⏱️ Timing:</strong> the <strong className="text-foreground">first Full sync can take ~1–3+ hours</strong> — normal, not a hang. The slow step is <strong className="text-foreground">embedding</strong> (on local Ollama it&apos;s CPU-bound, ~1–1.5 jobs/sec); a cloud embedding provider is much faster. Later syncs only embed <em>new</em> jobs, so they&apos;re far quicker.</p>
+        <p><strong className="text-foreground">⏱️ Timing:</strong> the <strong className="text-foreground">first Full sync can take a few minutes</strong> — Gemini cloud embeddings are fast. Later syncs only embed <em>new</em> jobs, so they&apos;re even quicker.</p>
         <p>Progress (step checklist, live log, elapsed time, job counter) shows in the sidebar. You can cancel any run, and syncs keep running even if you browse around.</p>
       </Section>
 
@@ -76,7 +76,7 @@ export default function GuidePage() {
         </ul>
         <p>Your <strong className="text-foreground">career targets</strong> are hard constraints, not nudges: a deal-breaker caps the score at 15, an AI &quot;skip&quot; caps it at 45, and missing must-haves subtract. Each row shows <strong className="text-foreground">why</strong> it scored what it did — problems first, so a bad match can&apos;t look good.</p>
         <p>Duplicate postings of the same role at the same company are collapsed into one row (with a &quot;N locations&quot; chip), and no single company can take more than three of the top slots.</p>
-        <p><strong className="text-foreground">Scope — technical roles.</strong> HireSignal is built for engineering/technical jobs (software, architecture, data, DevOps, …). Non-technical postings (sales, marketing, recruiting, HR) are filtered on broad sources and down-ranked elsewhere. Seniority adapts to your résumé — senior/architect roles by default, plus junior/entry-level <em>technical</em> roles if you&apos;re early-career. Within that scope nothing else is a hard filter (except dead links), so relevant roles across all industries surface, with your domain boosted.</p>
+        <p><strong className="text-foreground">Scope — technical roles.</strong> HireMe is built for engineering/technical jobs (software, architecture, data, DevOps, …). Non-technical postings (sales, marketing, recruiting, HR) are filtered on broad sources and down-ranked elsewhere. Seniority adapts to your résumé — senior/architect roles by default, plus junior/entry-level <em>technical</em> roles if you&apos;re early-career. Within that scope nothing else is a hard filter (except dead links), so relevant roles across all industries surface, with your domain boosted.</p>
       </Section>
 
       <Section icon={ListFilter} title="Working the matches list">
@@ -106,6 +106,15 @@ export default function GuidePage() {
         <p>Answers to screening questions are saved and reused on later applications — review, edit or delete them under <Link href="/settings" className="text-primary hover:underline">Settings → Screening answers</Link>. Before applying, the tool re-checks the posting is still live and refuses closed/dead listings. A required question with no answer blocks the submission rather than sending an incomplete form.</p>
       </Section>
 
+      <Section icon={ShieldCheck} title="LinkedIn &amp; Naukri Logins &amp; Chrome Sessions">
+        <p><strong className="text-foreground">Persistent Chrome Profile:</strong> All job syncing and autofill applications run inside a local Chrome browser profile (<code className="rounded bg-muted px-1">data/playwright/browser-profile</code>). Session cookies and logins persist safely on your machine.</p>
+        <ul className="ml-4 list-disc space-y-1.5">
+          <li><strong className="text-foreground">LinkedIn Job Syncing</strong> — runs silently via LinkedIn&apos;s guest API. <em className="text-foreground">No login required to sync jobs!</em> When using 1-Click Easy Apply, Chrome opens and uses your saved LinkedIn login.</li>
+          <li><strong className="text-foreground">Naukri &amp; LinkedIn Job Syncing &amp; Direct Apply</strong> — Use the 1-click <strong className="text-foreground">&quot;Sign In to Naukri&quot;</strong> and <strong className="text-foreground">&quot;Sign In to LinkedIn&quot;</strong> buttons directly in the app UI (<Link href="/settings" className="text-primary hover:underline">Settings → Platform Logins</Link> or the <strong className="text-foreground">Sync</strong> card). Chrome will open for you to log into your account; once logged in, your session is saved permanently on your machine for future syncs &amp; direct applies.</li>
+        </ul>
+      </Section>
+
+
       <Section icon={Building2} title="Company intelligence">
         <p>On a job you can generate an <strong className="text-foreground">AI evaluation</strong> (fit across several dimensions) and a <strong className="text-foreground">company brief</strong> (financial resilience, layoffs, culture, legitimacy). Where available it pulls Levels.fyi comp, AmbitionBox (India) ratings, and layoff history. All cached per company.</p>
       </Section>
@@ -113,8 +122,8 @@ export default function GuidePage() {
       <Section icon={Database} title="Providers &amp; embeddings">
         <p><strong className="text-foreground">Two independent LLM settings:</strong></p>
         <ul className="ml-4 list-disc space-y-1.5">
-          <li><strong className="text-foreground">Chat</strong> (evaluations, cover letters, research) — set in <Link href="/settings" className="text-primary hover:underline">Settings</Link>. Defaults to Ollama; add Gemini (free tier), Groq, OpenAI, Anthropic, etc. It auto-rotates keys and falls back to Ollama when one is rate-limited.</li>
-          <li><strong className="text-foreground">Embeddings</strong> (matching) — set via <code className="rounded bg-muted px-1">EMBEDDING_PROVIDER</code> in <code className="rounded bg-muted px-1">.env.local</code>; the active one shows on the Settings <em>Embeddings</em> card. Ollama by default (no quota); or Gemini/OpenAI to skip Ollama entirely.</li>
+          <li><strong className="text-foreground">Chat</strong> (evaluations, cover letters, research) — set in <Link href="/settings" className="text-primary hover:underline">Settings</Link>. Uses Gemini by default (free tier); add Groq, OpenAI, Anthropic, etc. It auto-rotates keys on rate limits.</li>
+          <li><strong className="text-foreground">Embeddings</strong> (matching) — Gemini <code className="rounded bg-muted px-1">text-embedding-004</code> by default; the active provider shows on the Settings <em>Embeddings</em> card.</li>
         </ul>
         <p><strong className="text-foreground">Switching embedding provider</strong> means re-embedding (all vectors must share one model). Run <code className="rounded bg-muted px-1">npm run reembed</code> — it re-embeds in place and keeps your applications, tracker, and résumés. The app blocks mixing embedding spaces with a clear message.</p>
         <p>Want quota-proof chat across many free providers? Route chat through <strong className="text-foreground">Freeway</strong> (optional) as an <em>openai-compatible</em> provider — see <code className="rounded bg-muted px-1">docs/freeway.md</code>.</p>
@@ -122,10 +131,10 @@ export default function GuidePage() {
 
       <Section icon={Wrench} title="Troubleshooting">
         <ul className="ml-4 list-disc space-y-1.5">
-          <li><strong className="text-foreground">Blank / no matches</strong> — do both first-run steps, and make sure your embedding source is reachable (Ollama running, or a valid cloud key).</li>
-          <li><strong className="text-foreground">Résumé upload fails</strong> — the error names the embedding provider. On Ollama: start it / use <code className="rounded bg-muted px-1">127.0.0.1</code>. On a cloud key: check the key and your daily limit.</li>
+          <li><strong className="text-foreground">Blank / no matches</strong> — do both first-run steps, and make sure your Gemini API key is valid.</li>
+          <li><strong className="text-foreground">Résumé upload fails</strong> — check your Gemini API key is set in <code className="rounded bg-muted px-1">.env.local</code> and has quota remaining.</li>
           <li><strong className="text-foreground">&quot;Embedding provider mismatch&quot;</strong> — you changed <code className="rounded bg-muted px-1">EMBEDDING_PROVIDER</code> on an existing DB. Run <code className="rounded bg-muted px-1">npm run reembed</code>, or set it back.</li>
-          <li><strong className="text-foreground">Rating is slow / failing</strong> — cloud chat quota is likely exhausted; it falls back to Ollama (CPU, one at a time). Add another provider in Settings, or use Freeway.</li>
+          <li><strong className="text-foreground">Rating is slow / failing</strong> — cloud chat quota is likely exhausted. Add another provider in Settings, or use Freeway.</li>
           <li><strong className="text-foreground">App not running</strong> — it&apos;s manual-start: run <code className="rounded bg-muted px-1">npm run dev</code> and open localhost:3000.</li>
         </ul>
       </Section>

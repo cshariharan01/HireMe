@@ -58,4 +58,14 @@ describe('Remove from Dashboard (hide/unhide) API and UI integration', () => {
     expect(code).toContain('Removed "');
     expect(code).toContain('from dashboard');
   });
+
+  it('verifies that dashboard-client only displays JobDetailPanel when job is in filtered matches', () => {
+    const code = fs.readFileSync(path.join(process.cwd(), 'src', 'app', 'dashboard-client.tsx'), 'utf8');
+    expect(code).toContain('selectedId != null && filtered.some((m) => m.id === selectedId)');
+    expect(code).toContain('No jobs available to display');
+    expect(code).toContain('if (filtered.length === 0)');
+    expect(code).toContain('setSelectedId(null)');
+  });
 });
+
+

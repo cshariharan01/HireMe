@@ -3,6 +3,7 @@
 // the active resume mirrors it into my_profile, so those consumers need no changes.
 
 import db from './db';
+import { screeningOwnerId, ensureScreeningOwner } from './apply/screening-owner';
 
 /** Copy a resume's fields (incl. original PDF bytes + LaTeX template) into the singleton my_profile row. */
 export function mirrorResumeToProfile(resumeId: number): boolean {
@@ -22,6 +23,16 @@ export function mirrorResumeToProfile(resumeId: number): boolean {
        resume_tex = excluded.resume_tex,
        updated_at = CURRENT_TIMESTAMP`
   ).run(r.raw_text, r.parsed_json, r.embedding, r.pdf_blob, r.pdf_filename, r.resume_tex);
+
+  if (r.parsed_json) {
+    try {
+      const parsed = JSON.parse(r.parsed_json);
+      const ownerId = screeningOwnerId(parsed);
+      ensureScreeningOwner(ownerId);
+    } catch {
+      // ignore JSON parse error
+    }
+  }
   return true;
 }
 
@@ -33,8 +44,16 @@ export function setActiveResume(resumeId: number): boolean {
     db.prepare('UPDATE resumes SET is_active = 0 WHERE is_active = 1').run();
     db.prepare('UPDATE resumes SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(id);
     mirrorResumeToProfile(id);
+    db.prepare('DELETE FROM job_documents').run();
+    try {
+      db.prepare('DELETE FROM match_cache').run();
+    } catch {}
   });
   tx(resumeId);
+  try {
+    const { invalidateMatchCache } = require('./matches');
+    invalidateMatchCache();
+  } catch {}
   return true;
 }
 

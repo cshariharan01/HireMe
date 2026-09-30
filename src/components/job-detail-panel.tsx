@@ -372,15 +372,18 @@ export function JobDetailPanel({
 
   // Sibling navigation — read the visible match-IDs the dashboard wrote to sessionStorage,
   // so Prev/Next walks through the user's currently-filtered context, not arbitrary IDs.
-  const siblings = useMemo<number[]>(() => {
-    if (typeof window === 'undefined') return [];
+  const [siblings, setSiblings] = useState<number[]>([]);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
     try {
       const raw = sessionStorage.getItem('hs:visibleMatchIds');
-      if (!raw) return [];
+      if (!raw) return;
       const arr = JSON.parse(raw);
-      return Array.isArray(arr) ? arr.filter((n) => typeof n === 'number') : [];
+      if (Array.isArray(arr)) {
+        setSiblings(arr.filter((n: unknown) => typeof n === 'number'));
+      }
     } catch {
-      return [];
+      /* ignore */
     }
   }, [jobId]);
 
@@ -404,7 +407,7 @@ export function JobDetailPanel({
     return () => window.removeEventListener('keydown', onKey);
   }, [prevId, nextId, router]);
 
-  const { data, isLoading } = useJobDetail(jobId);
+  const { data, error, isLoading, refresh } = useJobDetail(jobId);
   const [coverLetter, setCoverLetter] = useState<string | null>(null);
   const [resumeVariant, setResumeVariant] = useState<string | null>(null);
   const [generating, setGenerating] = useState<string | null>(null);
@@ -969,6 +972,22 @@ export function JobDetailPanel({
     );
   }
 
+  if (error && !data) {
+    return (
+      <div className="text-center text-muted-foreground py-12">
+        <p className="text-sm font-medium text-destructive">Failed to load job details ({error})</p>
+        <div className="mt-3 flex items-center justify-center gap-2">
+          <Button variant="outline" size="sm" onClick={() => refresh()}>
+            Retry
+          </Button>
+          <Button asChild variant="link" size="sm">
+            <Link href="/">Back to matches</Link>
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   if (!data || !data.job) {
     return (
       <div className="text-center text-muted-foreground py-12">
@@ -1042,7 +1061,7 @@ export function JobDetailPanel({
                 <span>·</span>
                 <span className="inline-flex items-center gap-1 font-medium text-foreground/80">
                   <Clock className="h-3.5 w-3.5 text-muted-foreground/70" />
-                  {formatJobAge(job.postedAt, job.ingestedAt, match?.ageDays)}
+                  {formatJobAge(job.postedAt, job.ingestedAt, match?.ageDays, (match as any)?.lastSeenAt)}
                 </span>
                 <span>·</span>
                 <span className="font-mono text-xs">

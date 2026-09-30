@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import db from '@/lib/db';
+import { getLLMUsageStats, getAvailableModelsForKind, PROVIDER_MODEL_REGISTRY } from '@/lib/llm-models';
 
 interface ProviderRow {
   id: number;
@@ -10,11 +11,12 @@ interface ProviderRow {
   base_url: string | null;
   is_active: number;
   is_creative: number;
+  cooldown_until?: string | null;
   created_at: string;
 }
 
 // Keep in sync with PROVIDER_KINDS in src/lib/db.ts (the table's CHECK) and ProviderKind in src/lib/llm.ts.
-const VALID_KINDS = ['gemini', 'openai', 'anthropic', 'openai-compatible', 'ollama', 'freeway'];
+const VALID_KINDS = ['gemini', 'openai', 'anthropic', 'openai-compatible', 'freeway'];
 
 function maskKey(key: string | null): string | null {
   if (!key) return null;
@@ -23,6 +25,17 @@ function maskKey(key: string | null): string | null {
 }
 
 function rowToPublic(r: ProviderRow) {
+  const availableModels = getAvailableModelsForKind(r.kind, r.model);
+  const usage = getLLMUsageStats(r.kind, r.model, r.id);
+  const currentModelSpec = availableModels.find((m) => m.id === r.model) || {
+    id: r.model,
+    name: r.model,
+    contextWindow: '128K Tokens',
+    hitsLimitDaily: 1500,
+    rpmLimit: 30,
+    tpmLimit: 1000000,
+  };
+
   return {
     id: r.id,
     kind: r.kind,
@@ -33,7 +46,11 @@ function rowToPublic(r: ProviderRow) {
     base_url: r.base_url,
     is_active: !!r.is_active,
     is_creative: !!r.is_creative,
+    cooldown_until: r.cooldown_until || null,
     created_at: r.created_at,
+    availableModels,
+    currentModelSpec,
+    usage,
   };
 }
 
@@ -41,7 +58,10 @@ function rowToPublic(r: ProviderRow) {
 export async function GET() {
   try {
     const rows = db.prepare('SELECT * FROM llm_providers ORDER BY is_active DESC, id ASC').all() as ProviderRow[];
-    return NextResponse.json({ providers: rows.map(rowToPublic) });
+    const providers = rows.map(rowToPublic);
+    const activePrimary = providers.find((p) => p.is_active) || null;
+    const activeCreative = providers.find((p) => p.is_creative) || null;
+    return NextResponse.json({ providers, activePrimary, activeCreative });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : 'Failed' }, { status: 500 });
   }
@@ -65,10 +85,10 @@ export async function POST(req: NextRequest) {
     // Freeway runs on localhost, so its URL is a sensible default rather than a required field.
     const resolvedBaseUrl =
       kind === 'freeway' ? base_url || process.env.FREEWAY_BASE_URL || 'http://localhost:8092' : base_url;
-    // Ollama needs no key. Freeway's is optional: if FREEWAY_API_KEY is already in .env.local
+    // Freeway's key is optional: if FREEWAY_API_KEY is already in .env.local
     // the row inherits it at call time (src/lib/freeway.ts falls back to env), so the user isn't
     // made to paste the same key twice. Supplying one here overrides the env value for this row.
-    const keyOptional = kind === 'ollama' || (kind === 'freeway' && !!process.env.FREEWAY_API_KEY);
+    const keyOptional = kind === 'freeway' && !!process.env.FREEWAY_API_KEY;
     if (!keyOptional && !api_key) {
       return NextResponse.json(
         {

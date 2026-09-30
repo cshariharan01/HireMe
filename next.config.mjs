@@ -9,6 +9,13 @@ const nextConfig = {
   // that reads a fixture off disk and throws — which is also why the resume route requires
   // `pdf-parse/lib/pdf-parse.js` directly.
   serverExternalPackages: ['pdf-parse', 'better-sqlite3', 'sqlite-vec'],
+  async redirects() {
+    return [
+      { source: '/trackers', destination: '/tracker', permanent: true },
+      { source: '/applications', destination: '/tracker', permanent: true },
+      { source: '/tracker-page', destination: '/tracker', permanent: true },
+    ];
+  },
   webpack: (config) => {
     config.externals = [...(config.externals || []), 'better-sqlite3', 'sqlite-vec'];
     return config;

@@ -10,52 +10,109 @@
 // questions one at a time via li.botItem elements, and the candidate responds
 // via radio buttons or contenteditable text inputs.
 
-import { type BrowserContext, type Page } from 'playwright';
+import { type BrowserContext, type Page, type Locator } from 'playwright';
 import path from 'path';
 import fs from 'fs';
 import type { CandidateProfile, PlatformResult } from './platform';
-import { launchApplyBrowser, bringWindowToFront, AUTO_APPLY_SUCCESS_PAGE, isApplyCancelled } from './launcher';
+import { launchApplyBrowser, bringWindowToFront, focusApplyPage, shouldBringWindowToFront, AUTO_APPLY_SUCCESS_PAGE, isApplyCancelled, getSystemChromeProfileDir } from './launcher';
 import { getApplyConfig, answerScreeningQuestion, normalizeCityName, matchCityResidenceQuestion } from './questions';
+import { resolveScreeningQuestionWithGemini, type FieldConstraints } from './llm-screening';
 
 export { normalizeCityName, matchCityResidenceQuestion };
 
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), 'data', 'playwright', 'browser-profile');
 
+/**
+ * Resolve the best Chrome profile directory for Naukri: prefer the user's REAL Chrome profile
+ * so DPAPI-encrypted session cookies are decryptable → Naukri opens already signed in.
+ * Falls back to the isolated Playwright profile when Chrome isn't installed or the profile
+ * can't be found (or when the user's everyday Chrome is already open on that profile).
+ */
+function resolveNaukriProfileDir(): string {
+  return BROWSER_PROFILE_DIR;
+}
+
 // ----- Naukri-specific selectors ---------------------------------------------
 
-const APPLY_BUTTON_SELECTORS = [
+export const DIRECT_APPLY_BUTTON_SELECTORS = [
   'button#apply-button',
   'button.apply-button',
+  'button:has-text("Apply Now")',
+  'button:has-text("Direct Apply")',
   'button:has-text("Apply")',
-  'button:has-text("Login to apply")',
-  'button:has-text("Continue with Google")',
-  'button:has-text("Continue with google")',
-  'a:has-text("Continue with Google")',
-  'a:has-text("Continue with google")',
+  'a:has-text("Apply Now")',
+  'a:has-text("Direct Apply")',
+  'a#apply-button',
+  'a.apply-button',
+  '#apply-button',
+  '.apply-button',
+  '.applyBtn',
   '[class*="apply-button"]',
   '[class*="applyBtn"]',
 ];
 
+const APPLY_BUTTON_SELECTORS = DIRECT_APPLY_BUTTON_SELECTORS;
+
 const COMPANY_SITE_SELECTORS = [
   'button#company-site-button',
   'a#company-site-button',
+  'button:has-text("Apply on company site")',
+  'a:has-text("Apply on company site")',
+  'button:has-text("Company Site")',
+  'a:has-text("Company Site")',
+  'button:has-text("Apply on Company Website")',
+  'a:has-text("Apply on Company Website")',
+  'button:has-text("Apply on Company Site")',
+  'a:has-text("Apply on Company Site")',
+  'button:has-text("Apply via Company")',
+  'a:has-text("Apply via Company")',
+  // Class-based selectors for Naukri DOM variants
+  '[class*="company-site"]',
+  '[class*="companySite"]',
+  '[class*="external-apply"]',
+  '[class*="externalApply"]',
+  '[data-ga-track*="company"]',
+  '[aria-label*="company site" i]',
+  '[aria-label*="company website" i]',
 ];
 
-const CHATBOT_DRAWER = ':is(div.chatbot_DrawerContentWrapper, div[class*="chatbot"])';
+const CHATBOT_DRAWER = ':is(div.chatbot_DrawerContentWrapper, div[class*="chatbot" i], div[class*="drawer" i], div[class*="Drawer"], div[class*="apply-container" i], div[class*="applyDrawer" i], div[class*="tuple-drawer" i], div[class*="chat-container" i], section[class*="chatbot" i], aside[class*="chatbot" i], div.apply-layer)';
 
-const CHATBOT_MESSAGE = 'li.botItem, li[class*="botItem"], div.botItem, div[class*="botItem"], div.msg_container.bot, div.botMsg';
+const CHATBOT_MESSAGE = 'li.botItem, li[class*="botItem"], div.botItem, div[class*="botItem"], div.msg_container.bot, div.botMsg, [class*="bot-msg" i], [class*="botMessage" i]';
 
 const CHATBOT_TEXT_INPUT = [
-  ':is(div.chatbot_DrawerContentWrapper, div[class*="chatbot"]) div[contenteditable="true"].textArea',
-  ':is(div.chatbot_DrawerContentWrapper, div[class*="chatbot"]) div[contenteditable="true"]',
-  ':is(div.chatbot_DrawerContentWrapper, div[class*="chatbot"]) input[type="text"].chatbot_Input',
-  ':is(div.chatbot_DrawerContentWrapper, div[class*="chatbot"]) input[type="text"]',
-  ':is(div.chatbot_DrawerContentWrapper, div[class*="chatbot"]) textarea',
-  'div[contenteditable="true"].textArea',
-  'div.textAreaWrapper [contenteditable="true"]',
-  'div[contenteditable="true"]',
-  'input[type="text"].chatbot_Input',
-  'textarea',
+  `${CHATBOT_DRAWER} div[contenteditable="true"].textArea`,
+  `${CHATBOT_DRAWER} div.textAreaWrapper [contenteditable="true"]`,
+  `${CHATBOT_DRAWER} div[contenteditable="true"]`,
+  `${CHATBOT_DRAWER} input[type="text"].chatbot_Input`,
+  `${CHATBOT_DRAWER} input.chatbot_Input`,
+  `${CHATBOT_DRAWER} input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])`,
+  `${CHATBOT_DRAWER} textarea`,
+  'div.chatbot_DrawerContentWrapper div[contenteditable="true"]',
+  'div.chatbot_DrawerContentWrapper input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]):not([type="submit"]):not([type="button"])',
+  'div.chatbot_DrawerContentWrapper textarea',
+].join(', ');
+
+const CHATBOT_SKILL_CHIPS = [
+  `${CHATBOT_DRAWER} div.suggested-chips div.chip`,
+  `${CHATBOT_DRAWER} div.suggested-chips span`,
+  `${CHATBOT_DRAWER} .chip-item`,
+  `${CHATBOT_DRAWER} .ssrc__chip`,
+  `${CHATBOT_DRAWER} .skill-chip`,
+  `${CHATBOT_DRAWER} [class*="chip"]`,
+  `${CHATBOT_DRAWER} [class*="tag"]`,
+  `${CHATBOT_DRAWER} [class*="suggested-skill"]`,
+].join(', ');
+
+const CHATBOT_CUSTOM_DROPDOWN = [
+  `${CHATBOT_DRAWER} div[class*="dropdown"]`,
+  `${CHATBOT_DRAWER} div[class*="select"]`,
+  `${CHATBOT_DRAWER} div[class*="custom-select"]`,
+  `${CHATBOT_DRAWER} div.droppable`,
+  `${CHATBOT_DRAWER} input[placeholder*="location" i]`,
+  `${CHATBOT_DRAWER} input[placeholder*="city" i]`,
+  `${CHATBOT_DRAWER} input[placeholder*="search" i]`,
+  `${CHATBOT_DRAWER} input[placeholder*="select" i]`,
 ].join(', ');
 
 const CHATBOT_SKIP_BUTTON = [
@@ -75,7 +132,18 @@ const CHATBOT_SKIP_BUTTON = [
   'button:has-text("Skip")',
 ].join(', ');
 
-const CHATBOT_RADIO = `${CHATBOT_DRAWER} label.ssrc__label, ${CHATBOT_DRAWER} .ssrc__radio-btn-container, ${CHATBOT_DRAWER} .singleselect-radiobutton, label.ssrc__label, .singleselect-radiobutton`;
+const CHATBOT_RADIO = [
+  `${CHATBOT_DRAWER} label.ssrc__label`,
+  `${CHATBOT_DRAWER} .ssrc__radio-btn-container`,
+  `${CHATBOT_DRAWER} .singleselect-radiobutton`,
+  `${CHATBOT_DRAWER} label[class*="radio" i]`,
+  `${CHATBOT_DRAWER} div[class*="radio" i]`,
+  `${CHATBOT_DRAWER} div[class*="singleselect" i]`,
+  'label.ssrc__label',
+  '.singleselect-radiobutton',
+  'label[class*="radio" i]',
+  'div[class*="singleselect" i]',
+].join(', ');
 
 const CHATBOT_CHECKBOX = `${CHATBOT_DRAWER} div.multiselectcheckboxes, ${CHATBOT_DRAWER} .mcc__checkbox, ${CHATBOT_DRAWER} label.mcc__label, div.multiselectcheckboxes, .mcc__checkbox, label.mcc__label`;
 
@@ -84,12 +152,15 @@ const CHATBOT_FILE_UPLOAD = `${CHATBOT_DRAWER} input.chatbot_Uploader[type="file
 const CHATBOT_SAVE_BUTTON = [
   `${CHATBOT_DRAWER} div.send:not(.disabled) div.sendMsg`,
   `${CHATBOT_DRAWER} div.send:not(.disabled)`,
-  `${CHATBOT_DRAWER} button:has-text("Save")`,
-  'div.sendMsg',
-  'div[class*="sendMsg"]',
+  `${CHATBOT_DRAWER} button:has-text("Save"):not([disabled])`,
+  `${CHATBOT_DRAWER} button:has-text("Next"):not([disabled])`,
+  'div.send:not(.disabled) div.sendMsg',
   'div.send:not(.disabled)',
+  'button:has-text("Save"):not([disabled])',
+  'button:has-text("Next"):not([disabled])',
+  `${CHATBOT_DRAWER} button:has-text("Save")`,
   'button:has-text("Save")',
-  'button:has-text("Submit")',
+  'div.sendMsg',
 ].join(', ');
 
 export const CHATBOT_CLOSE_BUTTON = [
@@ -249,33 +320,195 @@ export async function waitForNaukriSubmission(page: Page, maxWaitMs = 5000): Pro
   return false;
 }
 
+export const NAUKRI_EXPIRED_PATTERNS = [
+  /this job is no longer available/i,
+  /this job has expired/i,
+  /job has expired/i,
+  /job is expired/i,
+  /applications are closed for this job/i,
+  /no longer accepting applications/i,
+  /this vacancy has expired/i,
+  /this vacancy is no longer available/i,
+  /the job you are looking for is no longer available/i,
+  /this job is currently inactive/i,
+  /listing has expired/i,
+  /listing is expired/i,
+  /posting has expired/i,
+  /position has been closed/i,
+  /position is closed/i,
+  /applications closed/i,
+  /applications are closed/i,
+  /vacancy closed/i,
+  /job closed/i,
+  /expired job/i,
+];
+
+/**
+ * Detect whether the Naukri job posting has expired or closed.
+ * Checks both explicit badges/elements and rendered body text.
+ */
+export async function detectNaukriExpired(page: Page): Promise<boolean> {
+  try {
+    // 1. Explicit badges, banners, buttons, or message tags
+    const expiredBadges = [
+      '[class*="job-expired" i]',
+      '[class*="jobExpired" i]',
+      '[class*="expired-banner" i]',
+      '[class*="expired-msg" i]',
+      '[class*="expired-tag" i]',
+      '[class*="expired" i]',
+      'button:has-text("Job Expired")',
+      'button:has-text("Expired")',
+      'button:text-is("Expired")',
+      'span:text-is("Expired")',
+      'div:text-is("Expired")',
+      'span:has-text("Job has expired")',
+      'div:has-text("Job has expired")',
+      'p:has-text("Job has expired")',
+      'div:has-text("This job is no longer available")',
+      'p:has-text("This job is no longer available")',
+      'div:has-text("No longer accepting applications")',
+    ];
+
+    for (const sel of expiredBadges) {
+      try {
+        const el = page.locator(sel).first();
+        if ((await el.count()) > 0 && (await el.isVisible().catch(() => false))) {
+          const text = (await el.innerText().catch(() => '')).trim().toLowerCase();
+          if (
+            text.includes('expired') ||
+            text.includes('no longer available') ||
+            text.includes('closed') ||
+            text.includes('no longer accepting')
+          ) {
+            return true;
+          }
+        }
+      } catch {}
+    }
+
+    // 2. Scan page body / main container text
+    const bodySnippet = await page.evaluate(() => {
+      const el = document.querySelector('.job-desc, .leftSec, main, #root, #app') || document.body;
+      return (el as HTMLElement)?.innerText?.slice(0, 10000) || '';
+    }).catch(() => '');
+
+    if (bodySnippet) {
+      for (const pattern of NAUKRI_EXPIRED_PATTERNS) {
+        if (pattern.test(bodySnippet)) {
+          return true;
+        }
+      }
+    }
+  } catch {}
+  return false;
+}
+
+/**
+ * Detect whether the Naukri job page only supports external application (Apply on company site).
+ * Checks explicit selectors as well as DOM elements for external phrasing.
+ */
+export async function detectNaukriCompanySite(page: Page): Promise<boolean> {
+  // 1. Check explicit company site selectors
+  for (const sel of COMPANY_SITE_SELECTORS) {
+    try {
+      const btn = page.locator(sel).first();
+      if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+        return true;
+      }
+    } catch {}
+  }
+
+  // 2. Inspect buttons and links for external apply text
+  try {
+    const isCompany = await page.evaluate(() => {
+      const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], .apply-button, [class*="apply"]'));
+      for (const el of candidates) {
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (
+          text.includes('apply on company') ||
+          text.includes('company site') ||
+          text.includes('company website') ||
+          text.includes('apply via company') ||
+          text.includes('apply externally') ||
+          text.includes('visit company') ||
+          text.includes('apply now on company')
+        ) {
+          const style = window.getComputedStyle(el);
+          if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
+            return true;
+          }
+        }
+      }
+      return false;
+    });
+    if (isCompany) return true;
+  } catch {}
+
+  return false;
+}
+
+/**
+ * Find the direct Apply (Easy Apply) button on the Naukri job page.
+ * Returns null if the page is expired, requires external apply, or has no direct button.
+ */
+export async function findNaukriDirectApplyButton(page: Page): Promise<Locator | null> {
+  // Disqualify immediately if expired or company site
+  if (await detectNaukriExpired(page)) return null;
+  if (await detectNaukriCompanySite(page)) return null;
+
+  for (const sel of DIRECT_APPLY_BUTTON_SELECTORS) {
+    try {
+      const btn = page.locator(sel).first();
+      if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+        const text = (await btn.innerText().catch(() => '')).trim();
+        // Negative checks
+        if (/apply on company|company site|company website|apply via company|external|visit site/i.test(text)) {
+          continue;
+        }
+        if (/already applied|expired|closed/i.test(text)) {
+          continue;
+        }
+        if (/login to apply|sign in|continue with google/i.test(text)) {
+          continue;
+        }
+        // Positive check
+        if (/apply/i.test(text) || sel.includes('apply')) {
+          return btn;
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
 /**
  * Detect whether Naukri's direct-apply (Easy Apply) button is present.
- * Returns false if the company-site button is visible (external apply only).
+ * Returns false if the job is expired or company-site button is visible.
  */
 export async function detectNaukriEasyApply(page: Page): Promise<boolean> {
-  // If the "Apply on company site" button is visible, it's NOT Easy Apply
+  // 1. Check for explicit company site buttons (external apply only)
   for (const sel of COMPANY_SITE_SELECTORS) {
     try {
       const btn = page.locator(sel).first();
       if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
         return false;
       }
-    } catch {
-      // continue
-    }
+    } catch {}
   }
 
-  // Check for the direct apply button
-  for (const sel of APPLY_BUTTON_SELECTORS) {
+  // 2. Check for direct apply buttons
+  for (const sel of DIRECT_APPLY_BUTTON_SELECTORS) {
     try {
       const btn = page.locator(sel).first();
       if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+        const text = (await btn.innerText().catch(() => '')).trim();
+        if (/apply on company|company site|company website|apply via company|external|visit site|apply now on/i.test(text)) {
+          return false;
+        }
         return true;
       }
-    } catch {
-      // continue
-    }
+    } catch {}
   }
 
   return false;
@@ -304,6 +537,11 @@ export async function detectNaukriCaptcha(page: Page): Promise<boolean> {
  * Detect if login is required (login modal or redirect).
  */
 export async function detectNaukriLoginRequired(page: Page): Promise<boolean> {
+  // If application was ALREADY submitted or confirmed on Naukri, login is NOT required!
+  if (await detectNaukriApplicationSubmitted(page).catch(() => false)) {
+    return false;
+  }
+
   // Check URL for login page patterns
   try {
     const url = page.url();
@@ -320,10 +558,10 @@ export async function detectNaukriLoginRequired(page: Page): Promise<boolean> {
     // ignore
   }
 
-  // Naukri shows a login / continue with google button when not authenticated
+  // Naukri shows explicit login required buttons when not authenticated
   try {
     const loginBtn = page.locator(
-      'button#login-apply-button, button#continue-with-google-button, [class*="continue-with-google"], .login-to-apply, a:has-text("Login"), button:has-text("Login")'
+      'button#login-apply-button, button#continue-with-google-button, [class*="continue-with-google"], .login-to-apply, button:has-text("Login to apply"), a:has-text("Login to apply")'
     ).first();
     if ((await loginBtn.count()) > 0 && (await loginBtn.isVisible().catch(() => false))) {
       return true;
@@ -393,23 +631,47 @@ export async function waitForNaukriLogin(
  */
 async function isChatbotOpen(page: Page): Promise<boolean> {
   try {
-    const drawer = page.locator(CHATBOT_DRAWER).first();
-    if ((await drawer.count()) === 0) return false;
-    const isVisible = await drawer.isVisible().catch(() => false);
-    if (!isVisible) return false;
-
     // If application is already confirmed submitted, chatbot has completed
     if (await detectNaukriApplicationSubmitted(page)) return false;
 
-    // Check for interactive question elements inside the chatbot
-    const hasRadio = (await page.locator(CHATBOT_RADIO).first().count() > 0) && (await page.locator(CHATBOT_RADIO).first().isVisible().catch(() => false));
-    const hasCheckbox = (await page.locator(CHATBOT_CHECKBOX).first().count() > 0) && (await page.locator(CHATBOT_CHECKBOX).first().isVisible().catch(() => false));
-    const textInput = page.locator(CHATBOT_TEXT_INPUT).first();
-    const hasInput = (await textInput.count() > 0) && (await textInput.isVisible().catch(() => false));
-    const hasSelect = (await page.locator(`${CHATBOT_DRAWER} select`).first().count() > 0);
-    const hasFile = (await page.locator(CHATBOT_FILE_UPLOAD).first().count() > 0);
+    // Check if any chatbot drawer container or layer is visible
+    const drawerSelectors = [
+      CHATBOT_DRAWER,
+      'div[class*="chatbot" i]',
+      'div[class*="drawer" i]',
+      'div[class*="apply-container" i]',
+      'div[class*="applyDrawer" i]',
+      'div[class*="tuple-drawer" i]',
+      'div[class*="chat-container" i]',
+      'section[class*="chatbot" i]',
+      'aside[class*="chatbot" i]',
+      'div.apply-layer',
+    ];
 
-    return hasRadio || hasCheckbox || hasInput || hasSelect || hasFile;
+    for (const sel of drawerSelectors) {
+      const el = page.locator(sel).first();
+      if ((await el.count()) > 0 && (await el.isVisible().catch(() => false))) {
+        return true;
+      }
+    }
+
+    // Check for bot message or interactive question elements directly
+    const botMsg = page.locator('li.botItem, li[class*="botItem"], div.botItem, div[class*="botItem"], [class*="botMsg" i], [class*="bot_msg" i]').first();
+    if ((await botMsg.count()) > 0 && (await botMsg.isVisible().catch(() => false))) {
+      return true;
+    }
+
+    const textInput = page.locator(CHATBOT_TEXT_INPUT).first();
+    if ((await textInput.count()) > 0 && (await textInput.isVisible().catch(() => false))) {
+      return true;
+    }
+
+    const radio = page.locator(CHATBOT_RADIO).first();
+    if ((await radio.count()) > 0 && (await radio.isVisible().catch(() => false))) {
+      return true;
+    }
+
+    return false;
   } catch {
     return false;
   }
@@ -434,7 +696,7 @@ async function getCurrentQuestionText(page: Page): Promise<string> {
 /**
  * Classify the current question type.
  */
-async function detectQuestionType(page: Page, questionText: string): Promise<'radio' | 'checkbox' | 'text' | 'file_upload' | 'select' | 'unknown'> {
+async function detectQuestionType(page: Page, questionText: string): Promise<'radio' | 'checkbox' | 'skill_chips' | 'custom_dropdown' | 'file_upload' | 'select' | 'text' | 'unknown'> {
   // 1. Radio buttons (single-select questions, Yes/No, experience ranges)
   const radio = page.locator(CHATBOT_RADIO).first();
   if ((await radio.count()) > 0 && (await radio.isVisible().catch(() => false))) {
@@ -447,13 +709,23 @@ async function detectQuestionType(page: Page, questionText: string): Promise<'ra
     return 'checkbox';
   }
 
-  // 3. Native select
+  // 3. Skill Chips / Tag Buttons
+  if (/skills|keyskills|key skills/i.test(questionText) || ((await page.locator(CHATBOT_SKILL_CHIPS).first().count() > 0) && (await page.locator(CHATBOT_SKILL_CHIPS).first().isVisible().catch(() => false)))) {
+    return 'skill_chips';
+  }
+
+  // 4. Native select
   const selects = page.locator(`${CHATBOT_DRAWER} select`).first();
   if ((await selects.count()) > 0 && (await selects.isVisible().catch(() => false))) {
     return 'select';
   }
 
-  // 4. File upload (only if question specifically prompts for resume/CV/upload)
+  // 5. Custom Dropdown / Searchable location input
+  if (/location|city|where do you live|reside|locality|area/i.test(questionText) && ((await page.locator(CHATBOT_CUSTOM_DROPDOWN).first().count() > 0) && (await page.locator(CHATBOT_CUSTOM_DROPDOWN).first().isVisible().catch(() => false)))) {
+    return 'custom_dropdown';
+  }
+
+  // 6. File upload (only if question specifically prompts for resume/CV/upload)
   if (/resume|cv|upload|attach/i.test(questionText)) {
     const fileInput = page.locator(CHATBOT_FILE_UPLOAD).first();
     if ((await fileInput.count()) > 0) {
@@ -461,7 +733,7 @@ async function detectQuestionType(page: Page, questionText: string): Promise<'ra
     }
   }
 
-  // 5. Visible text input (contenteditable div or input)
+  // 7. Visible text input (contenteditable div or input)
   const textInput = page.locator(CHATBOT_TEXT_INPUT).first();
   if ((await textInput.count()) > 0 && (await textInput.isVisible().catch(() => false))) {
     return 'text';
@@ -475,7 +747,7 @@ async function detectQuestionType(page: Page, questionText: string): Promise<'ra
  */
 async function getRadioOptions(page: Page): Promise<string[]> {
   try {
-    const labels = page.locator(`${CHATBOT_DRAWER} label.ssrc__label`);
+    const labels = page.locator(`${CHATBOT_DRAWER} label.ssrc__label, ${CHATBOT_DRAWER} label, ${CHATBOT_DRAWER} .singleselect-radiobutton`);
     const count = await labels.count();
     const options: string[] = [];
     for (let i = 0; i < count; i++) {
@@ -549,41 +821,54 @@ export function matchExperienceOption(options: string[], candidateYears: number)
 /**
  * Answer a radio button question by clicking the matching option.
  */
-async function answerRadioQuestion(page: Page, questionText: string, profile: CandidateProfile, options: string[]): Promise<boolean> {
+export async function answerRadioQuestion(
+  page: Page,
+  questionText: string,
+  profile: CandidateProfile,
+  options: string[],
+): Promise<boolean> {
   const lowerQuestion = questionText.toLowerCase();
 
   let targetIndex = -1;
   let targetAnswer: string | null = null;
 
-  // Ex-employee / previous employment with this company
-  if (/ex[- ](employee|emp|infosys|tcs|wipro|cognizant)|former employee|previous employee|past employee|previously worked/i.test(questionText)) {
+  // 1. Ex-employee / previous employment with target company
+  if (/ex[- ](employee|emp|infosys|tcs|wipro|cognizant|accenture|hcl|tech mahindra|capgemini)|former employee|previous employee|past employee|previously worked/i.test(questionText)) {
     targetAnswer = 'No';
     targetIndex = options.findIndex((o) => o.toLowerCase() === 'no');
     if (targetIndex < 0) {
-      targetIndex = options.findIndex((o) => /na|none|never/i.test(o));
+      targetIndex = options.findIndex((o) => /na|none|never|false/i.test(o));
     }
   }
 
-  // City residence verification (e.g. "Are you residing curretly in Hydrabad ?")
+  // 2. City residence verification (e.g. "Are you residing curretly in Hydrabad ?")
   else if (matchCityResidenceQuestion(questionText, profile.location)) {
     const cityCheck = matchCityResidenceQuestion(questionText, profile.location)!;
     targetAnswer = cityCheck.answer;
     targetIndex = options.findIndex((o) => o.trim().toLowerCase() === cityCheck.answer.toLowerCase());
   }
 
-  // Work from office / hybrid / on-site
-  else if (/work from office|wfo|hybrid|on[- ]?site|in[- ]?office/i.test(questionText)) {
+  // 3. Work from office / hybrid / on-site / shifts / travel / walk-in / interview attendance
+  else if (/work from office|wfo|hybrid|on[- ]?site|in[- ]?office|night shift|rotational|shifts|travel|business travel|attend|walk[- ]?in|drive|in[- ]?person|interview|venue|slot/i.test(questionText)) {
     targetAnswer = 'Yes';
-    targetIndex = options.findIndex((o) => o.toLowerCase() === 'yes');
+    targetIndex = options.findIndex((o) => /yes|true|attend|agree|willing|sure/i.test(o));
+    if (targetIndex < 0 && options.length > 0) {
+      targetIndex = 0;
+      targetAnswer = options[0];
+    }
   }
 
-  // Yes/No questions (willingness, relocate, ready to, comfortable, etc.)
-  else if (/willing|able|can you|relocate|ready to|comfortable|okay with|open to|authorized/i.test(questionText)) {
+  // 4. General Yes/No & Willingness questions (willingness, relocate, ready to, comfortable, can you, will you, etc.)
+  else if (/(?:will|can|do|are|would|is|have)\s+you|willing|able|relocate|ready to|comfortable|okay with|open to|authorized|agree/i.test(questionText)) {
     targetAnswer = 'Yes';
-    targetIndex = options.findIndex((o) => o.toLowerCase() === 'yes');
+    targetIndex = options.findIndex((o) => /yes|true|agree|willing/i.test(o));
+    if (targetIndex < 0 && options.length > 0) {
+      targetIndex = 0;
+      targetAnswer = options[0];
+    }
   }
 
-  // Experience / years questions (e.g. "How many years of experience do you have as ETL Developer ?")
+  // 5. Experience / years questions
   else if (/experience|years|yoe|how many.*year/i.test(questionText)) {
     const candidateYears = profile.yearsExperience || profile.yearsOfExperience || 4;
     targetIndex = matchExperienceOption(options, candidateYears);
@@ -592,17 +877,17 @@ async function answerRadioQuestion(page: Page, questionText: string, profile: Ca
     }
   }
 
-  // Notice period
-  else if (/notice period|serving notice|lwd|last working/i.test(questionText)) {
+  // 6. Notice period / serving notice / joining
+  else if (/notice period|serving notice|lwd|last working|joining/i.test(questionText)) {
     targetAnswer = '15 Days';
-    targetIndex = options.findIndex((o) => o.includes('15') || o.toLowerCase().includes('immediate') || o.includes('< 15'));
+    targetIndex = options.findIndex((o) => o.includes('15') || o.toLowerCase().includes('immediate') || o.includes('< 15') || o.includes('0-15'));
     if (targetIndex < 0 && options.length > 0) {
       targetIndex = 0;
       targetAnswer = options[0];
     }
   }
 
-  // Employment type
+  // 7. Employment type (Full-time / Part-time / Contract)
   else if (/employment type|full.?time|part.?time/i.test(questionText)) {
     targetAnswer = 'Full-time';
     targetIndex = options.findIndex((o) => o.toLowerCase().includes('full'));
@@ -612,39 +897,123 @@ async function answerRadioQuestion(page: Page, questionText: string, profile: Ca
     }
   }
 
-  // Default: pick the first non-Skip option
+  // Default fallback: pick via Gemini or first non-skip option
   if (targetIndex < 0 && options.length > 0) {
-    targetIndex = options.findIndex((o) => !/skip|decline|none of/i.test(o));
-    if (targetIndex < 0) targetIndex = 0;
-    targetAnswer = options[targetIndex];
+    try {
+      const geminiChoice = await resolveScreeningQuestionWithGemini(
+        questionText,
+        'radio',
+        options,
+        profile
+      );
+      if (geminiChoice) {
+        const found = options.findIndex(
+          (o) => o.trim().toLowerCase() === geminiChoice.toLowerCase() || o.toLowerCase().includes(geminiChoice.toLowerCase())
+        );
+        if (found >= 0) {
+          targetIndex = found;
+          targetAnswer = options[found];
+        }
+      }
+    } catch {}
+
+    if (targetIndex < 0) {
+      targetIndex = options.findIndex((o) => !/skip|decline|none of/i.test(o));
+      if (targetIndex < 0) targetIndex = 0;
+      targetAnswer = options[targetIndex];
+    }
   }
 
-  if (targetIndex < 0) return false;
+  if (targetIndex < 0 && !targetAnswer) return false;
 
-  // Click the label element for the chosen option (Naukri modern UI binds click to label.ssrc__label)
-  try {
-    const labels = page.locator(`${CHATBOT_DRAWER} label.ssrc__label`);
-    const count = await labels.count();
-    if (targetIndex < count) {
-      await labels.nth(targetIndex).click({ timeout: 3000 });
-      await page.waitForTimeout(500);
+  // First try: JS evaluation inside the chatbot drawer to find and click the exact option element
+  const clickedInJs = await page.evaluate(({ tIndex, tText }) => {
+    const drawer = document.querySelector(
+      'div.chatbot_DrawerContentWrapper, div[class*="chatbot" i], div[class*="drawer" i], div[class*="applyDrawer" i], div[class*="apply-container" i]'
+    );
+    const root = drawer || document;
+
+    const items = Array.from(root.querySelectorAll(
+      'label.ssrc__label, .singleselect-radiobutton, .ssrc__radio-btn-container, label[class*="radio" i], div[class*="radio" i], input[type="radio"], label'
+    ));
+
+    const validOptions: { element: HTMLElement; text: string; radioInput: HTMLInputElement | null }[] = [];
+    for (const el of items) {
+      const text = ((el as HTMLElement).innerText || el.textContent || '').trim();
+      if (text && !text.includes('\n') && text.length < 100 && !/skip this question|bot|drawer|step/i.test(text)) {
+        if (!validOptions.some((v) => v.text === text)) {
+          const radioInput = (el instanceof HTMLInputElement && el.type === 'radio')
+            ? el
+            : el.querySelector('input[type="radio"]');
+          validOptions.push({ element: el as HTMLElement, text, radioInput: radioInput as HTMLInputElement | null });
+        }
+      }
+    }
+
+    let chosen: { element: HTMLElement; text: string; radioInput: HTMLInputElement | null } | undefined;
+
+    if (tText) {
+      const lower = tText.toLowerCase();
+      chosen = validOptions.find((v) => v.text.toLowerCase() === lower) ||
+               validOptions.find((v) => v.text.toLowerCase().includes(lower));
+    }
+
+    if (!chosen && tIndex >= 0 && tIndex < validOptions.length) {
+      chosen = validOptions[tIndex];
+    }
+
+    if (!chosen && validOptions.length > 0) {
+      chosen = validOptions[0];
+    }
+
+    if (chosen) {
+      const { element, radioInput } = chosen;
+      element.scrollIntoView({ block: 'nearest' });
+      element.click();
+
+      if (radioInput) {
+        radioInput.checked = true;
+        radioInput.dispatchEvent(new Event('change', { bubbles: true }));
+        radioInput.dispatchEvent(new Event('click', { bubbles: true }));
+      }
+
+      const sendBtn = root.querySelector('div.send, [class*="send" i], [class*="save" i]');
+      if (sendBtn) sendBtn.classList.remove('disabled');
+
       return true;
     }
-  } catch {}
+    return false;
+  }, { tIndex: targetIndex, tText: targetAnswer }).catch(() => false);
 
-  // Fallback: match by label text
+  if (clickedInJs) {
+    await page.waitForTimeout(500);
+    return true;
+  }
+
+  // Playwright locator click fallback
   if (targetAnswer) {
     try {
       const byText = page.locator(
-        `${CHATBOT_DRAWER} label.ssrc__label:has-text("${targetAnswer}"), ${CHATBOT_DRAWER} label:has-text("${targetAnswer}")`
+        `${CHATBOT_DRAWER} label.ssrc__label:has-text("${targetAnswer}"), ${CHATBOT_DRAWER} label:has-text("${targetAnswer}"), ${CHATBOT_DRAWER} .singleselect-radiobutton:has-text("${targetAnswer}")`
       ).first();
-      if ((await byText.count()) > 0) {
-        await byText.click({ timeout: 3000 });
+      if ((await byText.count()) > 0 && (await byText.isVisible().catch(() => false))) {
+        await byText.click({ timeout: 2000 });
         await page.waitForTimeout(500);
         return true;
       }
     } catch {}
   }
+
+  // Fallback locator by index
+  try {
+    const labels = page.locator(`${CHATBOT_DRAWER} label.ssrc__label, ${CHATBOT_DRAWER} .singleselect-radiobutton`);
+    const count = await labels.count();
+    if (targetIndex >= 0 && targetIndex < count) {
+      await labels.nth(targetIndex).click({ timeout: 2000 });
+      await page.waitForTimeout(500);
+      return true;
+    }
+  } catch {}
 
   return false;
 }
@@ -721,6 +1090,113 @@ export async function answerCheckboxQuestion(
 }
 
 /**
+ * Answer a skill chips question by clicking matching or first skill tag.
+ */
+export async function answerSkillChipsQuestion(
+  page: Page,
+  profile: CandidateProfile,
+): Promise<boolean> {
+  try {
+    const chips = page.locator(CHATBOT_SKILL_CHIPS);
+    const count = await chips.count();
+    if (count === 0) return false;
+
+    const userSkills = [
+      ...(Array.isArray(profile.skills) ? profile.skills : []),
+      ...(Array.isArray(profile.keySkills) ? profile.keySkills : []),
+      ...(profile.title ? [profile.title] : []),
+    ].map((s) => String(s).toLowerCase());
+
+    let clicked = false;
+    for (let i = 0; i < count; i++) {
+      const chip = chips.nth(i);
+      const text = (await chip.innerText().catch(() => '')).trim();
+      if (!text) continue;
+
+      const lowerText = text.toLowerCase();
+      const matches = userSkills.some((s) => lowerText.includes(s) || s.includes(lowerText));
+      if (matches || userSkills.length === 0 || i === 0) {
+        await chip.click({ timeout: 2000 }).catch(() => {});
+        clicked = true;
+        await page.waitForTimeout(300);
+      }
+    }
+
+    if (!clicked && count > 0) {
+      await chips.first().click({ timeout: 2000 }).catch(() => {});
+      clicked = true;
+    }
+
+    await page.waitForTimeout(500);
+    return clicked;
+  } catch (err) {
+    console.warn('[naukri] Error answering skill chips question:', err);
+    return false;
+  }
+}
+
+/**
+ * Answer a custom dropdown / searchable location question in Naukri chatbot.
+ */
+export async function answerCustomDropdownQuestion(
+  page: Page,
+  questionText: string,
+  profile: CandidateProfile,
+): Promise<boolean> {
+  try {
+    const dropdownInput = page.locator(CHATBOT_CUSTOM_DROPDOWN).first();
+    if ((await dropdownInput.count()) === 0) return false;
+
+    const targets = profile.targets as { locations?: string[] } | undefined;
+    const targetLocation = (profile.location as string) || (targets?.locations?.[0]) || 'Bengaluru';
+    const city = targetLocation.split(',')[0].trim();
+
+    await dropdownInput.scrollIntoViewIfNeeded().catch(() => {});
+    await dropdownInput.click({ timeout: 3000 });
+    await page.waitForTimeout(300);
+
+    // Clear and type city name
+    await page.keyboard.press('Control+A');
+    await page.keyboard.press('Backspace');
+    await page.keyboard.type(city, { delay: 40 });
+    await page.waitForTimeout(600);
+
+    // Click the first matching option suggestion in the dropdown popup
+    const optionLocators = [
+      `${CHATBOT_DRAWER} ul li`,
+      `${CHATBOT_DRAWER} div[class*="option"]`,
+      `${CHATBOT_DRAWER} div[class*="item"]`,
+      `${CHATBOT_DRAWER} div.droppable div`,
+      'ul.dropdown li',
+      'div[class*="suggestion"]',
+      'div[class*="dropdown-item"]',
+    ];
+
+    for (const sel of optionLocators) {
+      try {
+        const firstOpt = page.locator(sel).first();
+        if ((await firstOpt.count()) > 0 && (await firstOpt.isVisible().catch(() => false))) {
+          await firstOpt.click({ timeout: 2000 });
+          await page.waitForTimeout(500);
+          return true;
+        }
+      } catch {
+        // continue
+      }
+    }
+
+    // Fallback: press Enter or Down Arrow + Enter
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(500);
+    return true;
+  } catch (err) {
+    console.warn('[naukri] Error answering custom dropdown question:', err);
+    return false;
+  }
+}
+
+/**
  * Deterministically resolve a text answer for a Naukri chatbot screening question.
  */
 export function resolveChatbotTextAnswer(
@@ -771,58 +1247,69 @@ export function resolveChatbotTextAnswer(
     return profile.name || '';
   }
   if (/\blinkedin\b/i.test(q)) return profile.linkedin || '';
-  if (/\b(github|portfolio|website)\b/i.test(q)) return profile.portfolioUrl || 'https://github.com/cshariharan01';
+  if (/\b(github|portfolio|website)\b/i.test(q)) return profile.portfolioUrl || '';
 
   // 4. Notice period / LWD / Joining time
   if (/notice period|serving notice|last working day|lwd|how soon can you join/i.test(q)) {
-    const days = profile.noticePeriodDays ?? 30;
+    const days = profile.noticePeriodDays ?? (profile.notice_period_days as number) ?? 30;
     if (/in days|\bdays\b/i.test(q)) return String(days);
     return `${days} Days`;
   }
 
-  // 5. Current CTC / Compensation
+  // 5. Current CTC / Compensation (e.g. "What is your current CTC in Lacs per annum?")
   if (/current\s*(ctc|salary|compensation|fixed|take home|package)|present\s*(ctc|salary)/i.test(q)) {
-    const inr = profile.currentCtcInr ?? 700000;
-    if (/in lpa|\blpa\b|lakhs?/i.test(q)) {
-      return `${(inr / 100000).toFixed(1)} LPA`;
+    const inr = (profile.currentCtcInr as number | undefined) ?? (profile.current_ctc_inr as number | undefined);
+    const targetMin = (profile.targets as any)?.comp_min;
+    const val = inr || targetMin || 700000;
+    const lakhs = val / 100000;
+    const formattedLakhs = lakhs % 1 === 0 ? String(lakhs) : Number(lakhs.toFixed(2)).toString();
+    if (/(?:in lpa|\blpa\b|lakhs?|lacs?)/i.test(q)) {
+      return formattedLakhs;
     }
-    if (/in inr|in ₹|rupees|digits|numbers?/i.test(q)) {
-      return String(inr);
+    if (/(?:in inr|in ₹|rupees|digits|numbers?)/i.test(q)) {
+      return String(val);
     }
-    return `${(inr / 100000).toFixed(1)} LPA`;
+    return formattedLakhs;
   }
 
   // 6. Expected CTC / Compensation
   if (/expected\s*(ctc|salary|compensation|package)|salary expectation/i.test(q)) {
-    const inr = profile.expectedCtcInr ?? 1200000;
-    if (/in lpa|\blpa\b|lakhs?/i.test(q)) {
-      return `${(inr / 100000).toFixed(1)} LPA`;
+    const targets = profile.targets as { comp_min?: number; locations?: string[] } | undefined;
+    const inr = (profile.expectedCtcInr as number | undefined) ?? (profile.expected_ctc_inr as number | undefined) ?? targets?.comp_min;
+    const val = inr || 1200000;
+    const lakhs = val / 100000;
+    const formattedLakhs = lakhs % 1 === 0 ? String(lakhs) : Number(lakhs.toFixed(2)).toString();
+    if (/(?:in lpa|\blpa\b|lakhs?|lacs?)/i.test(q)) {
+      return formattedLakhs;
     }
-    if (/in inr|in ₹|rupees|digits|numbers?/i.test(q)) {
-      return String(inr);
+    if (/(?:in inr|in ₹|rupees|digits|numbers?)/i.test(q)) {
+      return String(val);
     }
-    return `${(inr / 100000).toFixed(1)} LPA`;
+    return formattedLakhs;
   }
 
-  // 7. Experience / Years
-  if (/(total|relevant|overall|years of)?\s*(experience|exp|yoe)\b/i.test(q)) {
-    const yoe = profile.yearsOfExperience ?? profile.yearsExperience ?? 3;
-    return String(yoe);
+  // 7. Experience / Years (e.g. "How many years of experience do you have in Power Bi?", "Years of experience in Python")
+  if (/(?:total|relevant|overall|years of|work)?\s*(?:experience|exp|yoe)\b|how many years|years in\b/i.test(q)) {
+    const expList = Array.isArray(profile.experience) ? profile.experience : [];
+    const rawYoe = (profile.yearsOfExperience as number) ?? (profile.yearsExperience as number) ?? (expList.length ? Math.max(1, expList.length * 2) : 3);
+    const numYoe = Number(rawYoe);
+    return !isNaN(numYoe) && numYoe >= 0 ? String(Math.floor(numYoe)) : '3';
   }
 
   // 8. Location & Relocation
   if (/willing to relocate|ready to relocate|comfortable to relocate|open to relocate/i.test(q)) {
     return 'Yes';
   }
-  const cityResidence = matchCityResidenceQuestion(q, profile.location);
+  const cityResidence = matchCityResidenceQuestion(q, profile.location as string | undefined);
   if (cityResidence) {
     return cityResidence.answer;
   }
   if (/current location|current city|where are you (currently )?(living|located|residing|based)/i.test(q)) {
-    return profile.location || 'Madurai, India';
+    return (profile.location as string) || '';
   }
   if (/preferred location|preferred city/i.test(q)) {
-    return 'Bengaluru';
+    const targets = profile.targets as { locations?: string[] } | undefined;
+    return (targets?.locations && targets.locations.length > 0) ? targets.locations[0] : ((profile.location as string) || '');
   }
   if (/work from office|wfo|hybrid|on[- ]?site|in[- ]?office/i.test(q)) {
     return 'Yes';
@@ -830,18 +1317,28 @@ export function resolveChatbotTextAnswer(
 
   // 9. Current Company / Title
   if (/current (organization|company|employer)|present (organization|company|employer)/i.test(q)) {
-    return profile.currentCompany || 'Solartis Technology';
+    return (profile.currentCompany as string) || '';
   }
   if (/current (role|job title|designation)|present (role|job title|designation)/i.test(q)) {
-    return profile.currentJobTitle || 'Data Engineer';
+    return (profile.currentJobTitle as string) || (profile.title as string) || '';
   }
 
-  // 10. Education / College
+  // 10. Education / College / Years
   if (/highest (qualification|education|degree)|qualification|degree/i.test(q)) {
-    return 'B.E. Computer Science and Engineering';
+    const edu = Array.isArray(profile.education) ? profile.education : [];
+    return edu.length > 0 ? String(edu[0]) : ((profile.degree as string) || (profile.qualification as string) || 'Bachelor Degree');
   }
-  if (/pass(ing)? out year|graduation year|year of graduation/i.test(q)) {
-    return '2022';
+  if (/starting year|start year|admission year/i.test(q)) {
+    const eduStr = JSON.stringify(profile.education || []);
+    const match = eduStr.match(/(\b20\d\d\b|\b19\d\d\b)/);
+    if (match) return match[1];
+    return '2016';
+  }
+  if (/pass(ing)? out year|graduation year|year of graduation|completion year|end year/i.test(q)) {
+    const eduStr = JSON.stringify(profile.education || []);
+    const matches = eduStr.match(/(\b20\d\d\b|\b19\d\d\b)/g);
+    if (matches && matches.length > 0) return matches[matches.length - 1];
+    return '2020';
   }
 
   // 11. Willingness / Yes-No prompts
@@ -861,16 +1358,31 @@ export function resolveChatbotTextAnswer(
  * Click the optional "Skip this question" button in the chatbot if present.
  */
 export async function clickChatbotSkip(page: Page): Promise<boolean> {
-  try {
-    const skipBtn = page.locator(CHATBOT_SKIP_BUTTON).first();
-    if ((await skipBtn.count()) > 0 && (await skipBtn.isVisible().catch(() => false))) {
-      console.log('[naukri] Clicking Skip button in chatbot');
-      await skipBtn.click({ timeout: 3000 });
-      await page.waitForTimeout(1500);
-      return true;
+  const skipSelectors = [
+    `${CHATBOT_DRAWER} button:has-text("Skip this question")`,
+    `${CHATBOT_DRAWER} span:has-text("Skip this question")`,
+    `${CHATBOT_DRAWER} div:has-text("Skip this question"):not(:has(div))`,
+    `${CHATBOT_DRAWER} [class*="skip" i]`,
+    'button:has-text("Skip this question")',
+    'span:has-text("Skip this question")',
+    'div:has-text("Skip this question"):not(:has(div))',
+    'button:has-text("Skip")',
+    '.skip-btn',
+    '[class*="skipBtn"]',
+  ];
+
+  for (const sel of skipSelectors) {
+    try {
+      const skipBtn = page.locator(sel).first();
+      if ((await skipBtn.count()) > 0 && (await skipBtn.isVisible().catch(() => false))) {
+        console.log('[naukri] Clicking Skip button in chatbot via selector:', sel);
+        await skipBtn.click({ timeout: 3000 });
+        await page.waitForTimeout(1500);
+        return true;
+      }
+    } catch {
+      // continue
     }
-  } catch {
-    // continue
   }
   return false;
 }
@@ -881,23 +1393,96 @@ export async function clickChatbotSkip(page: Page): Promise<boolean> {
  */
 async function typeIntoChatbotInput(page: Page, answer: string): Promise<boolean> {
   try {
-    const textInput = page.locator(CHATBOT_TEXT_INPUT).first();
-    if ((await textInput.count()) === 0) return false;
+    const textToType = answer.trim();
+    if (!textToType) return false;
 
-    await textInput.scrollIntoViewIfNeeded().catch(() => {});
-    await textInput.click({ timeout: 3000 });
-    await page.waitForTimeout(300);
+    // 1. Locate the input using Playwright and click to focus
+    const inputLoc = page.locator(CHATBOT_TEXT_INPUT).first();
+    let hasLoc = false;
+    if ((await inputLoc.count()) > 0 && (await inputLoc.isVisible().catch(() => false))) {
+      hasLoc = true;
+      if (typeof (inputLoc as any).scrollIntoViewIfNeeded === 'function') {
+        await (inputLoc as any).scrollIntoViewIfNeeded().catch(() => {});
+      }
+      await inputLoc.click({ timeout: 2000 }).catch(() => {});
+    }
 
-    // Focus and clear existing text cleanly using keyboard for natural focus retention
-    await page.keyboard.press('Control+A');
-    await page.keyboard.press('Backspace');
-    await page.waitForTimeout(100);
+    // 2. Set value directly in DOM and trigger React input/change events
+    const filledInJs = await page.evaluate((val) => {
+      const drawer = document.querySelector(
+        'div.chatbot_DrawerContentWrapper, div[class*="chatbot" i], div[class*="drawer" i], div[class*="applyDrawer" i], div[class*="apply-container" i]'
+      );
+      const root = drawer || document;
 
-    // Type via keyboard for natural React event handling
-    await page.keyboard.type(answer, { delay: 40 });
-    await page.waitForTimeout(400);
+      // Select all candidate editable inputs inside drawer or root
+      const candidates = Array.from(root.querySelectorAll<HTMLElement>(
+        'div[contenteditable="true"], input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]):not([type="submit"]):not([type="button"]), textarea'
+      ));
 
-    return true;
+      let target: HTMLElement | null = null;
+      for (const el of candidates) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          target = el;
+          break;
+        }
+      }
+
+      if (!target) return false;
+
+      target.focus();
+
+      // Handle integer rounding if number input with integer step
+      let cleanVal = val;
+      if (target instanceof HTMLInputElement && target.type === 'number') {
+        const step = target.getAttribute('step');
+        const num = Number(val);
+        if (!isNaN(num) && step === '1' && !Number.isInteger(num)) {
+          cleanVal = String(Math.round(num));
+        }
+      }
+
+      // Native property setter + Synthetic Events for React
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+        const proto = Object.getPrototypeOf(target);
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set
+                    || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (setter) {
+          setter.call(target, cleanVal);
+        } else {
+          target.value = cleanVal;
+        }
+        target.dispatchEvent(new Event('input', { bubbles: true }));
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+      } else if (target.isContentEditable) {
+        target.innerText = cleanVal;
+        target.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: cleanVal }));
+        target.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      // Enable send button if present
+      const sendBtns = root.querySelectorAll('div.send, [class*="send" i], [class*="save" i], [class*="submit" i]');
+      sendBtns.forEach((btn) => btn.classList.remove('disabled'));
+
+      return true;
+    }, textToType).catch(() => false);
+
+    // 3. Native keyboard typing to guarantee React state updates
+    if (page.keyboard) {
+      try {
+        if (hasLoc) {
+          await inputLoc.click({ timeout: 1500 }).catch(() => {});
+        }
+        await page.keyboard.press('Control+A').catch(() => {});
+        await page.keyboard.press('Backspace').catch(() => {});
+        await page.keyboard.type(textToType, { delay: 15 }).catch(() => {});
+        await page.waitForTimeout(100);
+      } catch {
+        // evaluate already set value
+      }
+    }
+
+    return Boolean(filledInJs || hasLoc);
   } catch (err) {
     console.warn('[naukri] Error typing into chatbot input:', err);
     return false;
@@ -905,68 +1490,145 @@ async function typeIntoChatbotInput(page: Page, answer: string): Promise<boolean
 }
 
 /**
- * Answer a text input question by typing into the input field or skipping if optional.
+ * Extract DOM field constraints (inputMode, pattern, maxLength, isNumeric, errorMessage)
+ * from active Naukri chatbot input field.
  */
-async function answerTextQuestion(
+export async function extractNaukriDOMConstraints(page: Page): Promise<FieldConstraints> {
+  try {
+    return await page.evaluate(() => {
+      const drawer = document.querySelector(
+        'div.chatbot_DrawerContentWrapper, div[class*="chatbot" i], div[class*="drawer" i], div[class*="applyDrawer" i], div[class*="apply-container" i]'
+      );
+      const root = drawer || document;
+      const el = root.querySelector(
+        'div[contenteditable="true"], input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]):not([type="submit"]):not([type="button"]), textarea'
+      ) as HTMLInputElement | HTMLTextAreaElement | HTMLElement | null;
+
+      if (!el) return {};
+
+      const inputMode = el.getAttribute('inputmode') || (el as HTMLInputElement).inputMode || '';
+      const pattern = el.getAttribute('pattern') || '';
+      const rawMax = el.getAttribute('maxlength') || el.getAttribute('max_length') || '';
+      const maxLength = rawMax ? parseInt(rawMax, 10) : undefined;
+      const type = (el as HTMLInputElement).type || '';
+
+      const isNumeric =
+        inputMode === 'numeric' ||
+        inputMode === 'decimal' ||
+        inputMode === 'tel' ||
+        type === 'number' ||
+        type === 'tel' ||
+        pattern.includes('0-9') ||
+        pattern.includes('\\d');
+
+      const errorEl = root.querySelector(
+        '[class*="error" i], [class*="invalid" i], .artdeco-inline-feedback--error, div.errorMsg'
+      );
+      const errorMessage = errorEl ? (errorEl.textContent || '').trim() : undefined;
+
+      return {
+        inputMode,
+        pattern,
+        maxLength: maxLength && !isNaN(maxLength) ? maxLength : undefined,
+        isNumeric,
+        errorMessage,
+      };
+    });
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Answer a text input question by typing into the input field or skipping if optional.
+ * Delegates custom screening questions and constrained fields to Gemini.
+ */
+export async function answerTextQuestion(
   page: Page,
   questionText: string,
   profile: CandidateProfile,
   companyName?: string,
   jobTitle?: string,
+  retryErrorMessage?: string,
 ): Promise<boolean> {
-  // 1. Resolve answer from deterministic heuristics
-  let answer = resolveChatbotTextAnswer(questionText, profile, companyName);
+  const constraints = await extractNaukriDOMConstraints(page);
+  if (retryErrorMessage) {
+    constraints.errorMessage = retryErrorMessage;
+  }
 
-  // 2. If no heuristic answer, try screening question answerer (which checks cache / LLM)
-  if (!answer) {
-    try {
-      const llmResult = await answerScreeningQuestion(
-        questionText,
-        null,
-        profile as unknown as Record<string, unknown>,
-        { jobTitle: jobTitle || profile.currentJobTitle || 'Data Engineer', company: companyName || 'Company' },
-      );
-      if (llmResult.answer && llmResult.answer !== 'UNKNOWN') {
-        answer = llmResult.answer;
-      }
-    } catch {
-      // ignore
+  const isCtcQuestion =
+    /(?:current|present|expected)?\s*(?:ctc|salary|compensation|package)|salary expectation/i.test(questionText);
+  const isYearsOrExpQuestion =
+    /(?:how many\s+)?(?:years|months|days)(?:\s+of)?(?:\s+experience|\s+exp)?\b|experience in\b|years in\b|\byoe\b/i.test(questionText);
+  const isStandardProfileQuestion =
+    isCtcQuestion ||
+    isYearsOrExpQuestion ||
+    /notice period|serving notice|last working day|lwd|how soon/i.test(questionText) ||
+    /\b(email|phone|mobile|name|linkedin|portfolio)\b/i.test(questionText) ||
+    /willing to relocate|ready to relocate|current location|where are you|residing/i.test(questionText) ||
+    /ex[- ](employee|emp)|former employee|previous employee/i.test(questionText);
+
+  // 1. Try deterministic heuristics for standard profile fields
+  const heuristicAnswer = resolveChatbotTextAnswer(questionText, profile, companyName);
+
+  let answer: string | null = null;
+
+  // If question is a standard profile field and heuristic gave a clean answer, use it directly!
+  if (isStandardProfileQuestion && heuristicAnswer && !retryErrorMessage) {
+    answer = heuristicAnswer;
+  } else if (!heuristicAnswer || constraints.isNumeric || constraints.errorMessage || /experience in|role|tech stack|how many|years|skills/i.test(questionText)) {
+    if (isYearsOrExpQuestion || isCtcQuestion) {
+      constraints.isNumeric = true;
     }
+    answer = await resolveScreeningQuestionWithGemini(
+      questionText,
+      'text',
+      [],
+      profile,
+      constraints
+    );
   }
 
-  // 3. Fallback: if prompt asks "if not, write NA" or "else NA"
-  if (!answer && /(?:if not|else|otherwise|or)\s*,?\s*(?:write|enter|type)?\s*na\b/i.test(questionText)) {
-    answer = 'NA';
-  }
-
-  // 4. If we still don't have an answer, try skipping if a skip button exists
   if (!answer) {
-    const skipped = await clickChatbotSkip(page);
-    if (skipped) return true;
+    answer = heuristicAnswer;
+  }
 
-    // If it's a Yes/No question, never blindly fallback to 'NA'
-    const isYesNo =
-      /^(?:are\s+you|do\s+you|can\s+you|will\s+you|have\s+you|is\s+there|would\s+you|did\s+you)\b/i.test(questionText.trim()) ||
-      (/\?\s*$/i.test(questionText.trim()) && /(?:yes\s*\/\s*no|y\s*\/\s*n)/i.test(questionText));
-
-    if (isYesNo) {
-      // Negative question patterns: ex-employee, criminal, bond, gaps, active backlog
-      if (/ex[- ]employee|former employee|criminal|convict|backlog|bond|disciplinary/i.test(questionText)) {
-        answer = 'No';
-      } else {
-        // For willingness, night shifts, shifts, travel, join, general positive questions -> 'Yes'
-        answer = 'Yes';
-      }
+  if (!answer) {
+    if (/(?:if not|else|otherwise|or)\s*,?\s*(?:write|enter|type)?\s*na\b/i.test(questionText)) {
+      answer = 'NA';
+    } else if (/^(?:are\s+you|do\s+you|can\s+you|will\s+you|have\s+you|is\s+there|would\s+you|did\s+you)\b/i.test(questionText.trim())) {
+      answer = /ex[- ]employee|former employee|criminal|convict|backlog|bond|disciplinary/i.test(questionText) ? 'No' : 'Yes';
     } else {
-      // Last resort for required unhandled open text inputs in Indian ATS chatbots
       answer = 'NA';
     }
   }
 
-  // Type answer into chatbot text input
+  // 2. Format / sanitize answers according to question semantics
+  if (isCtcQuestion) {
+    // Format CTC strictly in Lacs (e.g. 5.25 or 12)
+    const match = answer.match(/\d+(?:\.\d+)?/);
+    if (match) {
+      const val = parseFloat(match[0]);
+      if (val > 200) {
+        // Full INR entered (e.g. 525000) -> convert to Lakhs
+        answer = Number((val / 100000).toFixed(2)).toString();
+      } else {
+        answer = Number(val.toFixed(2)).toString();
+      }
+    } else if (heuristicAnswer) {
+      answer = heuristicAnswer;
+    }
+  } else if (isYearsOrExpQuestion) {
+    const digits = answer.replace(/\D/g, '');
+    answer = digits || (heuristicAnswer && /^\d+$/.test(heuristicAnswer) ? heuristicAnswer : '3');
+  } else if (constraints.isNumeric && !/^\d+$/.test(answer)) {
+    const digits = answer.replace(/\D/g, '');
+    if (digits) answer = digits;
+  }
+
+  // 3. Type answer into chatbot text input
   const typed = await typeIntoChatbotInput(page, answer);
   if (!typed) {
-    // If typing failed, check if we can skip
     const skipped = await clickChatbotSkip(page);
     if (skipped) return true;
   }
@@ -978,52 +1640,69 @@ async function answerTextQuestion(
  */
 async function clickChatbotSave(page: Page): Promise<boolean> {
   try {
-    // 1. Wait briefly for the Save button to become enabled
-    await page.waitForFunction(
-      () => {
-        const sendDiv = document.querySelector('div.send');
-        if (sendDiv && !sendDiv.classList.contains('disabled')) return true;
-        const btn = document.querySelector('button');
-        if (btn && btn.textContent?.trim() === 'Save' && !btn.disabled) return true;
-        return false;
-      },
-      { timeout: 3000 }
-    ).catch(() => {});
+    // 1. Press Enter on keyboard if available (primary trigger for chatbot text inputs)
+    if (page.keyboard) {
+      try {
+        await page.keyboard.press('Enter').catch(() => {});
+        await page.waitForTimeout(300);
+      } catch {}
+    }
 
-    // 2. Try clicking active Save button
+    // 2. Playwright locator click on save/send buttons (generates trusted mouse events)
     const saveSelectors = [
-      `${CHATBOT_DRAWER} div.send:not(.disabled) div.sendMsg`,
-      `${CHATBOT_DRAWER} div.send:not(.disabled)`,
-      `${CHATBOT_DRAWER} button:has-text("Save"):not([disabled])`,
-      'div.send:not(.disabled) div.sendMsg',
-      'div.send:not(.disabled)',
-      'button:has-text("Save"):not([disabled])',
+      `${CHATBOT_DRAWER} div.send div.sendMsg`,
+      `${CHATBOT_DRAWER} div.sendMsg`,
       `${CHATBOT_DRAWER} button:has-text("Save")`,
-      'button:has-text("Save")',
+      `${CHATBOT_DRAWER} button:has-text("Next")`,
+      `${CHATBOT_DRAWER} div.send`,
+      'div.send div.sendMsg',
       'div.sendMsg',
+      'button:has-text("Save")',
+      'button:has-text("Next")',
+      'div.send',
     ];
 
     for (const sel of saveSelectors) {
       try {
         const btn = page.locator(sel).first();
         if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
-          await btn.click({ timeout: 2000 });
-          await page.waitForTimeout(1500);
+          await btn.click({ timeout: 1000 }).catch(() => {});
+          await page.waitForTimeout(400);
           return true;
         }
       } catch {}
     }
 
-    // 3. Fallback: try pressing Enter on keyboard (in chatbots, Enter sends message)
-    try {
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(1500);
-      return true;
-    } catch {}
+    // 3. Fallback: JS click inside evaluate, prioritizing child sendMsg over outer send
+    const clickedInJs = await page.evaluate(() => {
+      const drawer = document.querySelector('div.chatbot_DrawerContentWrapper, div[class*="chatbot" i], div[class*="drawer" i], div[class*="applyDrawer" i], div[class*="apply-container" i]');
+      const root = drawer || document;
 
-    // 4. If Save button is still disabled, check if "Skip this question" is present
-    const skipped = await clickChatbotSkip(page);
-    if (skipped) return true;
+      // Enable send div if disabled
+      const sendDiv = root.querySelector('div.send');
+      if (sendDiv) {
+        sendDiv.classList.remove('disabled');
+      }
+
+      // Prioritize clicking send msg div or save button over the outer send wrapper
+      const clickables = Array.from(root.querySelectorAll('div.sendMsg, button, [class*="send" i], [class*="save" i], div.send'));
+      for (const el of clickables) {
+        const text = (el.textContent || '').trim().toLowerCase();
+        if (text === 'save' || text === 'next' || text === 'send' || el.classList.contains('sendMsg') || el.classList.contains('send')) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            (el as HTMLElement).click();
+            return true;
+          }
+        }
+      }
+      return false;
+    }).catch(() => false);
+
+    if (clickedInJs) {
+      await page.waitForTimeout(400);
+      return true;
+    }
 
     return false;
   } catch {
@@ -1090,12 +1769,121 @@ async function uploadNaukriResume(
 
 // ----- Main entry point ------------------------------------------------------
 
+/**
+ * Detect whether the current chatbot question step is the final step before application completion.
+ */
+async function isFinalChatbotQuestion(
+  page: Page,
+  questionText: string,
+  currentStep: number,
+): Promise<boolean> {
+  try {
+    const lowerQ = questionText.toLowerCase();
+
+    // 1. Explicit keywords indicating final step or submission message
+    if (/final question|last question|one last|before you submit|confirm application|ready to apply|thank you|responses recorded/i.test(lowerQ)) {
+      return true;
+    }
+
+    // 2. Button text check (e.g. "Submit", "Apply", "Finish", "Complete")
+    const saveBtnText = await page.locator(CHATBOT_SAVE_BUTTON).first().innerText().catch(() => '');
+    if (/submit|apply|finish|complete/i.test(saveBtnText)) {
+      return true;
+    }
+
+    // 3. Step indicator check in drawer text (e.g. "2 of 2", "3/3", "Step 2 of 2")
+    const drawerText = await page.locator(CHATBOT_DRAWER).innerText().catch(() => '');
+    const stepMatch = drawerText.match(/(\d+)\s*(?:of|\/)\s*(\d+)/i);
+    if (stepMatch) {
+      const stepNum = parseInt(stepMatch[1], 10);
+      const totalSteps = parseInt(stepMatch[2], 10);
+      if (stepNum >= totalSteps) {
+        return true;
+      }
+    }
+
+    // 4. Count interactive inputs remaining in drawer
+    const botMessages = page.locator(CHATBOT_MESSAGE);
+    const msgCount = await botMessages.count();
+
+    const interactiveInputs = page.locator(
+      `${CHATBOT_DRAWER} :is(${CHATBOT_TEXT_INPUT}, ${CHATBOT_RADIO}, ${CHATBOT_CHECKBOX}, ${CHATBOT_SKILL_CHIPS})`
+    );
+    const inputCount = await interactiveInputs.count();
+
+    // If only 1 input group is visible and no step progress indicates more
+    if (inputCount <= 1 && !/next question/i.test(drawerText)) {
+      if (!stepMatch && msgCount <= 1) {
+        return true;
+      }
+    }
+  } catch {
+    // Default to true in manual apply mode if uncertain
+  }
+  return false;
+}
+
 const MAX_CHATBOT_STEPS = 15;
 
 /**
  * Handle the Naukri chatbot apply flow: detect questions, answer them,
  * upload resume when prompted, and stop when the chatbot completes.
  */
+/**
+ * When LLM or rule-based answering cannot answer a chatbot question,
+ * focus Chrome and watch for user cursor movement or keyboard entry.
+ * If user responds, wait for them to finish; if no user action, return 'no_response' so the job can be skipped.
+ */
+async function waitForUserIntervention(
+  page: Page,
+  questionText: string,
+  timeoutMs = 20000,
+): Promise<'user_answered' | 'no_response'> {
+  console.log(`[naukri] Watching cursor/keyboard activity for unanswered question: "${questionText.slice(0, 40)}..." (${timeoutMs / 1000}s timer)...`);
+  await focusApplyPage(page, true);
+
+  await page.evaluate(() => {
+    (window as any).__hireme_user_activity = false;
+    const handler = () => { (window as any).__hireme_user_activity = true; };
+    window.addEventListener('mousemove', handler, { once: true });
+    window.addEventListener('keydown', handler, { once: true });
+    window.addEventListener('click', handler, { once: true });
+  }).catch(() => {});
+
+  const startTime = Date.now();
+  let userActive = false;
+
+  while (Date.now() - startTime < timeoutMs) {
+    if (isApplyCancelled()) break;
+
+    userActive = await page.evaluate(() => Boolean((window as any).__hireme_user_activity)).catch(() => false);
+    if (userActive) {
+      console.log('[naukri] User cursor/keyboard activity detected! Giving user time to answer manually...');
+      break;
+    }
+
+    const submitted = await detectNaukriApplicationSubmitted(page).catch(() => false);
+    if (submitted) return 'user_answered';
+
+    await page.waitForTimeout(500);
+  }
+
+  if (userActive) {
+    const extendedStart = Date.now();
+    while (Date.now() - extendedStart < 40_000) {
+      if (isApplyCancelled()) break;
+      const submitted = await detectNaukriApplicationSubmitted(page).catch(() => false);
+      if (submitted) return 'user_answered';
+      await page.waitForTimeout(1000);
+    }
+  }
+
+  const finalSubmitted = await detectNaukriApplicationSubmitted(page).catch(() => false);
+  if (finalSubmitted) return 'user_answered';
+
+  return 'no_response';
+}
+
 export async function handleNaukriChatbot(opts: {
   page: Page;
   profile: CandidateProfile;
@@ -1113,6 +1901,12 @@ export async function handleNaukriChatbot(opts: {
 
   for (let step = 0; step < MAX_CHATBOT_STEPS; step++) {
     stepCount = step + 1;
+
+    // Safety: Cancellation check
+    if (isApplyCancelled()) {
+      console.log('[naukri] Auto-apply session cancelled by user. Halting chatbot loop.');
+      return { status: 'cancelled', filledFields, resumeAttached: false, stepCount, error: 'Auto-apply stopped by user' };
+    }
 
     // Safety: CAPTCHA check
     if (await detectNaukriCaptcha(page)) {
@@ -1147,8 +1941,22 @@ export async function handleNaukriChatbot(opts: {
     // Stuck loop protection: if the bot is asking the identical question 2+ times
     if (questionText && questionText === prevQuestion) {
       sameQuestionCount++;
-      if (sameQuestionCount >= 2) {
-        console.warn(`[naukri] Bot repeating question: "${questionText}". Attempting skip/fallback.`);
+      if (sameQuestionCount >= 4) {
+        console.warn(`[naukri] Bot repeating question "${questionText}" 4+ times without advancing. Pausing for user manual review.`);
+        await focusApplyPage(page, true);
+        return {
+          status: 'stopped_for_review',
+          readyForSubmit: false,
+          filledFields,
+          resumeAttached: true,
+          stepCount,
+          error: `Bot repeated question "${questionText.slice(0, 50)}" 4 times without advancing.`,
+        };
+      }
+
+      // If repeating 3+ times, attempt skip if available
+      if (sameQuestionCount >= 3) {
+        console.warn(`[naukri] Bot repeating question: "${questionText}" (attempt ${sameQuestionCount}). Attempting skip.`);
         const skipped = await clickChatbotSkip(page);
         if (skipped) {
           const submitted = await waitForNaukriSubmission(page, 3000);
@@ -1158,9 +1966,26 @@ export async function handleNaukriChatbot(opts: {
           }
           continue;
         }
-        // If cannot skip, resolve the proper contextual answer (never hardcode 'NA' for numbers/experience/yes-no)
+      }
+
+      if (sameQuestionCount >= 2) {
+        console.warn(`[naukri] Bot repeating question: "${questionText}". Retrying answer typing with normalized fallback.`);
+        // Resolve the proper contextual answer (never hardcode 'NA' for numbers/experience/yes-no/ctc)
         let fallbackAns = resolveChatbotTextAnswer(questionText, profile, companyName);
-        if (!fallbackAns) {
+        const isYearsOrExp = /(?:how many\s+)?(?:years|months|days)(?:\s+of)?(?:\s+experience|\s+exp)?\b|experience in\b|years in\b|\byoe\b/i.test(questionText);
+        const isCtc = /(?:current|present|expected)?\s*(?:ctc|salary|compensation|package)|salary expectation/i.test(questionText);
+        if (isCtc) {
+          const match = (fallbackAns || '').match(/\d+(?:\.\d+)?/);
+          if (match) {
+            const val = parseFloat(match[0]);
+            fallbackAns = val > 200 ? Number((val / 100000).toFixed(2)).toString() : Number(val.toFixed(2)).toString();
+          } else {
+            const inr = (profile.currentCtcInr as number | undefined) ?? (profile.current_ctc_inr as number | undefined) ?? 500000;
+            fallbackAns = Number((inr / 100000).toFixed(2)).toString();
+          }
+        } else if (isYearsOrExp) {
+          fallbackAns = (fallbackAns || '').replace(/\D/g, '') || '3';
+        } else if (!fallbackAns) {
           const isYesNo =
             /^(?:are\s+you|do\s+you|can\s+you|will\s+you|have\s+you|is\s+there|would\s+you|did\s+you)\b/i.test(questionText.trim()) ||
             (/\?\s*$/i.test(questionText.trim()) && /(?:yes\s*\/\s*no|y\s*\/\s*n)/i.test(questionText));
@@ -1174,17 +1999,21 @@ export async function handleNaukriChatbot(opts: {
 
         if (!autoSubmit) {
           console.log(`[naukri] Answer typed on repeated question. Waiting for user action before Save.`);
-          try { await page.bringToFront(); } catch {}
-          bringWindowToFront('Chrome');
+          await focusApplyPage(page, true);
           return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
         }
 
+        if (page.keyboard) {
+          await page.keyboard.press('Enter').catch(() => {});
+          await page.waitForTimeout(300);
+        }
         await clickChatbotSave(page);
         const submitted = await waitForNaukriSubmission(page, 3000);
         if (submitted) {
           await closeNaukriChatbotDrawer(page);
           return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
         }
+        await page.waitForTimeout(800);
         continue;
       }
     } else {
@@ -1198,15 +2027,70 @@ export async function handleNaukriChatbot(opts: {
       const uploaded = await uploadNaukriResume(page, resumeFilename, resumePdfBytes);
       if (uploaded) filledFields.push('Resume');
 
+      if (!uploaded) {
+        console.warn('[naukri] Resume upload failed in chatbot. Stopping for manual entry.');
+        await focusApplyPage(page, true);
+        return { status: 'stopped_for_review', readyForSubmit: false, filledFields, resumeAttached: false, stepCount };
+      }
+
       if (!autoSubmit) {
-        console.log('[naukri] Resume uploaded to chatbot. Waiting for user action before Save.');
-        try { await page.bringToFront(); } catch {}
-        bringWindowToFront('Chrome');
-        return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: uploaded, stepCount };
+        console.log('[naukri] Resume uploaded in manual mode — stopping without clicking Save.');
+        await focusApplyPage(page, true);
+        return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
       }
 
       await clickChatbotSave(page);
-      const submitted = await waitForNaukriSubmission(page, 3500);
+      const submitted = await waitForNaukriSubmission(page, 2500);
+      if (submitted) {
+        await closeNaukriChatbotDrawer(page);
+        return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
+      }
+      continue;
+    }
+
+    if (qType === 'skill_chips') {
+      const answered = await answerSkillChipsQuestion(page, profile);
+      if (answered) filledFields.push('Key Skills');
+
+      if (!answered) {
+        console.warn(`[naukri] Autofill could not select skill chips for "${questionText}". Stopping for manual entry.`);
+        await focusApplyPage(page, true);
+        return { status: 'stopped_for_review', readyForSubmit: false, filledFields, resumeAttached: true, stepCount };
+      }
+
+      if (!autoSubmit) {
+        console.log('[naukri] Skill chips selected in manual mode — stopping without clicking Save.');
+        await focusApplyPage(page, true);
+        return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
+      }
+
+      await clickChatbotSave(page);
+      const submitted = await waitForNaukriSubmission(page, 2500);
+      if (submitted) {
+        await closeNaukriChatbotDrawer(page);
+        return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
+      }
+      continue;
+    }
+
+    if (qType === 'custom_dropdown') {
+      const answered = await answerCustomDropdownQuestion(page, questionText, profile);
+      if (answered) filledFields.push(questionText.slice(0, 50));
+
+      if (!answered) {
+        console.warn(`[naukri] Autofill could not answer custom dropdown for "${questionText}". Stopping for manual entry.`);
+        await focusApplyPage(page, true);
+        return { status: 'stopped_for_review', readyForSubmit: false, filledFields, resumeAttached: true, stepCount };
+      }
+
+      if (!autoSubmit) {
+        console.log('[naukri] Custom dropdown selected in manual mode — stopping without clicking Save.');
+        await focusApplyPage(page, true);
+        return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
+      }
+
+      await clickChatbotSave(page);
+      const submitted = await waitForNaukriSubmission(page, 2500);
       if (submitted) {
         await closeNaukriChatbotDrawer(page);
         return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
@@ -1219,15 +2103,30 @@ export async function handleNaukriChatbot(opts: {
       const answered = await answerRadioQuestion(page, questionText, profile, options);
       if (answered) filledFields.push(questionText.slice(0, 50));
 
+      if (!answered) {
+        console.warn(`[naukri] Autofill could not answer radio question: "${questionText}". Watching cursor/keyboard for user entry...`);
+        const outcome = await waitForUserIntervention(page, questionText, 20000);
+        if (outcome === 'user_answered') {
+          await closeNaukriChatbotDrawer(page);
+          return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
+        }
+        return {
+          status: 'skipped',
+          filledFields,
+          resumeAttached: true,
+          stepCount,
+          error: `Autofill could not answer: "${questionText.slice(0, 50)}". Skipped and kept on Dashboard.`,
+        };
+      }
+
       if (!autoSubmit) {
-        console.log(`[naukri] Radio question answered: "${questionText}". Waiting for user action before Save.`);
-        try { await page.bringToFront(); } catch {}
-        bringWindowToFront('Chrome');
+        console.log('[naukri] Radio option selected in manual mode — stopping without clicking Save.');
+        await focusApplyPage(page, true);
         return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
       }
 
       await clickChatbotSave(page);
-      const submitted = await waitForNaukriSubmission(page, 3500);
+      const submitted = await waitForNaukriSubmission(page, 2500);
       if (submitted) {
         await closeNaukriChatbotDrawer(page);
         return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
@@ -1239,15 +2138,30 @@ export async function handleNaukriChatbot(opts: {
       const answered = await answerCheckboxQuestion(page, questionText, profile);
       if (answered) filledFields.push(questionText.slice(0, 50));
 
+      if (!answered) {
+        console.warn(`[naukri] Autofill could not answer checkbox question: "${questionText}". Watching cursor/keyboard for user entry...`);
+        const outcome = await waitForUserIntervention(page, questionText, 20000);
+        if (outcome === 'user_answered') {
+          await closeNaukriChatbotDrawer(page);
+          return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
+        }
+        return {
+          status: 'skipped',
+          filledFields,
+          resumeAttached: true,
+          stepCount,
+          error: `Autofill could not answer: "${questionText.slice(0, 50)}". Skipped and kept on Dashboard.`,
+        };
+      }
+
       if (!autoSubmit) {
-        console.log(`[naukri] Checkbox question answered: "${questionText}". Waiting for user action before Save.`);
-        try { await page.bringToFront(); } catch {}
-        bringWindowToFront('Chrome');
+        console.log('[naukri] Checkbox options selected in manual mode — stopping without clicking Save.');
+        await focusApplyPage(page, true);
         return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
       }
 
       await clickChatbotSave(page);
-      const submitted = await waitForNaukriSubmission(page, 3500);
+      const submitted = await waitForNaukriSubmission(page, 2500);
       if (submitted) {
         await closeNaukriChatbotDrawer(page);
         return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
@@ -1256,18 +2170,55 @@ export async function handleNaukriChatbot(opts: {
     }
 
     if (qType === 'text') {
-      const answered = await answerTextQuestion(page, questionText, profile, companyName, jobTitle);
+      let answered = await answerTextQuestion(page, questionText, profile, companyName, jobTitle);
       if (answered) filledFields.push(questionText.slice(0, 50));
 
+      if (autoSubmit) {
+        await clickChatbotSave(page);
+        await page.waitForTimeout(600);
+
+        // Check for inline DOM validation error
+        const constraints = await extractNaukriDOMConstraints(page);
+        if (constraints.errorMessage) {
+          console.warn(`[naukri] Inline form validation error detected: "${constraints.errorMessage}". Retrying with Gemini...`);
+          answered = await answerTextQuestion(
+            page,
+            questionText,
+            profile,
+            companyName,
+            jobTitle,
+            constraints.errorMessage
+          );
+          if (answered) {
+            await clickChatbotSave(page);
+            await page.waitForTimeout(600);
+          }
+        }
+      }
+
+      if (!answered) {
+        console.warn(`[naukri] Autofill could not answer text question: "${questionText}". Watching cursor/keyboard for user entry...`);
+        const outcome = await waitForUserIntervention(page, questionText, 20000);
+        if (outcome === 'user_answered') {
+          await closeNaukriChatbotDrawer(page);
+          return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
+        }
+        return {
+          status: 'skipped',
+          filledFields,
+          resumeAttached: true,
+          stepCount,
+          error: `Autofill could not answer: "${questionText.slice(0, 50)}". Skipped and kept on Dashboard.`,
+        };
+      }
+
       if (!autoSubmit) {
-        console.log(`[naukri] Text question answered: "${questionText}". Waiting for user action before Save.`);
-        try { await page.bringToFront(); } catch {}
-        bringWindowToFront('Chrome');
+        console.log('[naukri] Text answer entered in manual mode — stopping without clicking Save.');
+        await focusApplyPage(page, true);
         return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
       }
 
-      await clickChatbotSave(page);
-      const submitted = await waitForNaukriSubmission(page, 3500);
+      const submitted = await waitForNaukriSubmission(page, 2500);
       if (submitted) {
         console.log('[naukri] Application submitted successfully detected after answering text question!');
         await closeNaukriChatbotDrawer(page);
@@ -1277,7 +2228,7 @@ export async function handleNaukriChatbot(opts: {
     }
 
     if (qType === 'select') {
-      // Try to pick a reasonable option from the select
+      let answered = false;
       try {
         const select = page.locator(`${CHATBOT_DRAWER} select`).first();
         const options = await select.locator('option').allTextContents();
@@ -1285,20 +2236,34 @@ export async function handleNaukriChatbot(opts: {
         if (goodOption) {
           await select.selectOption({ label: goodOption.trim() }).catch(() => {});
           filledFields.push(questionText.slice(0, 50));
+          answered = true;
         }
-      } catch {
-        // continue
+      } catch {}
+
+      if (!answered) {
+        console.warn(`[naukri] Autofill could not select dropdown option for "${questionText}". Watching cursor/keyboard for user entry...`);
+        const outcome = await waitForUserIntervention(page, questionText, 20000);
+        if (outcome === 'user_answered') {
+          await closeNaukriChatbotDrawer(page);
+          return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
+        }
+        return {
+          status: 'skipped',
+          filledFields,
+          resumeAttached: true,
+          stepCount,
+          error: `Autofill could not answer: "${questionText.slice(0, 50)}". Skipped and kept on Dashboard.`,
+        };
       }
 
       if (!autoSubmit) {
-        console.log(`[naukri] Select question answered: "${questionText}". Waiting for user action before Save.`);
-        try { await page.bringToFront(); } catch {}
-        bringWindowToFront('Chrome');
+        console.log('[naukri] Select option chosen in manual mode — stopping without clicking Save.');
+        await focusApplyPage(page, true);
         return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
       }
 
       await clickChatbotSave(page);
-      const submitted = await waitForNaukriSubmission(page, 3500);
+      const submitted = await waitForNaukriSubmission(page, 2500);
       if (submitted) {
         await closeNaukriChatbotDrawer(page);
         return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
@@ -1306,32 +2271,70 @@ export async function handleNaukriChatbot(opts: {
       continue;
     }
 
-    // Unknown question type — try skip first, else click save
+    // Unknown question type — inspect DOM for visible inputs or option buttons before skipping/saving
+    const visibleInput = page.locator(CHATBOT_TEXT_INPUT).first();
+    if ((await visibleInput.count()) > 0 && (await visibleInput.isVisible().catch(() => false))) {
+      console.log('[naukri] Unknown question type matched visible text input — treating as text question');
+      const answered = await answerTextQuestion(page, questionText, profile, companyName, jobTitle);
+      if (answered) {
+        filledFields.push(questionText.slice(0, 50) || 'Text Question');
+        if (autoSubmit) {
+          await clickChatbotSave(page);
+          const submitted = await waitForNaukriSubmission(page, 2500);
+          if (submitted) {
+            await closeNaukriChatbotDrawer(page);
+            return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
+          }
+        }
+        continue;
+      }
+    }
+
+    const visibleRadio = page.locator(CHATBOT_RADIO).first();
+    if ((await visibleRadio.count()) > 0 && (await visibleRadio.isVisible().catch(() => false))) {
+      console.log('[naukri] Unknown question type matched visible radio options — treating as radio question');
+      const options = await getRadioOptions(page);
+      const answered = await answerRadioQuestion(page, questionText, profile, options);
+      if (answered) {
+        filledFields.push(questionText.slice(0, 50) || 'Radio Question');
+        if (autoSubmit) {
+          await clickChatbotSave(page);
+          const submitted = await waitForNaukriSubmission(page, 2500);
+          if (submitted) {
+            await closeNaukriChatbotDrawer(page);
+            return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
+          }
+        }
+        continue;
+      }
+    }
+
     const skipped = await clickChatbotSkip(page);
     if (!skipped) {
       if (!autoSubmit) {
-        try { await page.bringToFront(); } catch {}
-        bringWindowToFront('Chrome');
+        await focusApplyPage(page, true);
         return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
       }
       await clickChatbotSave(page);
     }
-    const submitted = await waitForNaukriSubmission(page, 3500);
+    const submitted = await waitForNaukriSubmission(page, 2500);
     if (submitted) {
       await closeNaukriChatbotDrawer(page);
       return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
     }
   }
 
-  // After chatbot completes, close the drawer and check if application was submitted
-  await closeNaukriChatbotDrawer(page);
-  await page.waitForTimeout(800);
+  // After all chatbot questions are answered, check if application was submitted
   const finalSubmitted = await detectNaukriApplicationSubmitted(page);
   if (finalSubmitted) {
+    await closeNaukriChatbotDrawer(page);
     return { status: 'submitted', filledFields, resumeAttached: true, stepCount };
   }
 
-  return { status: 'stopped_for_review', filledFields, resumeAttached: true, stepCount };
+  // Bring Chrome window to front at the end of autofill so user can do final Save/Submit
+  await focusApplyPage(page, true);
+
+  return { status: 'stopped_for_review', readyForSubmit: true, filledFields, resumeAttached: true, stepCount };
 }
 
 /**
@@ -1462,6 +2465,45 @@ export async function updateNaukriProfileResume(
 }
 
 /**
+ * Pre-launch the Chrome window and navigate to the Naukri job URL immediately.
+ * Intended to be called in parallel with prepareSubmission (LLM + PDF generation)
+ * so the user sees the browser open right away — not after all background work finishes.
+ *
+ * Returns { ctx, page } on success, or null if launch fails (naukriApply falls back
+ * to its own inline launch in that case).
+ */
+export async function preLaunchNaukriBrowser(jobUrl: string): Promise<{
+  ctx: BrowserContext;
+  page: Page;
+} | null> {
+  const profileDir = resolveNaukriProfileDir();
+  if (!fs.existsSync(profileDir)) {
+    fs.mkdirSync(profileDir, { recursive: true });
+  }
+  if (isApplyCancelled()) return null;
+  try {
+    const ctx = await launchApplyBrowser(profileDir, { focus: true });
+    const page = ctx.pages()[0] || (await ctx.newPage());
+    // Close leftover blank tabs so the window stays clean
+    for (const p of ctx.pages()) {
+      if (p !== page && (p.url() === 'about:blank' || p.url().startsWith('chrome://'))) {
+        await p.close().catch(() => {});
+      }
+    }
+    // Bring window to front only for the first job apply
+    await focusApplyPage(page, false);
+    // Navigate to the job URL — this finishes in 2-5s, well before resume generation
+    await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await focusApplyPage(page, false);
+    console.log('[naukri] Pre-launched browser and navigated to:', jobUrl);
+    return { ctx, page };
+  } catch (err) {
+    console.warn('[naukri] preLaunchNaukriBrowser failed — naukriApply will launch inline:', (err as Error).message);
+    return null;
+  }
+}
+
+/**
  * Full Naukri apply flow: launch browser, navigate to job URL,
  * detect Easy Apply, update profile resume if tailored PDF available,
  * click apply, handle chatbot, and stop for review.
@@ -1475,11 +2517,14 @@ export async function naukriApply(opts: {
   companyName?: string;
   jobTitle?: string;
   autoSubmit?: boolean;
+  /** Pre-launched browser context from preLaunchNaukriBrowser. Skips re-launching Chrome. */
+  prelaunchedContext?: { ctx: BrowserContext; page: Page } | null;
 }): Promise<PlatformResult> {
   const { jobUrl, profile, resumePdfBytes, resumeFilename, companyName, jobTitle, autoSubmit } = opts;
 
-  if (!fs.existsSync(BROWSER_PROFILE_DIR)) {
-    fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
+  const profileDir = resolveNaukriProfileDir();
+  if (!fs.existsSync(profileDir)) {
+    fs.mkdirSync(profileDir, { recursive: true });
   }
 
   if (isApplyCancelled()) {
@@ -1488,75 +2533,213 @@ export async function naukriApply(opts: {
 
   let ctx: BrowserContext | null = null;
   try {
-    ctx = await launchApplyBrowser(BROWSER_PROFILE_DIR, { focus: true });
+    let page: Page;
 
-    const page = ctx.pages()[0] || (await ctx.newPage());
-
-    // Wait for page to fully stabilize (handle Naukri redirect loops on login page)
-    await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    try { await page.bringToFront(); } catch {}
-    bringWindowToFront('Chrome');
-
-    // Extended stabilization: wait for network idle and no rapid navigations
-    await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
-    await page.waitForTimeout(5000);
-
-    // Detect redirect loops (page URL changing rapidly)
-    let lastUrl = page.url();
-    let redirectCount = 0;
-    for (let i = 0; i < 6; i++) {
-      await page.waitForTimeout(2000);
-      const currentUrl = page.url();
-      if (currentUrl !== lastUrl) {
-        redirectCount++;
-        lastUrl = currentUrl;
-        console.log(`[naukri] Redirect detected (${redirectCount}): ${currentUrl}`);
+    if (opts.prelaunchedContext) {
+      // ── Fast path: browser was launched in parallel with resume generation ──
+      // The Chrome window was already shown to the user while the tailored PDF
+      // was being generated. Just confirm page is loaded and bring it to front.
+      ctx = opts.prelaunchedContext.ctx;
+      page = opts.prelaunchedContext.page;
+      // Ensure navigation completed (it was started concurrently)
+      try {
+        await page.waitForLoadState('domcontentloaded', { timeout: 20_000 });
+      } catch { /* already loaded or timed out — continue */ }
+      // Safety re-navigate if the page didn't land on Naukri
+      const prelaunchUrl = page.url();
+      if (prelaunchUrl === 'about:blank' || !prelaunchUrl.includes('naukri')) {
+        await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
       }
-    }
-    if (redirectCount >= 3) {
-      console.warn('[naukri] Possible redirect loop detected, proceeding anyway');
+      await focusApplyPage(page, false);
+    } else {
+      // ── Fallback: pre-launch failed or was not attempted ──
+      ctx = await launchApplyBrowser(profileDir, { focus: true });
+      page = ctx.pages()[0] || (await ctx.newPage());
+      // Close any leftover blank tabs so the window stays clean
+      for (const p of ctx.pages()) {
+        if (p !== page && (p.url() === 'about:blank' || p.url().startsWith('chrome://'))) {
+          await p.close().catch(() => {});
+        }
+      }
+      await focusApplyPage(page, false);
+      await page.goto(jobUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await focusApplyPage(page, false);
     }
 
-    // Wait for page content to settle
-    await page.locator('button, a, input').first().waitFor({ state: 'attached', timeout: 15_000 }).catch(() => {});
+    // Brief pause so user can visually confirm the job page before automation begins
+    await page.waitForTimeout(1200);
+
+    // ── STEP 1: Fast Status Assessment Loop with 10s Time Limit ──
+    const BUTTON_WAIT_TIMEOUT_MS = 10_000;
+    const startWait = Date.now();
+    let directApplyBtn: Locator | null = null;
+    let isExpired = false;
+    let isCompanySite = false;
+    let isAlreadyApplied = false;
+
+    console.log(`[naukri] Checking job page status (timeout limit: ${BUTTON_WAIT_TIMEOUT_MS / 1000}s)...`);
+
+    while (Date.now() - startWait < BUTTON_WAIT_TIMEOUT_MS) {
+      if (isApplyCancelled()) {
+        return { status: 'cancelled', filledFields: [], resumeAttached: false, stepCount: 0, error: 'Auto-apply stopped by user' };
+      }
+
+      // Check 1: Is the job expired / closed?
+      if (await detectNaukriExpired(page)) {
+        console.log('[naukri] Job detected as expired / closed');
+        isExpired = true;
+        break;
+      }
+
+      // Check 2: Does it require applying on company site (external)?
+      if (await detectNaukriCompanySite(page)) {
+        console.log('[naukri] Job detected as external apply (company site)');
+        isCompanySite = true;
+        break;
+      }
+
+      // Check 3: Is it already applied?
+      if (await detectNaukriApplicationSubmitted(page)) {
+        console.log('[naukri] Job already applied');
+        isAlreadyApplied = true;
+        break;
+      }
+
+      // Check 4: Direct Apply button found?
+      const btn = await findNaukriDirectApplyButton(page);
+      if (btn) {
+        console.log('[naukri] Direct Apply button confirmed visible');
+        directApplyBtn = btn;
+        break;
+      }
+
+      // Check 5: CAPTCHA
+      if (await detectNaukriCaptcha(page)) {
+        await focusApplyPage(page, true);
+        ctx = null;
+        return { status: 'captcha', filledFields: [], resumeAttached: false, stepCount: 0, error: 'CAPTCHA detected on the job page. Please solve it manually.' };
+      }
+
+      // Check 6: Login required
+      if (await detectNaukriLoginRequired(page)) {
+        break;
+      }
+
+      await page.waitForTimeout(400);
+    }
+
+    // Handle Expired Job immediately: don't waste time updating profile resume!
+    if (isExpired) {
+      if (autoSubmit && ctx) {
+        try {
+          const p = ctx.pages()[0];
+          if (p && !p.isClosed()) await p.goto(AUTO_APPLY_SUCCESS_PAGE).catch(() => {});
+        } catch {}
+      }
+      ctx = null;
+      return {
+        status: 'expired',
+        filledFields: [],
+        resumeAttached: false,
+        stepCount: 0,
+        error: 'Job has expired (no longer accepting applications).',
+      };
+    }
+
+    // Handle Company Site immediately: don't waste time updating profile resume!
+    if (isCompanySite) {
+      if (autoSubmit && ctx) {
+        try {
+          const p = ctx.pages()[0];
+          if (p && !p.isClosed()) await p.goto(AUTO_APPLY_SUCCESS_PAGE).catch(() => {});
+        } catch {}
+      }
+      ctx = null;
+      return {
+        status: 'external_apply',
+        filledFields: [],
+        resumeAttached: false,
+        stepCount: 0,
+        error: 'This job requires applying on the company website (not Naukri direct apply).',
+      };
+    }
+
+    // Handle Already Applied
+    if (isAlreadyApplied) {
+      if (autoSubmit && ctx) {
+        try {
+          const p = ctx.pages()[0];
+          if (p && !p.isClosed()) await p.goto(AUTO_APPLY_SUCCESS_PAGE).catch(() => {});
+        } catch {}
+      }
+      ctx = null;
+      return {
+        status: 'submitted',
+        filledFields: ['Already Applied on Naukri'],
+        resumeAttached: true,
+        stepCount: 1,
+      };
+    }
 
     // Safety: login check
     if (await detectNaukriLoginRequired(page)) {
-      try { await page.bringToFront(); } catch {}
-      bringWindowToFront('Chrome');
+      await focusApplyPage(page, true);
 
       // Wait for user to complete login (up to 2 minutes)
       const loginCompleted = await waitForNaukriLogin(page, 120_000);
       if (!loginCompleted) {
-        ctx = null; // Leave browser open
+        ctx = null; // Leave browser open for user login
         return {
           status: 'login_required',
           filledFields: [],
           resumeAttached: false,
           stepCount: 0,
-          error: 'Naukri login required. Please log into your Naukri account in the Chrome window. If the page keeps reloading, try logging in manually first.',
+          error: 'Naukri login required. Please log into your Naukri account in the Chrome window.',
         };
       }
 
       // Login completed - wait for page to stabilize again
       await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
-      await page.waitForTimeout(3000);
-      await page.locator('button, a, input').first().waitFor({ state: 'attached', timeout: 15_000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+      directApplyBtn = await findNaukriDirectApplyButton(page);
     }
 
     // Safety: CAPTCHA check
     if (await detectNaukriCaptcha(page)) {
-      bringWindowToFront('Chrome');
+      await focusApplyPage(page, true);
+      ctx = null;
       return { status: 'captcha', filledFields: [], resumeAttached: false, stepCount: 0, error: 'CAPTCHA detected on the job page. Please solve it manually.' };
     }
 
-    // Check if this job supports direct apply
-    const easyApply = await detectNaukriEasyApply(page);
-    if (!easyApply) {
-      return { status: 'error', filledFields: [], resumeAttached: false, stepCount: 0, error: 'This job requires applying on the company website (not Naukri Easy Apply).' };
+    // If still no direct apply button found after timeout limit (10s):
+    if (!directApplyBtn) {
+      // Final re-checks in case page finished rendering during login wait
+      if (await detectNaukriExpired(page)) {
+        ctx = null;
+        return { status: 'expired', filledFields: [], resumeAttached: false, stepCount: 0, error: 'Job has expired (no longer accepting applications).' };
+      }
+      if (await detectNaukriCompanySite(page)) {
+        ctx = null;
+        return { status: 'external_apply', filledFields: [], resumeAttached: false, stepCount: 0, error: 'This job requires applying on the company website (not Naukri direct apply).' };
+      }
+      console.warn(`[naukri] No apply button found within ${BUTTON_WAIT_TIMEOUT_MS / 1000}s time limit.`);
+      if (autoSubmit && ctx) {
+        try {
+          const p = ctx.pages()[0];
+          if (p && !p.isClosed()) await p.goto(AUTO_APPLY_SUCCESS_PAGE).catch(() => {});
+        } catch {}
+      }
+      ctx = null;
+      return {
+        status: 'timeout_skipped',
+        filledFields: [],
+        resumeAttached: false,
+        stepCount: 0,
+        error: `No Apply button found within time limit (${BUTTON_WAIT_TIMEOUT_MS / 1000}s). Skipping to next job...`,
+      };
     }
 
-    // Pre-apply: Update candidate profile with the tailored resume before applying
+    // ── STEP 2: Pre-apply Profile Resume Update (Only for valid direct-apply jobs!) ──
     let profileResumeUpdated = false;
     const shouldUpdateProfile = opts.updateProfileResume ?? getApplyConfig().updateNaukriProfileResume ?? true;
     if (shouldUpdateProfile && resumePdfBytes && resumePdfBytes.length > 0) {
@@ -1564,29 +2747,31 @@ export async function naukriApply(opts: {
         const profilePage = await ctx.newPage();
         profileResumeUpdated = await updateNaukriProfileResume(profilePage, resumeFilename, resumePdfBytes);
         await profilePage.close().catch(() => {});
-        try { await page.bringToFront(); } catch {}
+        if (shouldBringWindowToFront(false)) { try { await page.bringToFront(); } catch {} }
       } catch (err) {
         console.warn('[naukri] Pre-apply profile resume upload warning:', err);
       }
     }
 
-    // Click the apply button to start the flow
+    // ── STEP 3: Click the Verified Direct Apply Button ──
     let applyClicked = false;
-    for (const sel of APPLY_BUTTON_SELECTORS) {
-      try {
-        const btn = page.locator(sel).first();
-        if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
-          await btn.click({ timeout: 5000 });
-          applyClicked = true;
-          break;
-        }
-      } catch {
-        // try next
-      }
-    }
+    try {
+      await directApplyBtn.scrollIntoViewIfNeeded().catch(() => {});
+      await directApplyBtn.evaluate((el) => {
+        el.style.outline = '3px solid #ef4444';
+        el.style.boxShadow = '0 0 12px rgba(239, 68, 68, 0.9)';
+      }).catch(() => {});
+    } catch {}
+    await focusApplyPage(page, false);
+    await page.waitForTimeout(600);
 
-    if (!applyClicked) {
-      return { status: 'error', filledFields: [], resumeAttached: false, stepCount: 0, error: 'Could not find or click the Apply button.' };
+    try {
+      await directApplyBtn.click({ timeout: 5000 });
+      applyClicked = true;
+    } catch (err) {
+      console.warn('[naukri] Error clicking direct Apply button:', (err as Error).message);
+      ctx = null;
+      return { status: 'error', filledFields: [], resumeAttached: false, stepCount: 0, error: 'Could not click the Apply button.' };
     }
 
     // Wait for chatbot or form to appear
@@ -1613,6 +2798,11 @@ export async function naukriApply(opts: {
       // If application was confirmed submitted, dismiss drawer; otherwise keep open for user review
       if (result.status === 'submitted') {
         await closeNaukriChatbotDrawer(page);
+        if (autoSubmit) {
+          try {
+            if (!page.isClosed()) await page.goto(AUTO_APPLY_SUCCESS_PAGE).catch(() => {});
+          } catch {}
+        }
       } else if (result.status === 'stopped_for_review') {
         result.readyForSubmit = true;
       }
@@ -1623,11 +2813,12 @@ export async function naukriApply(opts: {
         return result;
       }
 
-      // Bring browser to front for confirmation / review
-      try { await page.bringToFront(); } catch { /* ignore */ }
-      bringWindowToFront('Chrome');
+      if (!autoSubmit || result.status === 'stopped_for_review') {
+        // Bring browser to front for confirmation / review
+        await focusApplyPage(page, true);
+      }
 
-      ctx = null;
+      ctx = null; // Keep browser open
       return result;
     }
 
@@ -1638,9 +2829,14 @@ export async function naukriApply(opts: {
       await closeNaukriChatbotDrawer(page);
     }
 
-    try { await page.bringToFront(); } catch { /* ignore */ }
-    bringWindowToFront('Chrome');
-    ctx = null;
+    if (autoSubmit && (isSubmitted || applyClicked)) {
+      try {
+        if (!page.isClosed()) await page.goto(AUTO_APPLY_SUCCESS_PAGE).catch(() => {});
+      } catch {}
+    } else if (!autoSubmit || (!isSubmitted && !applyClicked)) {
+      await focusApplyPage(page, true);
+    }
+    ctx = null; // Keep browser open
 
     const filledFields: string[] = [];
     if (profileResumeUpdated) {
@@ -1654,6 +2850,20 @@ export async function naukriApply(opts: {
       stepCount: 1,
     };
   } catch (err) {
+    const isClosedError = (err as Error)?.message?.toLowerCase().includes('closed');
+    if (ctx) {
+      if (!isClosedError) await focusApplyPage(ctx.pages()[0], false);
+      ctx = null; // Preserve window open for user review
+    }
+    if (isClosedError) {
+      return {
+        status: 'stopped_for_review',
+        readyForSubmit: true,
+        filledFields: [],
+        resumeAttached: true,
+        stepCount: 1,
+      };
+    }
     return {
       status: 'error',
       filledFields: [],
@@ -1662,6 +2872,9 @@ export async function naukriApply(opts: {
       error: (err as Error).message,
     };
   } finally {
-    if (ctx) await ctx.close().catch(() => {});
+    // Only close context if explicitly cancelled; keep browser open for user review in all normal flows
+    if (ctx && isApplyCancelled()) {
+      await ctx.close().catch(() => {});
+    }
   }
 }

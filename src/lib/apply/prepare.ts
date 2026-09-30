@@ -13,13 +13,14 @@
 
 import db from '../db';
 import { readJobDocuments, saveJobDocument } from './documents';
+import { getActiveOwnerId } from './screening-owner';
 import { applicationUrl, identifySubmissionStrategy, type SubmissionStrategy } from './router';
 import { buildGreenhousePlan, type GhSubmissionPlan } from './greenhouse';
 import { buildAshbyPlan, type AshbySubmissionPlan } from './ashby';
 import { getApplyConfig } from './questions';
 import { generateCoverLetter, generateResumeVariant, generateLatexResume } from '../llm';
 import { renderResumePdf } from './render-pdf';
-import { compileLatexWithRepair, hasLatexCompiler, looksLikeLatexTemplate, latexPdfFilename, spliceLatexContent, isStaleTailoredTex } from './latex';
+import { compileLatexWithRepair, hasLatexCompiler, looksLikeLatexTemplate, latexPdfFilename, spliceLatexContent, isStaleTailoredTex, getLatexPageCount, fitLatexToPageBudget } from './latex';
 import { checkJobUrl } from '../link-check';
 import type { LinkedInSubmissionPlan, NaukriSubmissionPlan } from './platform';
 
@@ -55,6 +56,7 @@ interface JobRow {
   url: string;
   url_status: string | null;
   expired_at: string | null;
+  apply_type?: string | null;
 }
 
 interface ProfileRow {
@@ -107,8 +109,18 @@ export async function prepareSubmission(
   const warnings: PrepareWarning[] = [];
 
   // 1. Load job
-  const job = db.prepare('SELECT id, source, company, title, location, description, url, url_status, expired_at FROM job_postings WHERE id = ?').get(jobId) as JobRow | undefined;
+  const job = db.prepare('SELECT id, source, company, title, location, description, url, url_status, expired_at, apply_type FROM job_postings WHERE id = ?').get(jobId) as JobRow | undefined;
   if (!job) return { ok: false, strategy: 'browser', warnings, error: 'Job not found' };
+
+  // Check if job is known to be external (requires applying on company site)
+  if (job.apply_type === 'external') {
+    return {
+      ok: false,
+      strategy: 'manual',
+      warnings,
+      error: 'This job requires applying on the company website — use "Apply on company site" manually.',
+    };
+  }
 
   // 1b. Validity gate — never spend effort applying to a closed/dead posting.
   // Trust a recent DB verdict; otherwise do one live check now.
@@ -165,7 +177,10 @@ export async function prepareSubmission(
   if (!profile.name) warnings.push({ code: 'missing_name', message: 'Profile has no name.' });
 
   // 4. Load or generate cover letter + resume variant
-  const app = db.prepare('SELECT cover_letter, resume_variant, resume_tex FROM my_applications WHERE job_id = ?').get(jobId) as ApplicationRow | undefined;
+  const activeOwner = getActiveOwnerId();
+  const app = db
+    .prepare('SELECT cover_letter, resume_variant, resume_tex FROM my_applications WHERE job_id = ? AND (owner_id = ? OR (owner_id IS NULL AND ? = \'default\'))')
+    .get(jobId, activeOwner, activeOwner) as ApplicationRow | undefined;
   // Read through BOTH stores: the application record (what was actually sent) wins, then the
   // speculative cache. Reading only `app` here would mean every preview regenerated from scratch.
   const cachedDocs = readJobDocuments(jobId);
@@ -181,17 +196,6 @@ export async function prepareSubmission(
   }
   const hasTailored = !!(resumeMd || resumeTex);
 
-  if (!coverLetterMd && generateMissing) {
-    try {
-      const result = await generateCoverLetter(profile, job.title, job.company, job.description || '');
-      coverLetterMd = result.text;
-      // Cache it WITHOUT fabricating an application — see src/lib/apply/documents.ts.
-      saveJobDocument(jobId, 'cover_letter', coverLetterMd);
-    } catch (e) {
-      warnings.push({ code: 'cover_letter_failed', message: `Cover letter generation failed: ${(e as Error).message.slice(0, 100)}` });
-    }
-  }
-
   // 5. Resolve the resume PDF to attach.
   const safeName = (profile.name || 'candidate').replace(/[^\w-]+/g, '_');
   let pdf: { bytes: Uint8Array; filename: string } | null = null;
@@ -202,6 +206,55 @@ export async function prepareSubmission(
     bytes: new Uint8Array(profileRow.pdf_blob as Buffer),
     filename: profileRow.pdf_filename || `${safeName}_Resume.pdf`,
   });
+
+  const latexEnabled =
+    looksLikeLatexTemplate(profileRow.resume_tex) && (await hasLatexCompiler());
+  let tex = resumeTex;
+  if (tex && profileRow.resume_tex) {
+    tex = spliceLatexContent(profileRow.resume_tex as string, tex);
+  }
+
+  const needCoverLetter = !coverLetterMd && generateMissing;
+  const needResumeTex = !tex && generateMissing && latexEnabled && resumeSource !== 'original';
+
+  // Parallel generation: if both cover letter and tailored resume are missing, run them concurrently!
+  if (needCoverLetter && needResumeTex) {
+    const [clRes, texRes] = await Promise.allSettled([
+      generateCoverLetter(profile, job.title, job.company, job.description || '', { interactive: true }),
+      generateLatexResume(profile, profileRow.resume_tex as string, job.title, job.company, job.description || '', { interactive: true }),
+    ]);
+    if (clRes.status === 'fulfilled') {
+      coverLetterMd = clRes.value.text;
+      saveJobDocument(jobId, 'cover_letter', coverLetterMd);
+    } else {
+      warnings.push({ code: 'cover_letter_failed', message: `Cover letter generation failed: ${(clRes.reason as Error).message.slice(0, 100)}` });
+    }
+    if (texRes.status === 'fulfilled') {
+      tex = texRes.value.text;
+      saveJobDocument(jobId, 'resume_tex', tex);
+    } else {
+      warnings.push({ code: 'resume_tex_failed', message: `LaTeX variant generation failed: ${(texRes.reason as Error).message.slice(0, 100)}` });
+    }
+  } else {
+    if (needCoverLetter) {
+      try {
+        const result = await generateCoverLetter(profile, job.title, job.company, job.description || '', { interactive: true });
+        coverLetterMd = result.text;
+        saveJobDocument(jobId, 'cover_letter', coverLetterMd);
+      } catch (e) {
+        warnings.push({ code: 'cover_letter_failed', message: `Cover letter generation failed: ${(e as Error).message.slice(0, 100)}` });
+      }
+    }
+    if (needResumeTex) {
+      try {
+        const result = await generateLatexResume(profile, profileRow.resume_tex as string, job.title, job.company, job.description || '', { interactive: true });
+        tex = result.text;
+        saveJobDocument(jobId, 'resume_tex', tex);
+      } catch (e) {
+        warnings.push({ code: 'resume_tex_failed', message: `LaTeX variant generation failed: ${(e as Error).message.slice(0, 100)}` });
+      }
+    }
+  }
 
   if (resumeSource === 'original' && hasOriginal) {
     // Send the user's real uploaded PDF as-is — no LLM, no rendering.
@@ -216,28 +269,11 @@ export async function prepareSubmission(
     // AI-tailored path. Two renderers: the USER'S OWN LaTeX template (Overleaf design preserved)
     // when a template + compiler exist, else the Markdown one. Both only use facts from the resume.
     let latexUsed = false;
-    const latexEnabled =
-      looksLikeLatexTemplate(profileRow.resume_tex) && (await hasLatexCompiler());
     if (latexEnabled) {
-      // Validate-then-cache: a broken draft must never be stored (it would wedge the LaTeX lane
-      // forever). A cached tex is deterministic-repaired FIRST (`spliceLatexContent` re-runs
-      // `repairMacroArguments`, padding the custom macros' dropped args) so a pre-repair-era draft
-      // heals without an LLM call; then compile, and on failure hand the engine error back to the
-      // model for one structural repair pass. Only fall back to markdown when even that fails.
-      let tex = resumeTex;
-      if (tex) {
-        tex = spliceLatexContent(profileRow.resume_tex as string, tex);
-      } else if (generateMissing) {
-        try {
-          const result = await generateLatexResume(profile, profileRow.resume_tex as string, job.title, job.company, job.description || '', { interactive: true });
-          tex = result.text;
-        } catch (e) {
-          warnings.push({ code: 'resume_tex_failed', message: `LaTeX variant generation failed: ${(e as Error).message.slice(0, 100)}` });
-        }
-      }
       if (tex) {
         try {
-          const { bytes, tex: verifiedTex } = await compileLatexWithRepair(
+          // 1. Compile (with repair fallback)
+          const { bytes: rawBytes, tex: verifiedTex } = await compileLatexWithRepair(
             tex,
             (err) =>
               generateLatexResume(
@@ -249,9 +285,22 @@ export async function prepareSubmission(
                 { interactive: true, fixHint: err },
               ).then((r) => r.text),
           );
-          pdf = { bytes: new Uint8Array(bytes), filename: latexPdfFilename(profile.name, profileRow.pdf_filename) };
+          // 2. Auto-fit: ensure the tailored PDF does not exceed the template's page count
+          let fittedBytes = rawBytes;
+          let fittedTex = verifiedTex;
+          try {
+            const targetPages = await getLatexPageCount(profileRow.resume_tex as string);
+            if (targetPages > 0) {
+              const fitted = await fitLatexToPageBudget(verifiedTex, targetPages);
+              fittedBytes = fitted.bytes;
+              fittedTex = fitted.tex;
+            }
+          } catch (fitErr) {
+            console.warn('[prepare] page-fit failed — using unfit PDF:', (fitErr as Error).message.slice(0, 100));
+          }
+          pdf = { bytes: new Uint8Array(fittedBytes), filename: latexPdfFilename(profile.name, profileRow.pdf_filename) };
           latexUsed = true;
-          saveJobDocument(jobId, 'resume_tex', verifiedTex); // only cache what compiled
+          saveJobDocument(jobId, 'resume_tex', fittedTex); // only cache the fitted document
         } catch (e) {
           warnings.push({ code: 'latex_compile_failed', message: `LaTeX compile failed — falling back to Markdown: ${(e as Error).message.slice(0, 120)}` });
         }

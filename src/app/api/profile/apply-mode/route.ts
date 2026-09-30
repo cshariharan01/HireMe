@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import db from '@/lib/db';
+import { getApplyConfig, saveApplyConfig } from '@/lib/apply/questions';
 
 // GET /api/profile/apply-mode — returns the current apply mode and score threshold
 export async function GET() {
@@ -22,6 +23,11 @@ export async function POST(request: Request) {
 
     db.prepare("INSERT OR REPLACE INTO user_settings (key, value) VALUES ('apply_mode', ?)").run(mode);
     db.prepare("INSERT OR REPLACE INTO user_settings (key, value) VALUES ('score_threshold', ?)").run(String(threshold));
+
+    // Align apply_settings config_json resumeSource with apply_mode
+    const cfg = getApplyConfig();
+    cfg.resumeSource = mode === 'smart' ? 'original' : 'tailored';
+    saveApplyConfig(cfg);
 
     return NextResponse.json({ ok: true, mode, threshold });
   } catch (e) {

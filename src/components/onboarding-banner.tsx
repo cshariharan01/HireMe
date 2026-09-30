@@ -7,6 +7,7 @@ import { Sparkles, FileUp, RefreshCw, CheckCircle2, Circle, X, BookOpen, Loader2
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import useSWR from 'swr';
+import { PlatformLoginCard } from '@/components/platform-login-card';
 
 const fetcher = (url: string) => fetch(url).then((r) => r.json());
 
@@ -28,6 +29,21 @@ export function OnboardingBanner({ hasResume, jobCount }: { hasResume: boolean; 
   const step3Done = jobCount > 0;
 
   if ((step1Done && step2Done && step3Done) || dismissed) return null;
+
+  const launchPlatformLogin = async (platform: 'naukri' | 'linkedin') => {
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platform }),
+      });
+      const data = await res.json();
+      if (data.ok) toast.success(`Chrome launched for ${platform === 'naukri' ? 'Naukri' : 'LinkedIn'}! Sign in in Chrome.`);
+      else toast.error(data.error || 'Could not launch login browser.');
+    } catch {
+      toast.error('Failed to launch Chrome browser.');
+    }
+  };
 
   const startFullSync = async () => {
     setStarting(true);
@@ -118,24 +134,42 @@ export function OnboardingBanner({ hasResume, jobCount }: { hasResume: boolean; 
           )}
         </div>
 
-        {/* Step 3 — full sync */}
-        <div className="flex items-center gap-2.5">
+        {/* Step 3 — full sync & platform logins */}
+        <div className="flex flex-wrap items-center gap-2.5">
           <StepIcon done={step3Done} />
           <div className="min-w-0 flex-1">
             <p className={cn('text-sm font-medium', step3Done && 'text-muted-foreground line-through')}>
-              3. Run a Full sync
+              3. Connect platforms &amp; run Full sync
             </p>
             <p className="text-[11px] text-muted-foreground">
               {step3Done
                 ? `${jobCount.toLocaleString()} jobs in your pool.`
-                : 'Pulls fresh jobs from LinkedIn & Naukri. A few minutes.'}
+                : 'Sign into Naukri/LinkedIn in Chrome, then run Full Sync.'}
             </p>
           </div>
           {!step3Done && (
-            <Button onClick={startFullSync} disabled={starting || !step1Done || !step2Done} size="sm" variant="secondary" className="shrink-0">
-              {starting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
-              Run Full sync
-            </Button>
+            <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => launchPlatformLogin('naukri')}
+                className="border-orange-500/30 text-orange-600 dark:text-orange-400 hover:bg-orange-500/10 h-8 text-xs"
+              >
+                Sign in Naukri
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => launchPlatformLogin('linkedin')}
+                className="border-[#0A66C2]/30 text-[#0A66C2] dark:text-[#70B5F9] hover:bg-[#0A66C2]/10 h-8 text-xs"
+              >
+                Sign in LinkedIn
+              </Button>
+              <Button onClick={startFullSync} disabled={starting || !step1Done || !step2Done} size="sm" variant="secondary" className="h-8 text-xs">
+                {starting ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}
+                Run Full sync
+              </Button>
+            </div>
           )}
         </div>
       </div>

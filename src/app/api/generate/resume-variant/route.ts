@@ -39,7 +39,8 @@ export async function POST(request: NextRequest) {
       resumeJson,
       job.title,
       job.company,
-      job.description || ''
+      job.description || '',
+      { interactive: true }
     );
     const resumeVariant = result.text;
 

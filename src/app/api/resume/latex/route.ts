@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import db from '@/lib/db';
 import { getActiveResumeId } from '@/lib/resumes';
-import { compileLatex, hasLatexCompiler, looksLikeLatexTemplate } from '@/lib/apply/latex';
+import { compileLatex, compileLatexWithRepair, hasLatexCompiler, looksLikeLatexTemplate } from '@/lib/apply/latex';
 
 export const runtime = 'nodejs';
 
@@ -37,10 +37,16 @@ export async function POST(req: NextRequest) {
   }
   const tex = body.tex.trim();
 
-  // If a compiler exists, verify the template actually builds BEFORE accepting it.
+  let texToSave = tex;
   if (await hasLatexCompiler()) {
     try {
-      await compileLatex(tex);
+      const { tex: verifiedTex } = await compileLatexWithRepair(
+        tex,
+        async (err) => {
+          throw new Error(err);
+        },
+      );
+      texToSave = verifiedTex;
     } catch (e) {
       return NextResponse.json(
         { error: `Template does not compile with the installed LaTeX: ${(e as Error).message.slice(0, 300)}` },
@@ -54,11 +60,14 @@ export async function POST(req: NextRequest) {
     `INSERT INTO my_profile (id, resume_tex, updated_at)
      VALUES (1, ?, CURRENT_TIMESTAMP)
      ON CONFLICT(id) DO UPDATE SET resume_tex = excluded.resume_tex, updated_at = CURRENT_TIMESTAMP`,
-  ).run(tex);
+  ).run(texToSave);
 
   if (active) {
-    db.prepare('UPDATE resumes SET resume_tex = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(tex, active);
+    db.prepare('UPDATE resumes SET resume_tex = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(texToSave, active);
   }
+
+  // Clear all speculative cached job documents so unapplied jobs regenerate with the newly saved template
+  db.prepare('DELETE FROM job_documents').run();
 
   return NextResponse.json({ ok: true, saved: true, hasCompiler: await hasLatexCompiler(), templateDetected: looksLikeLatexTemplate(tex) });
 }

@@ -141,7 +141,11 @@ export function extractExperience(text: string, url = ''): { min: number | null;
     .replace(/([a-zA-Z])(\d)/g, '$1 $2')
     .replace(/(\d)([a-zA-Z])/g, '$1 $2')
     .replace(/(\+)([a-zA-Z])/g, '$1 $2')
-    .replace(/\b(exp|experience)\s*-\s*(\d)/gi, '$1: $2');
+    .replace(/\b(exp|experience)\s*-\s*(\d)/gi, '$1: $2')
+    .replace(/minimum\s+(\d)/gi, '$1')  // "minimum 5 years" -> "5 years"
+    .replace(/at\s+least\s+(\d)/gi, '$1+')  // "at least 5 years" -> "5+ years"
+    .replace(/upto\s+(\d)/gi, '0-$1')  // "upto 5 years" -> "0-5 years"
+    .replace(/(\d+)\s*[-–]\s*(\d+)\s*years?/gi, '$1-$2 years'); // normalize dashes
 
   let textExp: { min: number | null; max: number | null; text: string } | null = null;
 

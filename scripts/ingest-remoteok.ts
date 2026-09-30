@@ -53,7 +53,8 @@ function isRelevantJob(text: string): boolean {
 const DATA_DIR = path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new Database(path.join(DATA_DIR, 'hiresignal.db'));
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(DATA_DIR, 'hireme.db');
+const db = new Database(DB_PATH);
 sqliteVec.load(db);
 db.pragma('journal_mode = WAL');
 // Per-connection: the NORMAL set in src/lib/db.ts does not reach a standalone script, and

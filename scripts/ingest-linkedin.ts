@@ -19,30 +19,9 @@ import { createHash } from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import { ensureFreshnessColumns, markSourceAbsent } from './shared/freshness';
-import { getEnabledRoles, getProfileYoe, resolveSearchRoles } from './shared/profile-roles';
-import { isSeniorityCompatible, isExperienceCompatible } from '../src/lib/target-job-filter';
-
-const ALL_TERMS = [
-  'FHIR R4', 'FHIR STU3', 'FHIR R5', 'HL7', 'HL7 v2', 'HL7 CDA',
-  'SMART on FHIR', 'CDS Hooks', 'Bulk FHIR', 'FHIR API', 'HL7 FHIR',
-  'Epic', 'Cerner', 'Oracle Health', 'Meditech', 'Allscripts',
-  'CMS', 'ONC', 'HIPAA', 'USCDI', 'TEFCA', 'Prior Auth',
-  'interoperability', 'HITECH', 'PHI', 'CCDA', 'C-CDA',
-  'Mirth Connect', 'Azure Health Data Services',
-  'AWS HealthLake', 'DICOM', 'IHE', 'SNOMED', 'LOINC', 'ICD-10', 'RxNorm',
-];
-
-function isDomainPriority(text: string): boolean {
-  const lower = text.toLowerCase();
-  let count = 0;
-  for (const term of ALL_TERMS) {
-    if (lower.includes(term.toLowerCase())) {
-      count++;
-      if (count >= 3) return true;
-    }
-  }
-  return false;
-}
+import { getEnabledRoles, getEnabledLocations, getProfileYoe, resolveSearchRoles, isDomainPriorityJob } from './shared/profile-roles';
+import { matchesPreferredRole, isSeniorityCompatible, isExperienceCompatible, isLocationCompatible } from '../src/lib/target-job-filter';
+import { generateEmbedding, embeddingToBlob } from '../src/lib/embeddings';
 
 const GLOBAL_REMOTE_RE = /\b(work from anywhere|remote worldwide|remote \(global\)|open to international|globally remote|anywhere in the world)\b/i;
 const US_ONLY_RE = /\b(us(?:a)? only|u\.s\.? only|must be (?:a )?us (?:citizen|resident)|requires us work authorization|us residents only)\b/i;
@@ -80,25 +59,26 @@ function classifyJob(title: string, description: string, location: string): {
   };
 }
 
-// Configure the searches you actually care about. Each runs once, scrapes 1 page (~25 jobs).
+// Configure default search queries when no candidate roles exist.
 type SearchQuery = { keywords: string; location: string; geoId?: string };
 const DEFAULT_QUERIES: SearchQuery[] = [
+  { keywords: 'Software Engineer', location: 'India' },
+  { keywords: 'Software Engineer', location: 'Remote' },
+  { keywords: 'Solution Architect', location: 'India' },
   { keywords: 'Data Engineer', location: 'India' },
-  { keywords: 'Data Engineer', location: 'Remote' },
-  { keywords: 'Cloud Data Engineer', location: 'India' },
-  { keywords: 'PySpark Data Engineer', location: 'India' },
-  { keywords: 'ETL Developer', location: 'India' },
-  { keywords: 'Big Data Engineer', location: 'India' },
 ];
 
-// Build LinkedIn queries from the user's target roles from their profile.
-// Falls back to DEFAULT_QUERIES when no roles are set in the profile.
+// Build LinkedIn queries from the candidate's target roles and target locations.
 function buildQueries(db: Database.Database): SearchQuery[] {
   const roles = resolveSearchRoles(db, DEFAULT_QUERIES.map((q) => q.keywords));
+  const userLocations = getEnabledLocations(db);
+  const locations = userLocations.length > 0 ? userLocations : ['India', 'Remote'];
+
   const out: SearchQuery[] = [];
-  for (const role of roles) {
-    out.push({ keywords: role, location: 'India' });
-    out.push({ keywords: role, location: 'Remote' });
+  for (const role of Array.from(new Set(roles))) {
+    for (const loc of locations) {
+      out.push({ keywords: role, location: loc });
+    }
   }
   return out;
 }
@@ -118,62 +98,74 @@ function sleep(ms: number) {
 }
 
 async function fetchSearchPage(keywords: string, location: string, start = 0, postedAtMap?: Map<string, string>): Promise<string[]> {
-  // LinkedIn's native f_AL filter restricts search results to Easy Apply jobs before we
-  // fetch individual job details. Keep the runtime apply preflight as a fallback because
-  // LinkedIn can change or ignore undocumented guest-search parameters.
   const params = new URLSearchParams({
     keywords,
     location,
     start: String(start),
     f_AL: 'true',
     sortBy: 'DD',
-    f_TPR: 'r86400', // Past 24 hours only
+    f_TPR: process.env.SYNC_FRESHNESS_DAYS ? `r${Number(process.env.SYNC_FRESHNESS_DAYS) * 86400}` : 'r604800', // Past 7 days (604,800 seconds)
   });
   const url = `https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?${params.toString()}`;
-  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(10000) });
-  if (!res.ok) {
-    console.log(`  ✗ search "${keywords}" @ ${location}: HTTP ${res.status}`);
-    return [];
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(10000) });
+      if (res.status === 429) {
+        console.log(`  ⚠ search "${keywords}" @ ${location} rate limited (HTTP 429, attempt ${attempt}/3) — backing off ${attempt * 4}s...`);
+        await sleep(attempt * 4000);
+        continue;
+      }
+      if (!res.ok) {
+        console.log(`  ✗ search "${keywords}" @ ${location}: HTTP ${res.status}`);
+        return [];
+      }
+      const html = await res.text();
+      const $ = cheerio.load(html);
+      const ids = new Set<string>();
+
+      $('li').each((_, el) => {
+        const $el = $(el);
+        const title =
+          $el.find('h3.base-search-card__title').text().trim() ||
+          $el.find('.base-search-card__title').text().trim();
+        if (title && !isSeniorityCompatible(title)) {
+          return;
+        }
+        const timeEl = $el.find('time');
+        const dateStr = timeEl.attr('datetime') || timeEl.text().trim() || '';
+
+        const urn = $el.find('[data-entity-urn]').attr('data-entity-urn') || $el.attr('data-entity-urn') || '';
+        const m = urn.match(/jobPosting:(\d+)/);
+        if (m) {
+          ids.add(m[1]);
+          if (dateStr && postedAtMap) postedAtMap.set(m[1], dateStr);
+          return;
+        }
+        const href = $el.find('a.base-card__full-link, a.base-card__full-link-title').attr('href') || '';
+        const hm = href.match(/\/jobs\/view\/[^/?]*?-?(\d+)(?:\?|\/|$)/);
+        if (hm) {
+          ids.add(hm[1]);
+          if (dateStr && postedAtMap) postedAtMap.set(hm[1], dateStr);
+        }
+      });
+
+      $('[data-entity-urn]').each((_, el) => {
+        const urn = $(el).attr('data-entity-urn') || '';
+        const m = urn.match(/jobPosting:(\d+)/);
+        if (m) ids.add(m[1]);
+      });
+
+      return Array.from(ids);
+    } catch (e) {
+      if (attempt === 3) {
+        console.log(`  ✗ search error "${keywords}" @ ${location}: ${(e as Error).message}`);
+        return [];
+      }
+      await sleep(2000);
+    }
   }
-  const html = await res.text();
-  const $ = cheerio.load(html);
-  const ids = new Set<string>();
-
-  // Read cards directly to skip high seniority roles early before fetching details
-  $('li').each((_, el) => {
-    const $el = $(el);
-    const title =
-      $el.find('h3.base-search-card__title').text().trim() ||
-      $el.find('.base-search-card__title').text().trim();
-    if (title && !isSeniorityCompatible(title)) {
-      return;
-    }
-    const timeEl = $el.find('time');
-    const dateStr = timeEl.attr('datetime') || timeEl.text().trim() || '';
-
-    const urn = $el.find('[data-entity-urn]').attr('data-entity-urn') || $el.attr('data-entity-urn') || '';
-    const m = urn.match(/jobPosting:(\d+)/);
-    if (m) {
-      ids.add(m[1]);
-      if (dateStr && postedAtMap) postedAtMap.set(m[1], dateStr);
-      return;
-    }
-    const href = $el.find('a.base-card__full-link, a.base-card__full-link-title').attr('href') || '';
-    const hm = href.match(/\/jobs\/view\/[^/?]*?-?(\d+)(?:\?|\/|$)/);
-    if (hm) {
-      ids.add(hm[1]);
-      if (dateStr && postedAtMap) postedAtMap.set(hm[1], dateStr);
-    }
-  });
-
-  // Fallback to any entity-urns
-  $('[data-entity-urn]').each((_, el) => {
-    const urn = $(el).attr('data-entity-urn') || '';
-    const m = urn.match(/jobPosting:(\d+)/);
-    if (m) ids.add(m[1]);
-  });
-
-  return Array.from(ids);
+  return [];
 }
 
 interface JobDetail {
@@ -187,43 +179,51 @@ interface JobDetail {
 
 async function fetchJobDetail(id: string): Promise<JobDetail | null> {
   const url = `https://www.linkedin.com/jobs/view/${id}/`;
-  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(8000) });
-  if (!res.ok) return null;
-  const html = await res.text();
-  const $ = cheerio.load(html);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(8000) });
+      if (res.status === 429) {
+        await sleep(4000 * attempt);
+        continue;
+      }
+      if (!res.ok) return null;
+      const html = await res.text();
+      const $ = cheerio.load(html);
 
-  // Title
-  const title =
-    $('h1.top-card-layout__title').first().text().trim() ||
-    $('h1.topcard__title').first().text().trim() ||
-    $('h1').first().text().trim();
+      const title =
+        $('h1.top-card-layout__title').first().text().trim() ||
+        $('h1.topcard__title').first().text().trim() ||
+        $('h1').first().text().trim();
 
-  // Company
-  const company =
-    $('a.topcard__org-name-link').first().text().trim() ||
-    $('.topcard__flavor a').first().text().trim() ||
-    $('.top-card-layout__company-url').first().text().trim() ||
-    'Unknown';
+      const company =
+        $('a.topcard__org-name-link').first().text().trim() ||
+        $('.topcard__flavor a').first().text().trim() ||
+        $('.top-card-layout__company-url').first().text().trim() ||
+        'Unknown';
 
-  // Location
-  const location =
-    $('.topcard__flavor--bullet').first().text().trim() ||
-    $('.top-card-layout__second-subline span').first().text().trim() ||
-    '';
+      const location =
+        $('.topcard__flavor--bullet').first().text().trim() ||
+        $('.top-card-layout__second-subline span').first().text().trim() ||
+        '';
 
-  // Description (the public view dumps it as HTML in this container)
-  const description =
-    $('.show-more-less-html__markup').text().trim() ||
-    $('.description__text').text().trim() ||
-    $('section.show-more-less-html').text().trim();
+      const description =
+        $('.show-more-less-html__markup').text().trim() ||
+        $('.description__text').text().trim() ||
+        $('section.show-more-less-html').text().trim();
 
-  if (!title || !description) return null;
-  return { id, title, company, location, description, url };
+      if (!title || !description) return null;
+      return { id, title, company, location, description, url };
+    } catch {
+      if (attempt < 2) await sleep(1500);
+    }
+  }
+  return null;
 }
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const db = new Database(path.join(DATA_DIR, 'hiresignal.db'));
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(DATA_DIR, 'hireme.db');
+const db = new Database(DB_PATH);
 sqliteVec.load(db);
 db.pragma('journal_mode = WAL');
 // Per-connection, so the NORMAL set in src/lib/db.ts does not apply to this script. better-sqlite3
@@ -285,14 +285,15 @@ async function main() {
   const allIds = new Set<string>();
   const postedAtMap = new Map<string, string>();
   for (const q of SEARCH_QUERIES) {
-    for (const start of [0]) {
+    for (const start of [0, 25]) {
       try {
+        console.log(`[LinkedIn] 🔍 Searching "${q.keywords}" in ${q.location} (page ${start / 25 + 1})...`);
         const ids = await fetchSearchPage(q.keywords, q.location, start, postedAtMap);
-        console.log(`  ✓ "${q.keywords}" @ ${q.location}: ${ids.length} 24h ids`);
+        console.log(`[LinkedIn] 📋 Found ${ids.length} Easy Apply cards for "${q.keywords}" in ${q.location}`);
         ids.forEach((id) => allIds.add(id));
         await sleep(1500); // 1.5 sec between searches
       } catch (e) {
-        console.log(`  ✗ search error: ${(e as Error).message}`);
+        console.log(`[LinkedIn] ✗ search error: ${(e as Error).message}`);
         await sleep(5000); // back off
       }
     }
@@ -303,7 +304,7 @@ async function main() {
   let failed = 0;
   let count = 0;
   let skipped = 0;
-  const MAX_NEW_DETAILS = 50; // Bound new fetches per sync so runs complete promptly
+  const MAX_NEW_DETAILS = 150; // Bound new fetches per sync so runs complete promptly
   for (const id of Array.from(allIds)) {
     if (added >= MAX_NEW_DETAILS) {
       console.log(`  · reached batch limit of ${MAX_NEW_DETAILS} newly added jobs for this sync`);
@@ -325,17 +326,33 @@ async function main() {
         continue;
       }
 
-      if (!isSeniorityCompatible(detail.title)) {
-        console.log(`  · skip high seniority (${detail.title})`);
+      const userYoe = getProfileYoe(db, 3.6);
+      const targetRoles = getEnabledRoles(db);
+      const targetLocations = getEnabledLocations(db);
+
+      if (targetRoles.length > 0 && !matchesPreferredRole(detail.title, targetRoles)) {
+        console.log(`[LinkedIn] ⏭️ Skipped: "${detail.title}" at ${detail.company} (Non-target role)`);
         continue;
       }
 
-      if (!isExperienceCompatible(null, null, `${detail.title} ${detail.description}`)) {
-        console.log(`  · skip incompatible experience (${detail.title})`);
+      if (!isSeniorityCompatible(detail.title, userYoe, targetRoles)) {
+        console.log(`[LinkedIn] ⏭️ Skipped: "${detail.title}" at ${detail.company} (Seniority > 4 YOE)`);
         continue;
       }
 
-      const dp = isDomainPriority(detail.title + ' ' + detail.description);
+      if (!isExperienceCompatible(null, null, `${detail.title} ${detail.description}`, userYoe)) {
+        console.log(`[LinkedIn] ⏭️ Skipped: "${detail.title}" at ${detail.company} (Experience mismatch)`);
+        continue;
+      }
+
+      if (targetLocations.length > 0 && !isLocationCompatible(detail.location, null, targetLocations)) {
+        console.log(`[LinkedIn] ⏭️ Skipped: "${detail.title}" at ${detail.company} (Location mismatch)`);
+        continue;
+      }
+
+      console.log(`[LinkedIn] 🎯 Found Easy Apply: "${detail.title}" at ${detail.company}`);
+
+      const dp = isDomainPriorityJob(db, detail.title + ' ' + detail.description);
       const cls = classifyJob(detail.title, detail.description, detail.location);
       const hash = createHash('sha256')
         .update('linkedin' + detail.company + detail.title + detail.location)
@@ -354,7 +371,18 @@ async function main() {
         hash,
         postedAtMap.get(id) || null
       );
-      if (result.changes > 0) added++;
+      if (result.changes > 0) {
+        added++;
+        console.log(`[LinkedIn] 📥 Ingested: "${detail.title}" at ${detail.company} [Easy Apply]`);
+        // Embed immediately so job appears right away in Matches feed
+        try {
+          const emb = await generateEmbedding(`${detail.title} ${detail.company} ${(detail.description || '').slice(0, 2000)}`);
+          const blob = embeddingToBlob(emb);
+          db.prepare('UPDATE job_postings SET embedding = ? WHERE rowid = ?').run(blob, result.lastInsertRowid);
+        } catch { /* embed-jobs fallback */ }
+      } else {
+        console.log(`[LinkedIn] ℹ️ Already in database: "${detail.title}" at ${detail.company}`);
+      }
       if (count % 5 === 0) console.log(`  progress: ${count}/${allIds.size} (added=${added}, failed=${failed})`);
       await sleep(2500); // 2.5 sec between detail fetches
     } catch (e) {

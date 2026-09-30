@@ -125,7 +125,7 @@ export function LatexTemplatePanel() {
         {!loading && (
           <>
             <textarea
-              className="min-h-[180px] w-full resize-y rounded-md border border-border bg-background p-3 font-mono text-[11px] leading-relaxed text-foreground outline-none focus:border-primary/50"
+              className="min-h-[180px] w-full max-w-full overflow-x-auto resize-y rounded-md border border-border bg-background p-3 font-mono text-[11px] leading-relaxed text-foreground outline-none focus:border-primary/50"
               placeholder={'\\documentclass{article}\n\\usepackage[margin=0.6in]{geometry}\n...\n\\begin{document}\n\n... your résumé content ...\n\n\\end{document}'}
               value={tex}
               onChange={(e) => { setTex(e.target.value); setError(null); }}

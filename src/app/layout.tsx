@@ -8,6 +8,8 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { Toaster } from '@/components/ui/sonner';
 import { CommandPalette } from '@/components/command-palette';
 
+import { AutoApplyProvider } from '@/lib/auto-apply-context';
+
 export const metadata: Metadata = {
   title: 'HireMe',
   description: 'Personal AI job assistant — auto-apply to LinkedIn & Naukri jobs tailored to your profile',
@@ -21,7 +23,9 @@ export default function RootLayout({
       <body className="min-h-screen bg-background font-sans antialiased">
         <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
           <TooltipProvider delayDuration={200}>
-            <AppShell>{children}</AppShell>
+            <AutoApplyProvider>
+              <AppShell>{children}</AppShell>
+            </AutoApplyProvider>
             <CommandPalette />
             <Toaster />
           </TooltipProvider>

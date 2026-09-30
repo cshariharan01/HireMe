@@ -93,12 +93,42 @@ export function ScreeningAnswersCard() {
     }
   };
 
+  const removeAll = async () => {
+    if (!confirm('Are you sure you want to clear all stored screening answers? New applications will re-prompt/generate fresh answers.')) return;
+    setBusyId(-1);
+    try {
+      const res = await fetch('/api/apply/screening-answers', { method: 'DELETE' });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || 'Clear failed');
+      toast.success('All screening answers cleared');
+      mutate();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Clear failed');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base flex items-center gap-2">
-          <MessageSquareText className="h-4 w-4" /> Screening answers
-        </CardTitle>
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base flex items-center gap-2">
+            <MessageSquareText className="h-4 w-4" /> Screening answers
+          </CardTitle>
+          {answers.length > 0 && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={removeAll}
+              disabled={busyId === -1}
+              className="text-xs text-destructive hover:text-destructive hover:bg-destructive/10 h-7"
+            >
+              {busyId === -1 ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : <Trash2 className="h-3 w-3 mr-1" />}
+              Clear all
+            </Button>
+          )}
+        </div>
         <CardDescription>
           Answers auto-apply saved and reuses whenever a portal asks the same question. Edit one to
           correct it everywhere, or delete it to be asked fresh next time.

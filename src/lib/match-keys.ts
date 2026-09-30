@@ -24,5 +24,6 @@ export const PAGE_SIZE = 30;
  * case.
  */
 export function matchesFallbackKey(): string {
-  return `/api/matches?offset=0&limit=${PAGE_SIZE}`;
+  return `/api/matches?offset=0&limit=${PAGE_SIZE}&apply_score_filter=1`;
 }
+

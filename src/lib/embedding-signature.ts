@@ -50,7 +50,21 @@ export function assertEmbeddingConsistent(db: DB): void {
   const stored = readEmbeddingSignature(db);
   if (!stored) return;
   const current = getEmbeddingSignature();
-  if (stored !== current) throw new Error(embeddingMismatchMessage(stored, current));
+  if (stored !== current) {
+    // If there are no embedded jobs in the database, seamlessly update the signature
+    try {
+      const jobCount = (db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='job_postings'").get() as { c: number } | undefined)?.c
+        ? (db.prepare('SELECT COUNT(*) AS c FROM job_postings WHERE embedding IS NOT NULL').get() as { c: number } | undefined)?.c ?? 0
+        : 0;
+      if (jobCount === 0) {
+        db.prepare('UPDATE app_meta SET value = ? WHERE key = ?').run(current, KEY);
+        return;
+      }
+    } catch {
+      /* ignore */
+    }
+    throw new Error(embeddingMismatchMessage(stored, current));
+  }
 }
 
 /**

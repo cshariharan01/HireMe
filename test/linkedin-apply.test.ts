@@ -7,7 +7,11 @@ import {
   detectLinkedInExternalApply,
   easyApplyModalVisible,
   resolveLinkedInQuestionAnswer,
+  resolveLinkedInQuestionAnswerAsync,
+  resolvePreferredLocationOption,
 } from '@/lib/apply/linkedin';
+import db from '@/lib/db';
+import { screeningOwnerId, hashScreeningQuestion, ensureScreeningOwner } from '@/lib/apply/screening-owner';
 
 /**
  * Minimal Playwright `Page` fake for the pure detection functions.
@@ -291,6 +295,13 @@ describe('LinkedIn screening question resolution (resolveLinkedInQuestionAnswer)
     expect(resolveLinkedInQuestionAnswer('Total IT experience ?*', 'text', profile)).toBe('3');
   });
 
+  it('truncates decimal YOE (e.g. 3.6 years) down to 3 instead of rounding up to 4', () => {
+    const decimalProfile = { ...profile, yearsOfExperience: 3.6 };
+    expect(resolveLinkedInQuestionAnswer('How many years of work experience do you have with SQL?', 'text', decimalProfile)).toBe('3');
+    expect(resolveLinkedInQuestionAnswer('How many years of work experience do you have with Python (Programming Language)?', 'text', decimalProfile)).toBe('3');
+    expect(resolveLinkedInQuestionAnswer('How many years of work experience do you have with Microsoft Excel?', 'text', decimalProfile)).toBe('3');
+  });
+
   it('correctly resolves "Once offered, how soon you can join us - in days ?*" with notice period days', () => {
     expect(resolveLinkedInQuestionAnswer('Once offered, how soon you can join us - in days ?*', 'text', profile)).toBe('30');
     expect(resolveLinkedInQuestionAnswer('How soon can you join us? - in days', 'text', profile)).toBe('30');
@@ -326,5 +337,171 @@ describe('LinkedIn screening question resolution (resolveLinkedInQuestionAnswer)
   it('provides a safe fallback for unknown mandatory questions', () => {
     expect(resolveLinkedInQuestionAnswer('Rate your problem-solving skill (1-10)?*', 'text', profile)).toBe('3');
     expect(resolveLinkedInQuestionAnswer('Will you be open to travel occasionally?*', 'text', profile)).toBe('Yes');
+  });
+});
+
+describe('LinkedIn async screening question resolution (resolveLinkedInQuestionAnswerAsync)', () => {
+  const profile = {
+    email: 'cshariharan2001@gmail.com',
+    yearsOfExperience: 3,
+    noticePeriodDays: 30,
+    currentCtcInr: 570000,
+    expectedCtcInr: 1200000,
+  };
+
+  it('reuses answers from SQLite screening_answers profile cache when present', async () => {
+    const ownerId = screeningOwnerId(profile);
+    ensureScreeningOwner(ownerId);
+    const question = 'Custom Radio Question: Are you willing to work night shifts?';
+    const hash = hashScreeningQuestion(question, ownerId);
+
+    db.prepare(`
+      INSERT INTO screening_answers (question_hash, question, answer, category, used_count)
+      VALUES (?, ?, ?, 'radio', 1)
+      ON CONFLICT(question_hash) DO UPDATE SET answer = excluded.answer
+    `).run(hash, question, 'Yes');
+
+    const res = await resolveLinkedInQuestionAnswerAsync(question, 'radio', profile, ['Yes', 'No']);
+    expect(res).toBe('Yes');
+  });
+
+  it('snaps cached answer to matching radio option from options list', async () => {
+    const ownerId = screeningOwnerId(profile);
+    ensureScreeningOwner(ownerId);
+    const question = 'Custom Experience Range Question';
+    const hash = hashScreeningQuestion(question, ownerId);
+
+    db.prepare(`
+      INSERT INTO screening_answers (question_hash, question, answer, category, used_count)
+      VALUES (?, ?, ?, 'radio', 1)
+      ON CONFLICT(question_hash) DO UPDATE SET answer = excluded.answer
+    `).run(hash, question, '3-5 years');
+
+    const res = await resolveLinkedInQuestionAnswerAsync(question, 'radio', profile, ['0-1 years', '1-3 years', '3-5 years', '5+ years']);
+    expect(res).toBe('3-5 years');
+  });
+
+  it('correctly resolves radio button questions for work authorization, sponsorship, and qualification', () => {
+    expect(resolveLinkedInQuestionAnswer('Authorized to work in India', 'radio', profile)).toBe('Yes');
+    expect(resolveLinkedInQuestionAnswer('Are you legally authorized to work in the country?', 'radio', profile)).toBe('Yes');
+    expect(resolveLinkedInQuestionAnswer('Will you now or in the future require visa sponsorship?', 'radio', profile)).toBe('No');
+    expect(resolveLinkedInQuestionAnswer('Do you need visa sponsorship?', 'radio', profile)).toBe('No');
+    expect(resolveLinkedInQuestionAnswer('Comfortable with hybrid work policy?', 'radio', profile)).toBe('Yes');
+    expect(resolveLinkedInQuestionAnswer('Willing to relocate to Bangalore?', 'radio', profile)).toBe('Yes');
+  });
+
+  describe('Location preference matching (Zorba AI bug fix)', () => {
+    const candidateProfile = {
+      name: 'Hariharan Subramaniyan',
+      email: 'cshariharan2001@gmail.com',
+      city: 'Virudhunagar',
+      state: 'Tamil Nadu',
+      location: 'Virudhunagar, India',
+      targets: {
+        locations: ['Madurai', 'Coimbatore', 'Chennai', 'Bangalore', 'Remote'],
+      },
+    };
+
+    it('matches candidate preference Chennai from Zorba AI options list instead of picking first option Mumbai', () => {
+      const options = [
+        'Mumbai, Maharashtra, India',
+        'Bengaluru, Karnataka, India',
+        'Chennai, Tamil Nadu, India',
+      ];
+      const matched = resolvePreferredLocationOption(options, candidateProfile);
+      expect(matched).toBe('Chennai, Tamil Nadu, India');
+    });
+
+    it('matches Bangalore to Bengaluru using city aliases when Chennai is not present', () => {
+      const options = [
+        'Mumbai, Maharashtra, India',
+        'Bengaluru, Karnataka, India',
+        'Hyderabad, Telangana, India',
+      ];
+      const matched = resolvePreferredLocationOption(options, candidateProfile);
+      expect(matched).toBe('Bengaluru, Karnataka, India');
+    });
+
+    it('matches Remote when available and preferred', () => {
+      const remoteProfile = {
+        city: 'Virudhunagar',
+        targets: {
+          locations: ['Remote', 'Bangalore'],
+        },
+      };
+      const options = [
+        'Mumbai, Maharashtra, India',
+        'Work from home',
+        'Pune, Maharashtra, India',
+      ];
+      const matched = resolvePreferredLocationOption(options, remoteProfile);
+      expect(matched).toBe('Work from home');
+    });
+
+    it('matches candidate state when no exact city matches', () => {
+      const stateProfile = {
+        city: 'Virudhunagar',
+        state: 'Tamil Nadu',
+        targets: {
+          locations: ['Tirunelveli'],
+        },
+      };
+      const options = [
+        'Mumbai, Maharashtra, India',
+        'Trichy, Tamil Nadu, India',
+        'Kolkata, West Bengal, India',
+      ];
+      const matched = resolvePreferredLocationOption(options, stateProfile);
+      expect(matched).toBe('Trichy, Tamil Nadu, India');
+    });
+
+    it('resolves "Select your prefered location." question (single "r") with candidate preference', () => {
+      const options = [
+        'Mumbai, Maharashtra, India',
+        'Bengaluru, Karnataka, India',
+        'Chennai, Tamil Nadu, India',
+      ];
+      // Note spelling in prompt: "prefered" with one "r"
+      const ans = resolveLinkedInQuestionAnswer(
+        'Select your prefered location.',
+        'radio',
+        candidateProfile,
+        true,
+        options
+      );
+      expect(ans).toBe('Chennai, Tamil Nadu, India');
+    });
+
+    it('resolves "Preferred work location" for dropdown (select) input type', () => {
+      const options = [
+        'Select an option',
+        'Mumbai, Maharashtra, India',
+        'Bengaluru, Karnataka, India',
+        'Chennai, Tamil Nadu, India',
+      ];
+      const ans = resolveLinkedInQuestionAnswer(
+        'Preferred work location',
+        'select',
+        candidateProfile,
+        true,
+        options
+      );
+      expect(ans).toBe('Chennai, Tamil Nadu, India');
+    });
+
+    it('resolves async location question deterministically through resolveLinkedInQuestionAnswerAsync', async () => {
+      const options = [
+        'Mumbai, Maharashtra, India',
+        'Bengaluru, Karnataka, India',
+        'Chennai, Tamil Nadu, India',
+      ];
+      const res = await resolveLinkedInQuestionAnswerAsync(
+        'Select your prefered location.',
+        'radio',
+        candidateProfile,
+        options
+      );
+      expect(res).toBe('Chennai, Tamil Nadu, India');
+    });
   });
 });

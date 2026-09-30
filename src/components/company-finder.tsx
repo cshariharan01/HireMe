@@ -131,7 +131,7 @@ export function CompanyFinder() {
         </CardTitle>
         <CardDescription>
           Search {total ? total.toLocaleString() : 'thousands of'} company career boards by name and
-          add one in a click — no hunting for the careers URL. Jobs are pulled fresh by HireSignal;
+          add one in a click — no hunting for the careers URL. Jobs are pulled fresh by HireMe;
           the directory only says which system a company uses.
         </CardDescription>
       </CardHeader>

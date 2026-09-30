@@ -2,13 +2,12 @@ import { redirect } from 'next/navigation';
 import DashboardClient from './dashboard-client';
 import { buildMatchesPage } from '@/lib/matches-page';
 import { matchesFallbackKey } from '@/lib/match-keys';
-import { getDb } from '@/lib/db';
+import db from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 
 function isProfileConfigured(): boolean {
   try {
-    const db = getDb();
     const row = db.prepare('SELECT parsed_json FROM my_profile WHERE id = 1').get() as
       | { parsed_json: string | null }
       | undefined;
@@ -27,9 +26,9 @@ function isProfileConfigured(): boolean {
  * On first launch (no profile), redirects to /setup wizard.
  */
 export default function DashboardPage() {
-  // First-run check — redirect new users to the setup wizard
+  // First-run check — redirect new users to profile page if no profile exists
   if (!isProfileConfigured()) {
-    redirect('/setup');
+    redirect('/profile');
   }
 
   let fallback: Record<string, unknown> | undefined;

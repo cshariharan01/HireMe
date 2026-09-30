@@ -57,7 +57,8 @@ function classifyJob(source: string, title: string, description: string, locatio
   };
 }
 
-const db = new Database(path.join(process.cwd(), 'data', 'hiresignal.db'));
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(process.cwd(), 'data', 'hireme.db');
+const db = new Database(DB_PATH);
 sqliteVec.load(db);
 db.pragma('journal_mode = WAL');
 

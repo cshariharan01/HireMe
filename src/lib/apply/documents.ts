@@ -1,4 +1,5 @@
 import db from '@/lib/db';
+import { getActiveOwnerId } from '@/lib/apply/screening-owner';
 
 /**
  * Read/write cache for generated cover letters and resume variants.
@@ -22,9 +23,10 @@ export interface JobDocuments {
 
 /** Prefer what was actually sent (the application) over the speculative cache. */
 export function readJobDocuments(jobId: number): JobDocuments {
+  const activeOwner = getActiveOwnerId();
   const app = db
-    .prepare('SELECT cover_letter, resume_variant, resume_tex, tailored_score, default_score FROM my_applications WHERE job_id = ?')
-    .get(jobId) as { cover_letter: string | null; resume_variant: string | null; resume_tex: string | null; tailored_score: number | null; default_score: number | null } | undefined;
+    .prepare('SELECT cover_letter, resume_variant, resume_tex, tailored_score, default_score FROM my_applications WHERE job_id = ? AND (owner_id = ? OR (owner_id IS NULL AND ? = \'default\'))')
+    .get(jobId, activeOwner, activeOwner) as { cover_letter: string | null; resume_variant: string | null; resume_tex: string | null; tailored_score: number | null; default_score: number | null } | undefined;
   const cached = db
     .prepare('SELECT cover_letter, resume_variant, resume_tex, tailored_score, default_score FROM job_documents WHERE job_id = ?')
     .get(jobId) as { cover_letter: string | null; resume_variant: string | null; resume_tex: string | null; tailored_score: number | null; default_score: number | null } | undefined;
@@ -49,9 +51,10 @@ export function saveJobDocument(
   field: 'cover_letter' | 'resume_variant' | 'resume_tex',
   value: string,
 ): void {
-  const hasApplication = db.prepare('SELECT 1 FROM my_applications WHERE job_id = ? LIMIT 1').get(jobId);
+  const activeOwner = getActiveOwnerId();
+  const hasApplication = db.prepare('SELECT 1 FROM my_applications WHERE job_id = ? AND (owner_id = ? OR owner_id IS NULL) LIMIT 1').get(jobId, activeOwner);
   if (hasApplication) {
-    db.prepare(`UPDATE my_applications SET ${field} = ? WHERE job_id = ?`).run(value, jobId);
+    db.prepare(`UPDATE my_applications SET ${field} = ? WHERE job_id = ? AND (owner_id = ? OR owner_id IS NULL)`).run(value, jobId, activeOwner);
     if (field === 'resume_variant' || field === 'resume_tex') {
       import('@/lib/tailored-score')
         .then(({ calculateAndStoreTailoredScore }) => calculateAndStoreTailoredScore(jobId, value))
@@ -82,6 +85,7 @@ export function promoteDocumentsToApplication(jobId: number): void {
     .prepare('SELECT cover_letter, resume_variant, resume_tex, tailored_score, default_score FROM job_documents WHERE job_id = ?')
     .get(jobId) as { cover_letter: string | null; resume_variant: string | null; resume_tex: string | null; tailored_score: number | null; default_score: number | null } | undefined;
   if (!cached) return;
+  const activeOwner = getActiveOwnerId();
   db.prepare(
     `UPDATE my_applications
         SET cover_letter   = COALESCE(cover_letter, ?),
@@ -89,7 +93,7 @@ export function promoteDocumentsToApplication(jobId: number): void {
             resume_tex     = COALESCE(resume_tex, ?),
             tailored_score = COALESCE(tailored_score, ?),
             default_score  = COALESCE(default_score, ?)
-      WHERE job_id = ?`,
-  ).run(cached.cover_letter, cached.resume_variant, cached.resume_tex, cached.tailored_score, cached.default_score, jobId);
+      WHERE job_id = ? AND (owner_id = ? OR owner_id IS NULL)`,
+  ).run(cached.cover_letter, cached.resume_variant, cached.resume_tex, cached.tailored_score, cached.default_score, jobId, activeOwner);
   db.prepare('DELETE FROM job_documents WHERE job_id = ?').run(jobId);
 }

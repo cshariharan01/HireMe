@@ -225,7 +225,7 @@ export default function ImportPage() {
           <CardHeader>
             <CardTitle className="text-base">Discover a whole company&apos;s board</CardTitle>
             <CardDescription>
-              Enter a company name or paste its careers-page URL. HireSignal detects the ATS
+              Enter a company name or paste its careers-page URL. HireMe detects the ATS
               (Greenhouse, Lever, Ashby, SmartRecruiters, Recruitee) and pulls every open role —
               or crawls the page if it&apos;s custom. Kept roles are senior/technical across all industries.
             </CardDescription>

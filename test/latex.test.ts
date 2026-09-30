@@ -149,7 +149,7 @@ Old Content
     const result = spliceLatexContent(oldTemplate, model);
 
     expect(result).toContain('\\usepackage{tabularx}');
-    expect(result).toContain('\\begin{tabularx}{\\textwidth}{@{}X r@{}}');
+    expect(result).toContain('\\begin{tabularx}{\\linewidth}{@{}X r@{}}');
     expect(result).not.toContain('1.001\\textwidth');
   });
 });

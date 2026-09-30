@@ -12,9 +12,10 @@ export function cn(...inputs: ClassValue[]) {
 export function formatJobAge(
   postedAt?: string | null,
   ingestedAt?: string | null,
-  ageDays?: number | null
+  ageDays?: number | null,
+  lastSeenAt?: string | null
 ): string {
-  const ref = postedAt || ingestedAt;
+  const ref = postedAt || lastSeenAt || ingestedAt;
   if (!ref && (ageDays === null || ageDays === undefined)) return 'Recently';
 
   if (ref) {

@@ -1,12 +1,13 @@
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import path from 'path';
-// Provider-aware embedder (Ollama by default, or a cloud provider via EMBEDDING_PROVIDER).
+// Provider-aware embedder (Gemini by default via EMBEDDING_PROVIDER=gemini).
 // embeddings.ts is pure (no DB import), so importing it here has no schema side-effects.
 import { generateEmbeddings, generateEmbedding, embeddingToBlob, getEmbeddingInfo } from '../src/lib/embeddings';
 import { assertEmbeddingConsistent, recordEmbeddingSignature } from '../src/lib/embedding-signature';
 
-const db = new Database(path.join(process.cwd(), 'data', 'hiresignal.db'));
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(process.cwd(), 'data', 'hireme.db');
+const db = new Database(DB_PATH);
 sqliteVec.load(db);
 
 interface JobRow {
@@ -61,29 +62,51 @@ async function main() {
 
   for (let i = 0; i < jobs.length; i += BATCH) {
     const chunk = jobs.slice(i, i + BATCH);
-    try {
-      if (!useBatch) throw new Error('batch disabled');
-      const embs = await generateEmbeddings(chunk.map(jobText));
-      const write = db.transaction(() => {
-        chunk.forEach((j, k) => { if (embs[k]) updateStmt.run(embeddingToBlob(embs[k]), j.id); });
-      });
-      write();
-      count += chunk.length;
-    } catch (err) {
-      // Fall back to per-item embedding for this chunk (and all subsequent chunks).
-      if (useBatch) console.error(`  Batch embedding failed (${(err as Error).message.slice(0, 100)}) — using single-item mode`);
-      useBatch = false;
+    let success = false;
+    for (let retry = 0; retry < 3; retry++) {
+      try {
+        const embs = await generateEmbeddings(chunk.map(jobText));
+        const write = db.transaction(() => {
+          chunk.forEach((j, k) => { if (embs[k]) updateStmt.run(embeddingToBlob(embs[k]), j.id); });
+        });
+        write();
+        count += chunk.length;
+        success = true;
+        break;
+      } catch (err) {
+        console.warn(`  Batch ${Math.floor(i / BATCH) + 1} attempt ${retry + 1} paused on rate limit: ${(err as Error).message.slice(0, 80)}`);
+        await new Promise((r) => setTimeout(r, 4000 * (retry + 1)));
+      }
+    }
+    if (!success) {
+      // Fall back to single item
       for (const j of chunk) {
-        try { updateStmt.run(embeddingToBlob(await generateEmbedding(jobText(j))), j.id); count++; }
-        catch (e) { console.error(`  ✗ Job ${j.id}: ${(e as Error).message}`); }
+        try {
+          updateStmt.run(embeddingToBlob(await generateEmbedding(jobText(j))), j.id);
+          count++;
+          await new Promise((r) => setTimeout(r, 1000));
+        } catch (e) {
+          console.error(`  ✗ Job ${j.id}: ${(e as Error).message}`);
+        }
       }
     }
     console.log(`  Embedded ${Math.min(i + BATCH, jobs.length)}/${jobs.length} jobs`);
+    // Polite 2.5s pause between batches to stay well within Gemini's 15 req/min quota
+    if (i + BATCH < jobs.length) {
+      await new Promise((r) => setTimeout(r, 2500));
+    }
   }
 
   if (count > 0) recordEmbeddingSignature(db); // first embed establishes the corpus's embedding space
+  if (count === 0 && jobs.length > 0) {
+    console.error(`\n✗ Failed to embed any of the ${jobs.length} pending jobs.`);
+    console.error(`  Please verify your Gemini API key is set in Settings or GEMINI_API_KEY in .env.local.\n`);
+    db.close();
+    process.exit(1);
+  }
   console.log(`Embedded ${count} jobs total.`);
   db.close();
 }
 
 main();
+

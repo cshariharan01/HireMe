@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Loader2, Send, AlertTriangle, CheckCircle2, FileText, Wand2, Globe, Eye, EyeOff, ExternalLink, Check, RefreshCw } from 'lucide-react';
+import { Loader2, Send, AlertTriangle, CheckCircle2, FileText, Wand2, Globe, Eye, EyeOff, ExternalLink, Check, RefreshCw, Download, Square, X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { CoverLetterView } from '@/components/cover-letter-view';
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from '@/components/ui/dialog';
@@ -90,7 +90,7 @@ export function AutoApplyDialog({
   const [overrides, setOverrides] = useState<Record<string, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const [dryRun, setDryRun] = useState(false);
-  const [autoSubmit, setAutoSubmit] = useState(true);
+  const [autoSubmit, setAutoSubmit] = useState(false);
   const [submitResult, setSubmitResult] = useState<{
     ok: boolean;
     unconfirmed?: boolean;
@@ -147,7 +147,22 @@ export function AutoApplyDialog({
     const q = params.toString() ? `?${params.toString()}` : '';
     try {
       const r = await fetch(`/api/jobs/${jobId}/apply${q}`);
-      setPreview((await r.json()) as PreviewResponse);
+      const text = await r.text();
+      let data: PreviewResponse;
+      try {
+        data = JSON.parse(text) as PreviewResponse;
+      } catch {
+        const cleanMsg = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        throw new Error(
+          !r.ok
+            ? `Server error (${r.status}${r.statusText ? ' ' + r.statusText : ''}): ${cleanMsg.slice(0, 150) || 'Internal Error'}`
+            : 'Invalid preview response from server'
+        );
+      }
+      if (!r.ok && data?.error) {
+        throw new Error(data.error);
+      }
+      setPreview(data);
     } catch (e) {
       setPreview({ ok: false, strategy: 'unknown', error: e instanceof Error ? e.message : 'Preview failed' });
     } finally {
@@ -185,7 +200,12 @@ export function AutoApplyDialog({
       });
       if (!res.ok) throw new Error(`Preparation failed (${res.status})`);
       await loadPreview();
-      toast.success('Tailored résumé prepared');
+      setResumeSource((currentSource) => {
+        if (currentSource !== 'original') {
+          toast.success('Tailored résumé prepared');
+        }
+        return currentSource;
+      });
     } catch (e) {
       console.warn('Tailored resume prep error:', e);
     } finally {
@@ -218,47 +238,19 @@ export function AutoApplyDialog({
   const [resumePdfLoading, setResumePdfLoading] = useState(false);
 
   const openResumePdf = async () => {
-    // Open the new tab IMMEDIATELY inside the click handler — browsers block
-    // window.open calls that happen after an async await because the user-gesture
-    // context is lost. We point it at about:blank now and rewrite the URL once
-    // the PDF is ready.
-    const win = window.open('about:blank', '_blank');
-    if (win) {
-      // Never leave the user staring at a blank tab. Generating a tailored résumé is an LLM call
-      // plus a PDF render and can take a while; `about:blank` gives no clue that anything is
-      // happening, which reads as "it opened a broken page".
-      try {
-        win.document.write(
-          '<!doctype html><meta charset="utf-8"><title>Preparing your résumé…</title>' +
-            '<style>body{font:15px system-ui,sans-serif;margin:0;height:100vh;display:flex;' +
-            'align-items:center;justify-content:center;color:#57534e;background:#fafaf9}' +
-            '@media(prefers-color-scheme:dark){body{background:#1c1917;color:#d6d3d1}}</style>' +
-            '<div>Preparing your résumé…</div>',
-        );
-        win.document.close();
-      } catch { /* cross-origin or blocked — the tab will just stay blank briefly */ }
-    }
-    if (!win) {
-      // Popup blocked — fall back to inline download via anchor click
-      toast('Popup blocked — saving instead');
-    }
     setResumePdfLoading(true);
     try {
-      // Send the source the user actually picked. An empty body made the server ignore the
-      // uploaded PDF and generate a fresh AI variant every time — an LLM call and a Playwright
-      // render to show a document that already exists.
+      const src = resumeSource ?? preview?.resumeSource ?? 'original';
       const r = await fetch(`/api/jobs/${jobId}/resume.pdf`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source: resumeSource ?? preview?.resumeSource ?? 'original' }),
+        body: JSON.stringify({ source: src }),
       });
       if (!r.ok) throw new Error(`PDF render failed (HTTP ${r.status})`);
       const blob = await r.blob();
       const url = URL.createObjectURL(blob);
-      if (win) {
-        win.location.href = url;
-      } else {
-        // Anchor-click fallback when popups are blocked
+      const win = window.open(url, '_blank');
+      if (!win) {
         const a = document.createElement('a');
         a.href = url;
         a.download = 'resume.pdf';
@@ -266,9 +258,8 @@ export function AutoApplyDialog({
         a.click();
         document.body.removeChild(a);
       }
-      setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
     } catch (e) {
-      if (win) win.close();
       toast.error(e instanceof Error ? e.message : 'Failed to open PDF');
     } finally {
       setResumePdfLoading(false);
@@ -304,8 +295,59 @@ export function AutoApplyDialog({
     }
   }, [open, preview?.ok, preview?.tailoredReady, activeResumeSource, tailoringInProgress, prepareTailoredNow]);
 
+  // Monitor automation Chrome window for submission while review dialog is active
+  useEffect(() => {
+    if (!open || (!submitResult?.stoppedForReview && !submitResult?.ok)) return;
+
+    let isSubmittingHandled = false;
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/jobs/${jobId}/apply-status`);
+        if (!res.ok) return;
+        const text = await res.text();
+        let data: any;
+        try { data = JSON.parse(text); } catch { return; }
+        if (data.status === 'submitted' && !isSubmittingHandled) {
+          isSubmittingHandled = true;
+          clearInterval(interval);
+          toast.success('Application submitted successfully! Moved to Tracker.');
+          revalidateApplications();
+          revalidateMatches();
+          revalidateDashboardStats();
+          revalidateDigest();
+          if (onSubmitted) onSubmitted();
+          onOpenChange(false);
+        } else if (data.status === 'captcha') {
+          toast.warning('CAPTCHA detected in Chrome window. Please solve it to finish applying.');
+        }
+      } catch {
+        // ignore polling errors
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [open, submitResult?.stoppedForReview, submitResult?.ok, jobId, onSubmitted, onOpenChange]);
+
+  const handleStopApply = useCallback(async () => {
+    try {
+      await fetch('/api/apply/focus-browser', { method: 'DELETE' });
+    } catch {
+      /* ignore */
+    }
+    setSubmitting(false);
+    toast.message('Auto-apply stopped.');
+  }, []);
+
+  const handleOpenChange = useCallback((nextOpen: boolean) => {
+    if (!nextOpen && submitting) {
+      void handleStopApply();
+    }
+    onOpenChange(nextOpen);
+  }, [submitting, handleStopApply, onOpenChange]);
+
   const handleSubmit = useCallback(async () => {
-    if (!preview?.plan) return;
+    const isTailoredPending = activeResumeSource === 'tailored' && tailoringInProgress;
+    if (submitting || isTailoredPending || !preview?.plan) return;
     setSubmitting(true);
     setSubmitResult(null);
     toast.info(
@@ -321,11 +363,22 @@ export function AutoApplyDialog({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           overrides,
-          resumeSource: resumeSource ?? undefined,
+          resumeSource: activeResumeSource,
           autoSubmit,
         }),
       });
-      const json = await res.json();
+      const text = await res.text();
+      let json: any;
+      try {
+        json = JSON.parse(text);
+      } catch {
+        const cleanMsg = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        throw new Error(
+          !res.ok
+            ? `Server error (${res.status}${res.statusText ? ' ' + res.statusText : ''}): ${cleanMsg.slice(0, 150) || 'Internal Error'}`
+            : 'Invalid server response (not JSON)'
+        );
+      }
       setSubmitResult(json);
 
       const isAlreadyApplied = Boolean(
@@ -339,13 +392,20 @@ export function AutoApplyDialog({
       );
 
       if (json.stoppedForReview) {
-        toast.success('Form filled! Switch to the Chrome window to review & submit', { duration: 6000 });
+        toast.success('Form filled in Chrome! Job moved to Tracker.', { duration: 5000 });
         void fetch('/api/apply/focus-browser', { method: 'POST' }).catch(() => {});
         revalidateApplications();
         revalidateMatches();
         revalidateDashboardStats();
         revalidateDigest();
         if (!dryRun && onSubmitted) onSubmitted();
+
+        setTimeout(() => {
+          onOpenChange(false);
+          if (typeof window !== 'undefined' && window.location.pathname.startsWith('/job/')) {
+            router.push('/');
+          }
+        }, 1200);
       } else if (isAlreadyApplied) {
         toast.info('Already applied on platform! Moved to Tracker.');
         revalidateApplications();
@@ -408,13 +468,6 @@ export function AutoApplyDialog({
     }
   }, [preview, jobId, dryRun, autoSubmit, overrides, resumeSource, onSubmitted, onOpenChange, router]);
 
-  // Auto-start submission progress stages when dialog opens in autoSubmit mode
-  useEffect(() => {
-    if (open && autoSubmit && preview?.ok && !submitting && !submitResult && !loading) {
-      void handleSubmit();
-    }
-  }, [open, autoSubmit, preview?.ok, submitting, submitResult, loading, handleSubmit]);
-
   const relevantWarnings = useMemo(() => {
     return (preview?.warnings || []).filter(
       (w) =>
@@ -426,7 +479,7 @@ export function AutoApplyDialog({
   }, [preview?.warnings]);
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto">
         <div className="space-y-1.5">
           <DialogTitle className="flex items-center gap-2">
@@ -567,21 +620,30 @@ export function AutoApplyDialog({
                       </span>
                     )}
                     <span className="text-xs text-muted-foreground ml-auto tabular">{formatBytes(preview.plan.attachments.resume.sizeBytes)}</span>
-                    <button
-                      type="button"
-                      onClick={openResumePdf}
-                      disabled={resumePdfLoading || regeneratingResume || tailoringInProgress}
-                      className="inline-flex items-center gap-1 text-xs text-info hover:underline disabled:opacity-60"
-                      title="Open PDF in new tab"
+                    <a
+                      href={`/api/jobs/${jobId}/resume.pdf?source=${activeResumeSource}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 text-xs text-info hover:underline"
+                      title="Open PDF for review in tab next to it"
                     >
-                      {resumePdfLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <ExternalLink className="h-3 w-3" />}
+                      <ExternalLink className="h-3 w-3" />
                       View
-                    </button>
+                    </a>
+                    <a
+                      href={`/api/jobs/${jobId}/resume.pdf?source=${activeResumeSource}`}
+                      download={`${(preview.plan?.company || 'Resume').replace(/[^a-z0-9]+/gi, '_')}_Resume.pdf`}
+                      className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground hover:underline ml-1"
+                      title="Download PDF file"
+                    >
+                      <Download className="h-3 w-3" />
+                      Download
+                    </a>
                     {activeResumeSource === 'tailored' && (
                       <button
                         type="button"
                         onClick={regenerateTailoredResume}
-                        disabled={resumePdfLoading || regeneratingResume || tailoringInProgress}
+                        disabled={regeneratingResume || tailoringInProgress}
                         className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground hover:underline disabled:opacity-60 ml-1"
                         title="Regenerate tailored résumé"
                       >
@@ -767,23 +829,55 @@ export function AutoApplyDialog({
                 )}
                 {submitResult.error && <p className="text-xs text-foreground/85">{submitResult.error}</p>}
                 
-                {/* 1-click Move to Tracker action */}
-                {(submitResult.stoppedForReview || submitResult.readyForSubmit || submitResult.ok || submitResult.unconfirmed || submitResult.alreadyApplied) && !dryRun && (
-                  <div className="pt-2 mt-2 flex items-center justify-between gap-2 border-t border-border/50">
-                    <p className="text-xs text-muted-foreground">
-                      {submitResult.stoppedForReview ? 'Submitted in Chrome? Move to Tracker:' : 'Track this application:'}
-                    </p>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="default"
-                      className="h-8 text-xs gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-medium shadow-sm"
-                      disabled={markingApplied}
-                      onClick={handleMarkApplied}
-                    >
-                      {markingApplied ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
-                      Mark as Applied & Move to Tracker
-                    </Button>
+                {/* Chrome Window controls */}
+                {(submitResult.stoppedForReview || preview.strategy === 'browser' || preview.strategy === 'linkedin' || preview.strategy === 'naukri') && (
+                  <div className="pt-2 mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-border/50">
+                    <div className="flex items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={async () => {
+                          try {
+                            await fetch('/api/apply/focus-browser', { method: 'POST' });
+                            toast.success('Brought Chrome to front');
+                          } catch {}
+                        }}
+                        className="h-7 text-[11px] gap-1 text-info hover:text-info"
+                      >
+                        <Globe className="h-3 w-3" />
+                        Bring Chrome to Front
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={async () => {
+                          try {
+                            await fetch('/api/apply/focus-browser', { method: 'DELETE' });
+                            toast.success('Closed Chrome automation window');
+                          } catch {}
+                        }}
+                        className="h-7 text-[11px] gap-1 text-destructive hover:text-destructive hover:bg-destructive/10"
+                      >
+                        <X className="h-3 w-3" />
+                        Close Chrome Window
+                      </Button>
+                    </div>
+
+                    {(submitResult.stoppedForReview || submitResult.readyForSubmit || submitResult.ok || submitResult.unconfirmed || submitResult.alreadyApplied) && !dryRun && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="default"
+                        className="h-8 text-xs gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-medium shadow-sm ml-auto"
+                        disabled={markingApplied}
+                        onClick={handleMarkApplied}
+                      >
+                        {markingApplied ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+                        Mark as Applied & Move to Tracker
+                      </Button>
+                    )}
                   </div>
                 )}
 
@@ -838,12 +932,24 @@ export function AutoApplyDialog({
                     </a>
                   </Button>
                 )}
-                <Button variant="ghost" onClick={() => onOpenChange(false)} disabled={submitting}>
-                  Cancel
-                </Button>
+                {submitting ? (
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={handleStopApply}
+                    className="h-8 text-xs gap-1.5 font-semibold"
+                  >
+                    <Square className="h-3 w-3 fill-current" />
+                    Stop Auto Apply
+                  </Button>
+                ) : (
+                  <Button variant="ghost" onClick={() => handleOpenChange(false)}>
+                    Cancel
+                  </Button>
+                )}
                 <Button
                   onClick={handleSubmit}
-                  disabled={submitting || !preview.plan.attachments.resume || preview.alreadyApplied}
+                  disabled={submitting || !preview.plan.attachments.resume || preview.alreadyApplied || (activeResumeSource === 'tailored' && tailoringInProgress)}
                   variant={dryRun ? 'outline' : 'default'}
                 >
                   {submitting

@@ -29,13 +29,30 @@ const FULL = ['ingest:linkedin', 'ingest:naukri', 'embed', 'prune', 'verify:link
 const RATE = ['evaluate:top'];
 
 // A run whose heartbeat (updated_at) is older than this is considered dead, not running.
-const STALE_MS = 120_000;
+const STALE_MS = 300_000;
 
 interface SyncRow {
   id: number; mode: string; status: string; started_at: string; finished_at: string | null;
   steps_done: number; steps_total: number; error: string | null;
   current_step: string | null; step_index: number | null; steps_json: string | null;
   log_tail: string | null; updated_at: string | null; pid: number | null; cancel_requested: number | null;
+  initial_dashboard_matches: number | null; scanned_direct_count: number | null;
+}
+
+function ensureSyncRunsColumns() {
+  for (const spec of [
+    'current_step TEXT',
+    'step_index INTEGER DEFAULT 0',
+    'steps_json TEXT',
+    'log_tail TEXT',
+    'updated_at DATETIME',
+    'pid INTEGER',
+    'cancel_requested INTEGER DEFAULT 0',
+    'initial_dashboard_matches INTEGER DEFAULT 0',
+    'scanned_direct_count INTEGER DEFAULT 0',
+  ]) {
+    try { db.exec(`ALTER TABLE sync_runs ADD COLUMN ${spec}`); } catch (e) { if (!(e instanceof Error) || !/duplicate column/i.test(e.message)) throw e; }
+  }
 }
 
 // SQLite UTC "YYYY-MM-DD HH:MM:SS" → epoch ms
@@ -46,6 +63,7 @@ function sqlMs(s: string | null): number {
 }
 
 function latestRow(): SyncRow | undefined {
+  ensureSyncRunsColumns();
   try { return db.prepare('SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1').get() as SyncRow | undefined; }
   catch { return undefined; }
 }
@@ -63,12 +81,15 @@ export function startSync(mode: SyncMode): { ok: boolean; error?: string } {
     QUICK;
   const steps = names.map((s) => ({ script: s, label: STEP_DEFS[s] || s, status: 'pending' as StepStatus }));
 
+  const counts = dbCounts();
+  const initialMatches = counts.dashboardMatches;
+
   let runId: number;
   try {
     const info = db.prepare(
-      `INSERT INTO sync_runs (mode, status, started_at, updated_at, steps_total, step_index, steps_json, log_tail, cancel_requested)
-       VALUES (?, 'running', datetime('now'), datetime('now'), ?, 0, ?, '[]', 0)`
-    ).run(mode, steps.length, JSON.stringify(steps));
+      `INSERT INTO sync_runs (mode, status, started_at, updated_at, steps_total, step_index, steps_json, log_tail, cancel_requested, initial_dashboard_matches, scanned_direct_count)
+       VALUES (?, 'running', datetime('now'), datetime('now'), ?, 0, ?, '[]', 0, ?, 0)`
+    ).run(mode, steps.length, JSON.stringify(steps), initialMatches);
     runId = Number(info.lastInsertRowid);
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : 'Failed to create sync run' };
@@ -115,14 +136,24 @@ export function cancelSync(): boolean {
   return true;
 }
 
-interface DbCounts { active: number; embedded: number; evaluated: number; }
+interface DbCounts { active: number; embedded: number; evaluated: number; dashboardMatches: number; }
 function dbCounts(): DbCounts {
   try {
     const active = (db.prepare("SELECT COUNT(*) n FROM job_postings WHERE expired_at IS NULL AND (url_status IS NULL OR url_status != 'dead')").get() as { n: number }).n;
     const embedded = (db.prepare('SELECT COUNT(*) n FROM job_postings WHERE embedding IS NOT NULL AND expired_at IS NULL').get() as { n: number }).n;
     const evaluated = (db.prepare('SELECT COUNT(*) n FROM job_evaluations').get() as { n: number }).n;
-    return { active, embedded, evaluated };
-  } catch { return { active: 0, embedded: 0, evaluated: 0 }; }
+    let dashboardMatches = active;
+    try {
+      const { buildMatchesPage } = require('./matches-page');
+      const page = buildMatchesPage({ limit: 1, applyScoreFilter: true });
+      if (typeof page?.totalFiltered === 'number') {
+        dashboardMatches = page.totalFiltered;
+      }
+    } catch {
+      dashboardMatches = active;
+    }
+    return { active, embedded, evaluated, dashboardMatches };
+  } catch { return { active: 0, embedded: 0, evaluated: 0, dashboardMatches: 0 }; }
 }
 
 function lastSyncedAt(): string | null {
@@ -159,6 +190,8 @@ export function getSyncStatus() {
       error,
       logTail,
       startedAt: row.started_at ? new Date(row.started_at.replace(' ', 'T') + 'Z').toISOString() : undefined,
+      initialDashboardMatches: row.initial_dashboard_matches ?? counts.dashboardMatches,
+      scannedDirectCount: row.scanned_direct_count ?? 0,
     },
     lastSyncedAt: lastSynced,
     counts,

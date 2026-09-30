@@ -35,9 +35,14 @@ export async function POST(_req: Request, props: { params: Promise<{ id: string 
       return NextResponse.json({ formatted: raw, cached: false, skipped: true });
     }
 
-    const formatted = await formatJobDescription(raw, job.title, job.company);
-    db.prepare('UPDATE job_postings SET description_formatted = ? WHERE id = ?').run(formatted, jobId);
-    return NextResponse.json({ formatted, cached: false });
+    try {
+      const formatted = await formatJobDescription(raw, job.title, job.company);
+      db.prepare('UPDATE job_postings SET description_formatted = ? WHERE id = ?').run(formatted, jobId);
+      return NextResponse.json({ formatted, cached: false });
+    } catch (err) {
+      console.warn('LLM format failed, returning fallback formatted description:', err);
+      return NextResponse.json({ formatted: raw, cached: false, fallback: true });
+    }
   } catch (error) {
     console.error('JD format error:', error);
     return NextResponse.json(

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import db from '@/lib/db';
 import { extractPostingFacts } from '@/lib/posting-facts';
 import { getRankedMatches, getRankedMatchById } from '@/lib/matches';
+import { getActiveOwnerId } from '@/lib/apply/screening-owner';
 
 interface JobRow {
   id: number;
@@ -31,9 +32,13 @@ interface ApplicationRow {
 }
 
 export async function GET(request: NextRequest, props: { params: Promise<{ jobId: string }> }) {
-  const params = await props.params;
   try {
-    const jobId = parseInt(params.jobId);
+    const params = props?.params ? await props.params : (props as any)?.params;
+    const rawId = params?.jobId ?? (params as any)?.id;
+    const jobId = parseInt(rawId, 10);
+    if (!jobId || isNaN(jobId)) {
+      return NextResponse.json({ error: 'Invalid or missing jobId' }, { status: 400 });
+    }
 
     const job = db.prepare('SELECT * FROM job_postings WHERE id = ?').get(jobId) as JobRow | undefined;
     if (!job) {
@@ -41,33 +46,26 @@ export async function GET(request: NextRequest, props: { params: Promise<{ jobId
     }
 
     // Score breakdown comes from the shared ranked-match cache.
-    //
-    // IMPORTANT: read the DEFAULT pool first — the same options /api/matches uses. `retrieval` is
-    // normalised against the best observed RRF *within a pool*, so the identical job scores
-    // differently in a differently-filtered pool. Reading only the all-inclusive view made the
-    // detail header show 78 for a job the list showed as 84, which is exactly the kind of
-    // inconsistency this scoring work exists to remove.
-    //
-    // Fall back to the all-inclusive pool so a hidden / expired / already-applied job (e.g. opened
-    // from /tracker) still resolves — its score then comes from that pool, which is the only one
-    // it appears in.
-    // Map lookup against the memoised payload — no 1.6MB parse, no linear scan over ~1200 rows.
-    let matchResult = getRankedMatchById({ includeHidden: false, includeExpired: false }, jobId);
-    if (!matchResult) {
-      // cachedOnly: this pool is only needed for a hidden/expired/applied job, and computing it
-      // synchronously added a consistent 4.5s to the detail route. If it isn't warm yet the page
-      // renders without a fit score and the pool fills in the background.
-      matchResult = getRankedMatchById(
-        { includeHidden: true, includeExpired: true, includeApplied: true, cachedOnly: true },
-        jobId,
-      );
+    // Wrap in try/catch so a match cache anomaly never blocks basic job detail display.
+    let matchResult: any = null;
+    try {
+      matchResult = getRankedMatchById({ includeHidden: false, includeExpired: false }, jobId);
+      if (!matchResult) {
+        matchResult = getRankedMatchById(
+          { includeHidden: true, includeExpired: true, includeApplied: true, cachedOnly: true },
+          jobId,
+        );
+      }
+    } catch (e) {
+      console.warn('[api/matches/[jobId]] match lookup error:', e);
     }
 
+    const activeOwner = getActiveOwnerId();
     const application = db.prepare(
       `SELECT status, cover_letter, resume_variant, notes, applied_at,
               applied_date, recruiter_name, recruiter_contact, next_follow_up_at, last_status_change_at
-       FROM my_applications WHERE job_id = ?`
-    ).get(jobId) as ApplicationRow | undefined;
+       FROM my_applications WHERE job_id = ? AND (owner_id = ? OR (owner_id IS NULL AND ? = 'default'))`
+    ).get(jobId, activeOwner, activeOwner) as ApplicationRow | undefined;
 
     const facts = extractPostingFacts(job.description || '', job.location || '', job.title || '', job.url || '');
 
@@ -94,6 +92,7 @@ export async function GET(request: NextRequest, props: { params: Promise<{ jobId
     });
   } catch (error) {
     console.error('Job detail error:', error);
-    return NextResponse.json({ error: 'Failed to fetch job details' }, { status: 500 });
+    const msg = error instanceof Error ? error.message : String(error);
+    return NextResponse.json({ error: `Failed to fetch job details (${msg})` }, { status: 500 });
   }
 }

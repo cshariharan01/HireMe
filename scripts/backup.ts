@@ -22,7 +22,7 @@ const projectDir = process.cwd();
 const projectName = path.basename(projectDir);
 const parentDir = path.dirname(projectDir);
 const backupsDir = path.join(projectDir, 'backups');
-const dbPath = path.join(projectDir, 'data', 'hiresignal.db');
+const dbPath = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(projectDir, 'data', 'hireme.db');
 
 function stamp(): string {
   const d = new Date();

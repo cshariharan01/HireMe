@@ -1,16 +1,16 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { GoogleGenerativeAI, SchemaType, type Schema } from '@google/generative-ai';
-import db from './db';
+import db, { addSystemNotification } from './db';
 import { askText as freewayAsk, freewayBaseUrl, freewayTimeoutFor, isFreewayEnabled, pointsAtFreeway } from './freeway';
 import { extractJdKeywords, matchKeywordsInText, type JdKeyword } from './jd-keywords';
+import { recordLLMUsage } from './llm-models';
 
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
-const OLLAMA_CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL || 'llama3.2';
+
 const ANTHROPIC_MODEL_ENV = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
-const GEMINI_MODEL_ENV = process.env.GEMINI_MODEL || 'gemini-1.5-flash-latest';
-const GEMINI_CREATIVE_MODEL_ENV = process.env.GEMINI_CREATIVE_MODEL || 'gemini-2.5-pro';
-/** Where the creative lane lands when Pro is rate-limited or unavailable. Verified working. */
-const GEMINI_CREATIVE_FALLBACK_MODEL = process.env.GEMINI_CREATIVE_FALLBACK_MODEL || 'gemini-3.6-flash';
+const GEMINI_MODEL_ENV = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const GEMINI_CREATIVE_MODEL_ENV = process.env.GEMINI_CREATIVE_MODEL || 'gemini-3.8-flash';
+/** Where the creative lane lands when primary model is rate-limited or unavailable. Verified working. */
+const GEMINI_CREATIVE_FALLBACK_MODEL = process.env.GEMINI_CREATIVE_FALLBACK_MODEL || 'gemini-3.8-flash';
 
 // ---------------------------------------------------------------------------
 // Provider resolution: DB-first (user-configured via /settings) with env fallback.
@@ -20,16 +20,16 @@ const GEMINI_CREATIVE_FALLBACK_MODEL = process.env.GEMINI_CREATIVE_FALLBACK_MODE
 
 // 'freeway' is env-sourced ONLY (see freewayEnvConfig) — `llm_providers.kind` has a CHECK
 // constraint that predates it, so there is never a DB row with this kind.
-export type ProviderKind = 'gemini' | 'openai' | 'anthropic' | 'openai-compatible' | 'ollama' | 'freeway';
+export type ProviderKind = 'gemini' | 'openai' | 'anthropic' | 'openai-compatible' | 'ollama' | 'freeway'; // 'ollama' kept for DB compatibility only — ignored at runtime
 
 interface ProviderConfig {
-  id?: number;            // llm_providers row id (for cooldown updates); Ollama-from-env has none
+  id?: number;            // llm_providers row id (for cooldown updates)
   kind: ProviderKind;
   model: string;
   apiKey: string | null;
   baseUrl: string | null;
   source: 'db' | 'env';
-  isActive?: boolean;     // the user's explicit /settings choice — keepOllamaInChain honours it
+  isActive?: boolean;     // the user's explicit /settings choice
 }
 
 interface ProviderCache {
@@ -39,6 +39,23 @@ interface ProviderCache {
   ts: number;
 }
 let providerCache: ProviderCache | null = null;
+
+export const GEMINI_MODEL_POOL = [
+  'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-flash-latest',
+  'gemini-flash-lite-latest',
+];
+
+export interface GeminiTestResult {
+  ok: boolean;
+  reason?: string;
+  simpleReason?: string;
+}
+
+const modelVerificationCache = new Map<string, { ok: boolean; ts: number; reason?: string; simpleReason?: string }>();
 
 function resolveProviderConfig(): ProviderConfig {
   // Try DB-active provider first
@@ -65,11 +82,11 @@ function resolveProviderConfig(): ProviderConfig {
   if (process.env.ANTHROPIC_API_KEY) {
     return { kind: 'anthropic', model: ANTHROPIC_MODEL_ENV, apiKey: process.env.ANTHROPIC_API_KEY, baseUrl: null, source: 'env' };
   }
-  // Freeway before Ollama: with no cloud key configured, a gateway over ~32 free-tier
-  // providers is a far better default than local llama3.2 for rating / generation work.
+  // Freeway: with no cloud key configured, use the local gateway over ~32 free-tier providers.
   const freeway = freewayEnvConfig();
   if (freeway) return freeway;
-  return { kind: 'ollama', model: OLLAMA_CHAT_MODEL, apiKey: null, baseUrl: OLLAMA_BASE_URL, source: 'env' };
+  // No provider configured at all — throw a clear error rather than silently using Ollama.
+  throw new Error('No LLM provider configured. Add a Gemini API key in Settings or set GEMINI_API_KEY in .env.local.');
 }
 
 function getProvider(): ProviderCache {
@@ -139,6 +156,7 @@ export function invalidateProviderCache() {
   providerCache = null;
   creativeProviderCache = null;
   creativeGeminiCache = null;
+  modelVerificationCache.clear();
 }
 
 // Tracks which provider actually produced the last successful result (set by callWithProviders),
@@ -151,13 +169,13 @@ export function getActiveProviderName(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Provider fallback chain — rotate active → other configured keys → Ollama (always last).
+// Provider fallback chain — rotate active → other configured keys → Freeway.
 // On a quota/429 error, put that provider on cooldown (skipped by buildProviderChain until it
 // expires) and move to the next. This makes on-demand AI degrade gracefully instead of 429-ing.
 // ---------------------------------------------------------------------------
 
 function isQuotaError(msg: string): boolean {
-  return /429|quota|rate.?limit|RESOURCE_EXHAUSTED|Too Many Requests|exceeded your current quota/i.test(msg);
+  return /429|500|502|503|quota|rate.?limit|RESOURCE_EXHAUSTED|Too Many Requests|exceeded your current quota|high demand|Service Unavailable|overloaded|Error fetching from https:\/\/generativelanguage\.googleapis\.com|fetch failed|ECONNRESET|ETIMEDOUT/i.test(msg);
 }
 
 /**
@@ -191,69 +209,29 @@ function markCooldown(id: number | undefined, msg: string): void {
   }
 }
 
-function ollamaEnvConfig(): ProviderConfig {
-  return {
-    kind: 'ollama',
-    model: process.env.OLLAMA_CHAT_MODEL || 'llama3.2',
-    apiKey: null,
-    baseUrl: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434',
-    source: 'env',
-  };
-}
-
 // Freeway — the local AI gateway (~32 free-tier providers, own failover). Env-sourced only:
 // `llm_providers.kind`'s CHECK constraint predates this kind, so it is never a DB row. It sits
-// between the user's own keys and Ollama, which is the whole point — when a cloud key hits its
-// daily quota we degrade to another *capable* model rather than to a small local one.
-// To make Freeway PRIMARY instead, add it in /settings as an "openai-compatible" provider
-// pointed at <base>/v1 (Quick preset "Freeway (local gateway)").
+// between the user's own keys when a cloud key hits its daily quota.
 function freewayEnvConfig(): ProviderConfig | null {
   if (!isFreewayEnabled()) return null;
   return {
     kind: 'freeway',
-    // 'auto' = let Freeway route to whatever is alive and has quota (it ignores unknown names
-    // anyway, so this string is never load-bearing). Pin with FREEWAY_MODEL if ever needed.
     model: process.env.FREEWAY_MODEL || 'auto',
-    apiKey: null,      // read from env inside src/lib/freeway.ts, never stored in the DB
+    apiKey: null,
     baseUrl: freewayBaseUrl(),
     source: 'env',
   };
 }
 
-// Should local Ollama be kept as the final chat fallback?
-//
-// It used to be unconditional, from when it was the only free option. Now that Freeway sits ahead
-// of it (a gateway over ~32 free-tier providers), a local 7B model is both redundant and worse
-// than useless for this workload: it can't hold the evaluation JSON schema together, and a
-// half-empty rating is more harmful than no rating because it looks authoritative and stops the
-// job being re-evaluated. So it is kept ONLY when it is genuinely wanted:
-//   1. the user activated an Ollama row in /settings (explicit choice), or
-//   2. it is the only provider available at all (nothing else configured), or
-//   3. OLLAMA_CHAT_FALLBACK=1 (opt back into the old behaviour).
-// Embeddings are unaffected — those ALWAYS go to Ollama (src/lib/embeddings.ts); Freeway has no
-// embeddings endpoint. This only governs chat/rating/generation.
-function keepOllamaInChain(ollamaCfg: ProviderConfig, otherProviders: ProviderConfig[]): boolean {
-  if (process.env.OLLAMA_CHAT_FALLBACK === '1') return true;
-  if (ollamaCfg.isActive) return true;
-  return otherProviders.length === 0;
-}
-
-// Tail of every chain: Freeway (if configured) then Ollama, in that order, always last.
-// `dbProviders` are the DB rows already in the chain — if the user has registered Freeway in
-// /settings (kind='freeway', or an openai-compatible row pointed at it), the env entry must not
-// queue it a second time. The DB row wins, since its key/model are what the user configured.
-function chainTail(ollamaCfg: ProviderConfig, dbProviders: ProviderConfig[] = []): ProviderConfig[] {
+// Append Freeway to chain if not already present.
+function chainTail(dbProviders: ProviderConfig[] = []): ProviderConfig[] {
   const alreadyQueued = dbProviders.some((c) => c.kind === 'freeway' || pointsAtFreeway(c.baseUrl));
   const freeway = alreadyQueued ? null : freewayEnvConfig();
-  const others = [...dbProviders, ...(freeway ? [freeway] : [])];
-  const tail: ProviderConfig[] = freeway ? [freeway] : [];
-  if (keepOllamaInChain(ollamaCfg, others)) tail.push(ollamaCfg);
-  return tail;
+  return freeway ? [freeway] : [];
 }
 
-// Build the ordered provider chain: DB rows not on cooldown (active-first), then Freeway, with
-// Ollama forced to the end (DB ollama row if present, else the env config). Falls back to env
-// resolution on DB error / empty result.
+// Build the ordered provider chain: DB rows not on cooldown (active-first), then Freeway.
+// Ollama DB rows are silently skipped — Ollama is no longer supported.
 function buildProviderChain(): ProviderConfig[] {
   try {
     const rows = db
@@ -264,10 +242,10 @@ function buildProviderChain(): ProviderConfig[] {
 
     if (rows.length === 0) return envOnlyChain();
 
-    const nonOllama: ProviderConfig[] = [];
-    let ollamaFromDb: ProviderConfig | null = null;
+    const dbProviders: ProviderConfig[] = [];
     for (const r of rows) {
-      const cfg: ProviderConfig = {
+      if (r.kind === 'ollama') continue; // Ollama removed — skip any legacy DB rows
+      dbProviders.push({
         id: r.id,
         kind: r.kind,
         model: r.model,
@@ -275,25 +253,25 @@ function buildProviderChain(): ProviderConfig[] {
         baseUrl: r.base_url,
         source: 'db',
         isActive: r.is_active === 1,
-      };
-      if (r.kind === 'ollama') ollamaFromDb = cfg; // move to end
-      else nonOllama.push(cfg);
+      });
     }
-    // Ollama is ALWAYS the last element, with Freeway immediately before it.
-    return [...nonOllama, ...chainTail(ollamaFromDb ?? ollamaEnvConfig(), nonOllama)];
+    if (dbProviders.length === 0) return envOnlyChain();
+    return [...dbProviders, ...chainTail(dbProviders)];
   } catch {
     return envOnlyChain();
   }
 }
 
-// No usable DB rows (empty table or DB error): resolve from env, then append the tail.
-// `resolveProviderConfig` may itself return Freeway or Ollama, so don't duplicate either.
+// No usable DB rows (empty table or DB error): resolve from env, then append Freeway tail.
 function envOnlyChain(): ProviderConfig[] {
-  const primary = resolveProviderConfig();
-  // Ollama resolved as primary means nothing else is configured — it's all we have, so keep it.
-  if (primary.kind === 'ollama') return [primary];
-  if (primary.kind === 'freeway') return keepOllamaInChain(ollamaEnvConfig(), [primary]) ? [primary, ollamaEnvConfig()] : [primary];
-  return [primary, ...chainTail(ollamaEnvConfig(), [primary])];
+  try {
+    const primary = resolveProviderConfig();
+    if (primary.kind === 'freeway') return [primary];
+    return [primary, ...chainTail([primary])];
+  } catch {
+    // No provider configured at all — return empty; callWithProviders will throw a clear error.
+    return [];
+  }
 }
 
 /**
@@ -350,6 +328,139 @@ function withLlmTimeout<T>(work: Promise<T>, label: string, ms = LLM_CALL_TIMEOU
 }
 
 /**
+ * Fast ping test for a specific Gemini model before proceeding with heavy work.
+ * Returns ok: true if healthy, or ok: false with a simple reason if rate-limited / high-demand / quota exceeded.
+ */
+export async function testGeminiModel(modelName: string, apiKey: string, skipCache = false): Promise<GeminiTestResult> {
+  if (!skipCache) {
+    const cached = modelVerificationCache.get(modelName);
+    if (cached && Date.now() - cached.ts < 45_000) {
+      return { ok: cached.ok, reason: cached.reason, simpleReason: cached.simpleReason };
+    }
+  }
+
+  try {
+    const client = new GoogleGenerativeAI(apiKey);
+    const model = client.getGenerativeModel({
+      model: modelName,
+      generationConfig: { maxOutputTokens: 2 },
+    });
+    await withLlmTimeout(model.generateContent('ping'), `ping ${modelName}`, 7000);
+    const res = { ok: true };
+    modelVerificationCache.set(modelName, { ok: true, ts: Date.now() });
+    return res;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    let simpleReason = 'failed limit check';
+    if (/503|high demand|overloaded|Service Unavailable/i.test(msg)) {
+      simpleReason = 'is experiencing high demand';
+    } else if (/429|quota|rate.?limit|RESOURCE_EXHAUSTED|Too Many Requests|exceeded your current quota/i.test(msg)) {
+      simpleReason = 'reached quota limit';
+    } else if (/404|not found|no longer available|discontinued/i.test(msg)) {
+      simpleReason = 'is discontinued or unavailable';
+    } else if (/timed out/i.test(msg)) {
+      simpleReason = 'response timed out';
+    }
+
+    const res = { ok: false, reason: msg, simpleReason };
+    modelVerificationCache.set(modelName, { ok: false, ts: Date.now(), reason: msg, simpleReason });
+    return res;
+  }
+}
+
+/**
+ * Dynamically switch active Gemini model to the next available working model from the pool.
+ * Updates llm_providers table, invalidates cache, and notifies the UI with a simple explanation.
+ */
+export async function switchGeminiModel(
+  currentModel: string,
+  apiKey: string,
+  reason?: string,
+): Promise<{ model: string; newModel: string; switched: boolean; message?: string }> {
+  const candidates = GEMINI_MODEL_POOL.filter((m) => m !== currentModel);
+  let workingModel: string | null = null;
+  const detectedReason = reason || 'reached quota limit';
+
+  console.log(`[llm] Testing candidate Gemini models to replace ${currentModel} (${detectedReason})...`);
+
+  for (const candidate of candidates) {
+    const cached = modelVerificationCache.get(candidate);
+    if (cached && !cached.ok && Date.now() - cached.ts < 60_000) {
+      continue;
+    }
+
+    const testRes = await testGeminiModel(candidate, apiKey, true);
+    if (testRes.ok) {
+      workingModel = candidate;
+      break;
+    } else {
+      console.warn(`[llm] Candidate model ${candidate} probe failed: ${testRes.simpleReason}`);
+    }
+  }
+
+  if (!workingModel) {
+    for (const candidate of candidates) {
+      const testRes = await testGeminiModel(candidate, apiKey, true);
+      if (testRes.ok) {
+        workingModel = candidate;
+        break;
+      }
+    }
+  }
+
+  if (!workingModel) {
+    console.error('[llm] All Gemini candidate models failed limit check.');
+    return { model: currentModel, newModel: currentModel, switched: false };
+  }
+
+  const simpleMsg = `Switched model to ${workingModel}: ${currentModel} ${detectedReason}.`;
+  console.log(`[llm] ${simpleMsg}`);
+
+  try {
+    db.prepare("UPDATE llm_providers SET model = ? WHERE kind = 'gemini'").run(workingModel);
+  } catch (e) {
+    console.error('[llm] Failed to update llm_providers model:', e);
+  }
+
+  invalidateProviderCache();
+  addSystemNotification('model_switch', simpleMsg);
+
+  return { model: workingModel, newModel: workingModel, switched: true, message: simpleMsg };
+}
+
+/**
+ * Pre-flight test for Gemini model before starting any major process.
+ * If the current model exceeds its limit or is unhealthy, dynamically switches to a working model.
+ */
+export async function ensureWorkingGeminiModel(forceCheck = false): Promise<{ model: string; switched: boolean; message?: string }> {
+  let key: string | null = null;
+  let currentModel = 'gemini-3.8-flash';
+
+  try {
+    const row = db
+      .prepare("SELECT model, api_key FROM llm_providers WHERE kind = 'gemini' AND api_key IS NOT NULL ORDER BY is_active DESC LIMIT 1")
+      .get() as { model: string; api_key: string } | undefined;
+    if (row) {
+      currentModel = row.model || currentModel;
+      key = row.api_key;
+    }
+  } catch { /* DB might be initializing */ }
+
+  if (!key) key = process.env.GEMINI_API_KEY || null;
+  if (!key) {
+    return { model: currentModel, switched: false };
+  }
+
+  const testRes = await testGeminiModel(currentModel, key, forceCheck);
+  if (testRes.ok) {
+    return { model: currentModel, switched: false };
+  }
+
+  console.warn(`[llm] Gemini model ${currentModel} limit check failed (${testRes.simpleReason}) — dynamically switching model...`);
+  return await switchGeminiModel(currentModel, key, testRes.simpleReason);
+}
+
+/**
  * Outer ceiling for one provider attempt.
  *
  * This must sit ABOVE whatever timeout the provider enforces itself, or the outer race pre-empts
@@ -370,7 +481,7 @@ function ceilingFor(cfg: { kind: string }, maxTokens?: number, override?: number
 
 // Run `run` against each provider in the chain until one succeeds. Quota failures cool the
 // offending provider down; any failure logs and rotates to the next. Throws the last error
-// only if every provider (including Ollama) fails.
+// only if every provider fails.
 async function callWithProviders<T>(
   run: (cfg: ProviderConfig) => Promise<T>,
   /**
@@ -391,8 +502,15 @@ async function callWithProviders<T>(
   let lastErr: unknown;
   for (const cfg of chain) {
     try {
+      if (cfg.kind === 'gemini') {
+        const check = await ensureWorkingGeminiModel();
+        if (check.switched) {
+          cfg.model = check.model;
+        }
+      }
       const r = await withLlmTimeout(run(cfg), `${cfg.kind} (${cfg.model})`, ceilingFor(cfg, maxTokens, timeoutMs));
       lastUsedProviderKind = cfg.kind;
+      recordLLMUsage(cfg.kind, cfg.model, maxTokens || 200, cfg.id);
       return r;
     } catch (e) {
       lastErr = e;
@@ -425,15 +543,42 @@ async function runStructured(
   switch (cfg.kind) {
     case 'gemini': {
       if (!cfg.apiKey) throw new Error('Gemini provider missing api_key');
-      const model = new GoogleGenerativeAI(cfg.apiKey).getGenerativeModel({
-        model: cfg.model,
-        generationConfig: {
-          responseMimeType: 'application/json',
-          responseSchema: geminiSchema,
-          maxOutputTokens: Math.max(maxTokens, 8192),
-        },
-      });
-      const result = await model.generateContent(prompt);
+      const check = await ensureWorkingGeminiModel();
+      let targetModel = check.switched ? check.model : (cfg.model || 'gemini-3.8-flash');
+      const client = new GoogleGenerativeAI(cfg.apiKey);
+      const makeModel = (m: string) =>
+        client.getGenerativeModel({
+          model: m,
+          generationConfig: {
+            responseMimeType: 'application/json',
+            responseSchema: geminiSchema,
+            maxOutputTokens: Math.max(maxTokens, 8192),
+          },
+        });
+      let result;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          result = await makeModel(targetModel).generateContent(prompt);
+          break;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (isQuotaError(msg) || /503|high demand|overloaded/i.test(msg)) {
+            const reason = /503|high demand/i.test(msg) ? 'is experiencing high demand' : 'reached quota limit';
+            const switched = await switchGeminiModel(targetModel, cfg.apiKey, reason);
+            if (switched.switched) {
+              targetModel = switched.newModel;
+              console.log(`[runStructured] Auto-switched to ${targetModel}. Retrying structured call...`);
+              continue;
+            }
+          }
+          if (/503|high demand|temporar|429|Service Unavailable|overloaded/i.test(msg) && attempt < 3) {
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;
+          }
+          throw err;
+        }
+      }
+      if (!result) throw new Error(`Gemini ${targetModel} structured call failed`);
       text = result.response.text();
       break;
     }
@@ -460,17 +605,15 @@ async function runStructured(
     case 'freeway': {
       // Freeway never forwards response_format / output_config to the upstream provider, so
       // there is no native structured-output path here — coach the schema in the prompt and let
-      // the caller regex-extract the object, exactly as the Ollama path does.
+      // the caller regex-extract the object (same as the Freeway path).
       text = await freewayAsk(
         `${prompt}${schemaToShapeHint(anthropicSchema)}\n\nReturn ONLY a JSON object, no markdown fences, no commentary.`,
         { maxTokens, model: cfg.model, apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, label: 'structured' },
       );
       break;
     }
-    case 'ollama': {
-      text = await ollamaGenerate(`${prompt}\n\nReturn ONLY a JSON object, no markdown fences.`, cfg.model, cfg.baseUrl);
-      break;
-    }
+    case 'ollama':
+      throw new Error('Ollama is no longer supported. Please configure a Gemini API key in Settings.');
   }
   if (!text || !text.trim()) throw new Error(`${cfg.kind} returned empty structured text`);
   return text;
@@ -547,6 +690,7 @@ async function openAiChat(
   const data = await res.json();
   const text = data.choices?.[0]?.message?.content;
   if (!text) throw new Error(`${cfg.kind} returned no content`);
+  recordLLMUsage(cfg.kind, cfg.model, options.maxTokens ?? 4096, cfg.id);
   return text;
 }
 
@@ -578,59 +722,7 @@ export type ParsedResume = {
   targets?: CareerTargets;
 };
 
-// `model`/`baseUrl` come from the provider row when there is one. They used to be ignored, so a
-// row configured as "Ollama (qwen2.5-coder 7b)" silently requested OLLAMA_CHAT_MODEL (llama3.2)
-// instead — the /settings model field did nothing, and the call failed outright if that model
-// wasn't pulled.
-async function ollamaGenerate(
-  prompt: string,
-  model?: string | null,
-  baseUrl?: string | null,
-  /**
-   * Cap the OUTPUT length (`num_predict`).
-   *
-   * Without it Ollama generates until the model decides to stop, and on CPU that regularly exceeds
-   * the fetch timeout — a cover letter request simply died at 120s with "operation was aborted".
-   * Measured on this machine with llama3.2: capped at 400 tokens it produces a complete 192-word
-   * letter in **35.7s**; uncapped, the same request never returned. The cap is what makes a local
-   * draft viable at all.
-   */
-  maxTokens?: number,
-  timeoutMs?: number,
-): Promise<string> {
-  const url = (baseUrl || OLLAMA_BASE_URL).replace(/\/+$/, '');
-  const response = await fetch(`${url}/api/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: model?.trim() || OLLAMA_CHAT_MODEL,
-      prompt,
-      stream: true,
-      ...(maxTokens ? { options: { num_predict: maxTokens } } : {}),
-    }),
-    // Local Ollama on CPU can take minutes on a long JD; without a signal it hangs the route.
-    signal: AbortSignal.timeout(timeoutMs || LLM_CALL_TIMEOUT_MS),
-  });
-  if (!response.ok || !response.body) throw new Error(`Ollama generation failed: ${response.statusText}`);
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let out = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const chunk = JSON.parse(line);
-      if (chunk.response) out += chunk.response;
-    }
-  }
-  return out;
-}
 
 // Direct Gemini call for the creative lane — independent of active primary.
 // Tries Pro first (best quality), falls back to Flash on quota / 429 errors.
@@ -650,7 +742,7 @@ let creativeProUnavailable = false;
  * PROVIDER ROW down would be wrong; this is lane-specific. But its default model is a reasoning
  * model, and for long-form prose it spends the whole 4096-token budget thinking and returns nothing
  * usable. Once that has happened, every later creative call pays ~70s to learn the same thing:
- * measured a 142s cover letter that was Gemini(2s) + Freeway(70s, doomed) + Ollama(70s, worked).
+ * measured a 142s cover letter that was Gemini(2s) + Freeway(70s, doomed).
  * Remembering it drops the same request to ~75s.
  *
  * Process-lifetime only — a restart re-probes, which is right if the gateway's routing changes.
@@ -664,65 +756,67 @@ function freewayUnusableForCreative(): boolean {
 }
 
 async function creativeGeminiGenerate(prompt: string, maxTokens = 4096): Promise<string> {
+  const check = await ensureWorkingGeminiModel();
+  let activeModel = check.model;
   const client = getCreativeGeminiClient();
   if (!client) throw new Error('No Gemini API key available for creative lane');
-  const budget = Math.max(maxTokens, 8192);
+  const budget = Math.min(maxTokens || 4096, 4096);
 
   const callModel = async (modelName: string) => {
     const model = client.getGenerativeModel({
       model: modelName,
       generationConfig: { maxOutputTokens: budget },
     });
-    try {
-      const result = await model.generateContent(prompt);
-      const text = result.response.text();
-      if (!text) {
-        const finish = result.response.candidates?.[0]?.finishReason;
-        throw new Error(`Gemini ${modelName} returned empty text (finishReason=${finish})`);
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const result = await model.generateContent(prompt);
+        const text = result.response.text();
+        if (!text) {
+          const finish = result.response.candidates?.[0]?.finishReason;
+          throw new Error(`Gemini ${modelName} returned empty text (finishReason=${finish})`);
+        }
+        recordLLMUsage('gemini', modelName, budget);
+        return text;
+      } catch (err: unknown) {
+        lastErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isQuotaError(msg) || /503|high demand|overloaded/i.test(msg)) {
+          // Break immediately to switch model instead of wasting retry delays on a rate-limited model
+          break;
+        }
+        if (/temporar|Service Unavailable|fetch/i.test(msg) && attempt < 2) {
+          await new Promise((r) => setTimeout(r, 1000));
+        } else {
+          throw err;
+        }
       }
-      return text;
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/503|high demand|temporar|429/i.test(msg)) {
-        await new Promise((r) => setTimeout(r, 2000));
-        const retryRes = await model.generateContent(prompt);
-        const retryText = retryRes.response.text();
-        if (retryText) return retryText;
-      }
-      throw err;
     }
+    throw lastErr;
   };
 
-  // Skip the Pro attempt entirely once we've learned it isn't available to this key.
-  if (creativeProUnavailable || GEMINI_CREATIVE_MODEL_ENV === GEMINI_CREATIVE_FALLBACK_MODEL) {
-    return await callModel(GEMINI_CREATIVE_FALLBACK_MODEL);
-  }
-
   try {
-    return await callModel(GEMINI_CREATIVE_MODEL_ENV);
+    return await callModel(activeModel);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (isQuotaError(msg) || /503|high demand|overloaded/i.test(msg)) {
+      let key: string | null = null;
+      try {
+        const row = db.prepare("SELECT api_key FROM llm_providers WHERE kind = 'gemini' AND api_key IS NOT NULL LIMIT 1").get() as { api_key: string } | undefined;
+        if (row?.api_key) key = row.api_key;
+      } catch { /* DB */ }
+      if (!key) key = process.env.GEMINI_API_KEY || null;
 
-    // Two DIFFERENT ways Pro can be unusable, and only one used to be handled:
-    //   - 429 / quota  → temporary; Pro is paid-only on many free tiers (limit:0).
-    //   - 404 / "no longer available to new users" → PERMANENT for this key.
-    // Only the quota case fell back, so a 404 threw and killed the whole creative lane, which then
-    // fell through to the active provider. Verified against the live key: `gemini-2.5-pro` is
-    // returned by the models list but answers generateContent with
-    // 404 "This model ... is no longer available to new users", so EVERY cover letter and résumé
-    // variant paid for a guaranteed-failed round-trip first and logged a scary error.
-    const isQuotaErr = /429|Too Many Requests|quota|RESOURCE_EXHAUSTED/i.test(msg);
-    const isUnavailable = /404|not found|no longer available|is not supported|does not exist/i.test(msg);
-    if (!isQuotaErr && !isUnavailable) throw e;
-
-    if (isUnavailable) {
-      // Permanent for this key — stop trying for the rest of the process.
-      creativeProUnavailable = true;
-      console.warn(`[creative] ${GEMINI_CREATIVE_MODEL_ENV} is not available to this key — using ${GEMINI_CREATIVE_FALLBACK_MODEL} from now on.`);
-    } else {
-      console.warn(`[creative] Pro rate-limited (${msg.slice(0, 100)}…) — falling back to ${GEMINI_CREATIVE_FALLBACK_MODEL}`);
+      if (key) {
+        const reason = /503|high demand/i.test(msg) ? 'is experiencing high demand' : 'reached quota limit';
+        const switched = await switchGeminiModel(activeModel, key, reason);
+        if (switched.switched) {
+          console.log(`[creative] Retrying creative generation with switched model ${switched.newModel}...`);
+          return await callModel(switched.newModel);
+        }
+      }
     }
-    return await callModel(GEMINI_CREATIVE_FALLBACK_MODEL);
+    throw e;
   }
 }
 
@@ -744,27 +838,45 @@ async function callProviderConfig(
 ): Promise<string> {
   switch (cfg.kind) {
     case 'gemini': {
-      if (!cfg.api_key) throw new Error('Gemini creative provider missing api_key');
+      if (!cfg.api_key) throw new Error('Gemini provider missing api_key');
+      const check = await ensureWorkingGeminiModel();
+      let modelName = check.switched ? check.model : (cfg.model || 'gemini-3.8-flash');
       const client = new GoogleGenerativeAI(cfg.api_key);
-      const model = client.getGenerativeModel({
-        model: cfg.model || 'gemini-3.6-flash',
-        generationConfig: { maxOutputTokens: Math.max(maxTokens, 8192) },
-      });
-      try {
-        const result = await model.generateContent(prompt);
-        const text = result.response.text();
-        if (!text) throw new Error(`Gemini ${cfg.model} returned empty text`);
-        return text;
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/503|high demand|temporar|429/i.test(msg)) {
-          await new Promise((r) => setTimeout(r, 2000));
-          const retryRes = await model.generateContent(prompt);
-          const retryText = retryRes.response.text();
-          if (retryText) return retryText;
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const model = client.getGenerativeModel({
+            model: modelName,
+            generationConfig: { maxOutputTokens: Math.min(maxTokens || 4096, 4096) },
+          });
+          const result = await model.generateContent(prompt);
+          const text = result.response.text();
+          if (!text) throw new Error(`Gemini ${modelName} returned empty text`);
+          recordLLMUsage(cfg.kind, modelName, Math.min(maxTokens || 4096, 4096));
+          return text;
+        } catch (err: unknown) {
+          lastErr = err;
+          const msg = err instanceof Error ? err.message : String(err);
+          if (isQuotaError(msg) || /503|high demand|overloaded/i.test(msg)) {
+            const reason = /503|high demand/i.test(msg) ? 'is experiencing high demand' : 'reached quota limit';
+            const switched = await switchGeminiModel(modelName, cfg.api_key, reason);
+            if (switched.switched) {
+              modelName = switched.newModel;
+              console.log(`[llm] Auto-switched to ${modelName} during generation. Retrying immediately...`);
+              continue;
+            }
+          }
+          if (/503|high demand|temporar|429|Service Unavailable|overloaded|fetch/i.test(msg) && attempt < 3) {
+            const delayMatch = msg.match(/retry(?:Delay)?[\s":]+(\d+(?:\.\d+)?)\s*s/i) || msg.match(/retry in (\d+(?:\.\d+)?)/i);
+            const delaySec = delayMatch ? Math.min(Math.ceil(parseFloat(delayMatch[1])) + 1, 10) : attempt * 2;
+            console.warn(`[llm] Gemini ${modelName} 503/429 (attempt ${attempt}/3) — retrying in ${delaySec}s...`);
+            await new Promise((r) => setTimeout(r, delaySec * 1000));
+          } else {
+            throw err;
+          }
         }
-        throw err;
       }
+      throw lastErr;
     }
     case 'anthropic': {
       if (!cfg.api_key) throw new Error('Anthropic creative provider missing api_key');
@@ -776,6 +888,7 @@ async function callProviderConfig(
       });
       const block = response.content.find((b) => b.type === 'text');
       if (!block || block.type !== 'text') throw new Error('Anthropic returned no text block');
+      recordLLMUsage(cfg.kind, cfg.model || 'claude-3-5-haiku-20241022', maxTokens);
       return block.text;
     }
     case 'openai':
@@ -795,7 +908,7 @@ async function callProviderConfig(
         timeoutMs,
       });
     case 'ollama':
-      return ollamaGenerate(prompt, cfg.model, cfg.base_url);
+      throw new Error('Ollama is no longer supported. Please configure a Gemini API key in Settings.');
     default:
       throw new Error(`Unsupported creative provider kind: ${cfg.kind}`);
   }
@@ -808,6 +921,11 @@ export async function primaryGenerate(
   /** `timeoutMs` caps EVERY provider attempt — pass LLM_INTERACTIVE_TIMEOUT_MS when a user waits. */
   opts: { timeoutMs?: number } = {},
 ): Promise<string> {
+  // Pre-flight test Gemini model to ensure it is healthy before proceeding
+  try {
+    await ensureWorkingGeminiModel();
+  } catch { /* best-effort pre-flight */ }
+
   if (lane === 'creative') {
     // 1. User-flagged creative provider in DB (opt-in)
     const flagged = getCreativeProvider();
@@ -835,7 +953,7 @@ export async function primaryGenerate(
         console.warn(`[creative] Gemini lane failed (${msg.slice(0, 140)}…) — falling back to active provider`);
       }
     }
-    // 3. Fall through to the provider chain (active → other keys → Ollama)
+    // 3. Fall through to the provider chain (active → other keys → Freeway)
   }
   return callWithProviders(
     (cfg) =>
@@ -885,32 +1003,33 @@ WRITING STANDARDS:
 - Avoid filler ("I am writing to express", "It would be a privilege to") — open with substance
 - One concrete proof point per paragraph minimum (a number, a system, a named project)`;
 
-const RESUME_VARIANT_RULES = `You are an elite, highly targeted resume tailoring engine. Rewrite the candidate's resume tailored to the target role. Output **valid Markdown** that renders as a clean professional resume and achieves a 95%+ to 99% ATS match score.
+const RESUME_VARIANT_RULES = `You are an elite, highly targeted resume tailoring engine. Rewrite the candidate's resume tailored to the target role. Output **valid Markdown** that renders as a clean professional resume and achieves a high ATS match score.
 
 YOUR GOAL:
-Achieve a 95%+ to 99% ATS match score by aggressively aligning the candidate's profile summary, skills, work experience bullets, and project details with the target Job Description's required tech stack, keywords, and responsibilities.
+Achieve a 95%+ to 99% ATS match score by dynamically aligning the candidate's profile summary, skills, work experience, and project details with the target Job Description's required tech stack, keywords, and responsibilities.
 
 CRITICAL INSTRUCTIONS:
-1. AGGRESSIVE ATS KEYWORD INJECTION IN ## Skills:
-   - Group skills into categorized lines (e.g. **Programming & Querying:**, **Cloud & Big Data:**, **Streaming & Databases:**, **Tools & Platforms:**).
-   - Ensure the JD's required technical keywords (e.g. PySpark, SQL, Python, AWS, S3, Snowflake, Kafka, Airflow, Docker, CI/CD, MySQL, ClickHouse, Cassandra) appear verbatim in ## Skills so ATS keyword scanners rate it at 99%.
+1. STRICT FACTUAL ACCURACY & CANDIDATE DATA FIDELITY:
+   - Use ONLY the facts, employment history, company names, job titles, dates, education, and real achievements provided in the candidate's ORIGINAL RESUME (facts).
+   - DO NOT invent fake companies, fake job titles, fake degrees, fake locations, or hallucinated experience.
+   - Emphasize and reframe the candidate's real experiences and achievements to best align with the target job description.
 
-2. ACTIVELY REWRITE WORK EXPERIENCE (## Experience):
-   - You MUST rewrite and tailor the work experience bullets under Solartis Technology to prominently feature the target JD's required technologies and methodologies.
-   - Detail hands-on data pipeline development, distributed processing, schema validation, data transformations, and storage optimization using the target job's requested tools (e.g. AWS/Azure/GCP, S3, Snowflake, Databricks, PySpark, Airflow, Kafka).
-   - Preserve the candidate's real numbers, scale figures, and impact (e.g., 30% reduction, 35% speed improvement, 500+ daily events, 60+ records per minute, zero data loss, 10+ clients).
-   - Keep candidate's real employer (Solartis Technology), role (Software Engineer), dates (September 2022 -- Present), and degree.
+2. DYNAMIC SKILL CATEGORIZATION & ATS KEYWORD ALIGNMENT IN ## Skills:
+   - Categorize the candidate's technical and professional skills into clean lines (e.g., **Core Skills:**, **Tools & Technologies:**, **Frameworks & Databases:**).
+   - Ensure target job description keywords that match the candidate's capabilities are highlighted in ## Skills so ATS keyword scanners rate the resume at 95%+.
 
-3. ACTIVELY TAILOR & EXPAND PROJECTS (## Projects):
-   - You MUST rewrite project titles, tech stacks, and bullet points to align with the target job description.
-   - CRITICAL NEW PROJECT INSTRUCTION: If the target JD requires a cloud platform or skill set (e.g. AWS S3/Glue/Athena/Redshift, Azure Data Factory/Synapse, GCP BigQuery, Snowflake, Databricks, dbt) that cannot be seamlessly merged into the existing CDC and streaming projects, YOU MUST ADD A NEW PROJECT (or replace/adapt one of the projects) tailored to that technology stack!
-   - Detail architectural design, ingestion, data transformation, validation, and analytics delivery.
+3. ACTIVELY REWRITE WORK EXPERIENCE (## Experience):
+   - Rewrite work experience bullets under the candidate's REAL employers to feature target job responsibilities, tools, and methodologies where applicable.
+   - Preserve candidate's real metrics, scale figures, and true achievements from their original resume.
+   - Keep candidate's real employer names, role titles, employment dates, and degrees exactly as provided.
 
-4. ATS-SAFE FORMATTING:
-   - Use proper Markdown sections in this order: # Name (heading), contact line under it, ## Summary, ## Skills, ## Experience, ## Projects, ## Education.
-   - The Summary MUST state years of experience explicitly (e.g. "Data Engineer with 3+ years of experience in designing and scaling end-to-end data pipelines...")
+4. ACTIVELY TAILOR & EXPAND PROJECTS (## Projects):
+   - Adapt project titles, tech stack descriptions, and bullet points of candidate's REAL projects to highlight relevant technologies and analytical/engineering methodologies requested in the JD.
+
+5. ATS-SAFE FORMATTING:
+   - Use proper Markdown sections in this order: # Name (heading), contact line under it, ## Summary, ## Skills, ## Experience, ## Projects (if present), ## Education.
    - Plain ASCII only (no tables, no multi-column layouts, no emoji).
-   - Single-page ~700 words. Do NOT wrap in code fences, output only the Markdown content.`;
+   - Do NOT wrap in code fences, output only the Markdown content.`;
 
 export interface KeywordCoverage {
   required: string[];   // top JD keywords we asked the model to mirror
@@ -928,45 +1047,54 @@ export interface CoverLetterResult {
 const RESUME_LATEX_RULES = `You are an elite, highly targeted LaTeX resume tailoring engine. Given the candidate's profile and their LaTeX template, produce a surgically tailored, high-scoring ATS resume for the target job role.
 
 YOUR GOAL:
-Achieve a 95%+ to 99% ATS match score by aggressively aligning the candidate's profile summary, skills, work experience bullets, and project details with the target Job Description's required tech stack, keywords, and responsibilities.
+Achieve a 95%+ to 99% ATS match score by carefully reading the target Job Description, identifying all required skills, title keywords, domain concepts, tools, and responsibilities, and dynamically aligning the candidate's profile summary, skills section, work experience bullets, and project details with maximum ATS keyword density.
 
 CRITICAL SECTION-BY-SECTION INSTRUCTIONS:
 
-1. PRESERVE THE LATEX TEMPLATE DESIGN:
+1. PRESERVE THE CANDIDATE'S LATEX TEMPLATE DESIGN & FONT SIZE:
    - The output must be a COMPLETE, self-contained, compilable .tex document (from \\documentclass to \\end{document}).
-   - Preserve the exact LaTeX commands, preamble, geometry, packages, and custom macros (\\resumeSubheading, \\resumeProjectHeading, \\resumeItem, \\resumeItemListStart, \\resumeItemListEnd). Do not invent new macros or alter layout geometry.
+   - Preserve the exact LaTeX commands, preamble, geometry, packages, font size (do NOT alter \\documentclass font size option), and custom macros (e.g. \\resumeSubheading, \\resumeProjectHeading, \\resumeItem, \\resumeItemListStart, \\resumeItemListEnd). Do not invent new macros or alter layout geometry.
 
-2. TARGET-ALIGNED SUMMARY (\\section{Summary}):
-   - The \\section{Summary} MUST state years of experience (3+ years) and align with the target role and core JD tech stack, e.g.:
-     "Data Engineer with 3+ years of experience in designing and scaling end-to-end data pipelines, ETL workflows, and real-time streaming architectures using Python, SQL, [insert target JD technologies, e.g., Apache Spark / PySpark, AWS, Snowflake, Kafka, and Airflow]."
+1b. PRESERVE PARACOL / TWO-COLUMN LAYOUT & COLUMN SWITCHES:
+   - If the template uses \\begin{paracol}{2} and \\switchcolumn, you MUST preserve \\begin{paracol}{2}, \\switchcolumn, and \\end{paracol} intact.
+   - DO NOT remove \\switchcolumn or convert a 2-column template into single-column stream.
+   - All tabularx environments inside \\begin{paracol} MUST use \\linewidth (NOT \\textwidth) so tables fit within the paracol column.
 
-3. AGGRESSIVE ATS KEYWORD INJECTION IN \\section{Skills}:
-   - Weave the JD's required technical keywords (languages, cloud services, tools, databases, frameworks) into \\section{Skills} under categorized lines:
-     \\textbf{Programming \\& Querying:} SQL, Python, ...
-     \\textbf{Cloud \\& Big Data:} [Insert target cloud tools, e.g. AWS (S3, Glue, Athena, Redshift) / Azure / GCP, Snowflake, Databricks, Apache Spark / PySpark]
-     \\textbf{Streaming \\& Databases:} Apache Kafka, Spark Streaming, MySQL, PostgreSQL, ClickHouse, Cassandra, ...
-     \\textbf{Orchestration \\& Tools:} Apache Airflow, Docker, Docker Compose, dbt, Git, CI/CD, Pentaho, Power BI
-   - Ensure all target technologies appear verbatim in the Skills block so ATS keyword scanners rate it at 99%.
+2. DYNAMIC CANDIDATE DATA FIDELITY (NO FAKE COMPANIES / SKILLS):
+   - Use ONLY the facts from the candidate's PARSED RESUME (facts) — candidate's real name, contact info, real employers, real job titles, real dates, real locations, real projects, and real degree.
+   - DO NOT insert hardcoded fake companies, fake locations, or fake tech stacks not present in the candidate's background.
 
-4. PRESERVE ORIGINAL WORK EXPERIENCE WITH TARGET TECH INJECTION (\\section{Experience}):
-   - The candidate's original employer ("Solartis Technology"), role title ("Software Engineer"), dates ("September 2022 -- Present"), location ("Madurai"), and core responsibilities MUST remain intact!
-   - DO NOT delete or wipe out the candidate's actual work experience.
-   - Update the "\\resumeItem{\\textbf{Tools Used:} ...}" line to weave in the target JD's relevant technologies and tools (e.g., Python, SQL, PySpark, AWS/Cloud Data Lake/GCP, Snowflake/BigQuery, Kafka, Airflow, Docker).
-   - In the existing bullet points, subtly weave in the target job's technologies (e.g. cloud storage S3/GCS/ADLS, BigQuery/Snowflake queries, PySpark transformations, Airflow orchestration) while preserving the candidate's real metrics and achievements: 30% reduction in processing time, 35% performance improvement, 25% data integrity improvement, 500+ daily events, 60+ records per minute, zero data loss, 10+ clients.
+2b. PRESERVE THE HEADING BLOCK VERBATIM (CRITICAL):
+   - The candidate's NAME and PROFILE TITLE/HEADLINE (the \\large or \\Large line below their name in \\begin{center}...\\end{center}) MUST be copied EXACTLY from the template — character for character.
+   - DO NOT change "Business Analyst" to "Data Engineer" or any other role in the top header.
+   - Only the body sections (\\section{Summary}, \\section{Skills}, \\section{Experience}, \\section{Projects}) may be tailored.
 
-5. PRESERVE ORIGINAL PROJECTS WITH TARGET TECHSTACK ADAPTATION (\\section{Projects}):
-   - STRICT REQUIREMENT: DO NOT REMOVE, WIPE OUT, OR DELETE THE CANDIDATE'S ORIGINAL PROJECTS!
-   - The candidate's original projects (e.g., CDC Pipeline and Real-Time Streaming Data Pipeline) MUST remain in the resume.
-   - You MUST adapt the techstack tags and bullet points of these existing projects to integrate the target JD's required technologies (e.g., GCP services like BigQuery/Cloud Storage/Dataflow, AWS Glue/S3/Snowflake, PySpark, Airflow, dbt, etc.) directly into the existing project architectures.
-   - For example:
-     - In the CDC / Data Pipeline project, update the tools line and bullets to show ingestion, transformation, and storage utilizing the target JD's data warehouse and cloud tools (e.g. BigQuery, Snowflake, PySpark).
-     - In the Streaming Pipeline project, highlight real-time streaming using Kafka, Spark Streaming, and target analytics stores.
-   - If a new skill/tool from the JD is needed, integrate it as part of these existing projects rather than replacing them.
-   - Ensure the entire document fits within 1 single page (~650-750 words).
+3. HIGH-IMPACT TARGET-ALIGNED SUMMARY (\\section{Summary}):
+   - Rewrite \\section{Summary} body text to open with a compelling professional summary that explicitly incorporates the target job's title domain, core responsibilities, key methodologies, and required skills (e.g. Risk Assessment, UAT, Business Requirements, Internal Controls, AI/LLM, Process Automation).
+   - Keep their actual professional title (e.g., "Business Analyst") — describe how their background is directly aligned to the target role's deliverables.
+   - YEARS OF EXPERIENCE FORMATTING: Always format experience in the Summary as "3+ years" (or "N+ years", e.g. "3+ years of experience").
 
-6. COMPILATION SAFETY:
+4. MANDATORY HIGH-DENSITY ATS KEYWORD & SKILL ALIGNMENT (\\section{Skills}):
+   - Every single keyword under REQUIRED ATS KEYWORDS and key skills from the Job Description MUST appear explicitly in \\section{Skills} under clean, professional category headers appropriate to candidate background (e.g., Domain \\& Business Analysis, Methodologies \\& Testing, Tools \\& Technologies, AI \\& Analytics).
+   - Never omit required target skills or title skills — this is critical for passing ATS thresholding (>90%+ match).
+
+5. PRESERVE ORIGINAL WORK EXPERIENCE WITH DEEP TARGET ALIGNMENT (\\section{Experience}):
+   - The candidate's original employers, role titles, dates, locations, and core achievements MUST remain intact.
+   - Rewrite experience bullet points (and any tools summary lines) to weave in the target job's relevant technologies, domain terms, responsibilities, and high-impact metrics (e.g., process automation %, UAT cycle time reduction, requirement accuracy, risk control efficiency).
+
+6. PRESERVE ORIGINAL PROJECTS WITH TARGET ALIGNMENT (\\section{Projects}):
+   - DO NOT REMOVE the candidate's original projects.
+   - Adapt project bullet points to integrate relevant target technologies and analytical/engineering methodologies requested in the JD.
+
+7. COMPILATION SAFETY:
    - Clean ASCII / standard LaTeX only: escape %, &, _, # properly (e.g. \\%, \\&, \\_, \\#).
-   - Output ONLY the raw compilable .tex code. No markdown fences, no explanatory text.`;
+   - Output ONLY the raw compilable .tex code. No markdown fences, no explanatory text.
+
+8. STRICT WORD & SENTENCE BUDGET (NO FONT RESIZING):
+   - DO NOT change the font size or \\documentclass options.
+   - You MUST edit the content so the word count and sentence count in each section matches the budget available in the template.
+   - Maintain the EXACT same number of bullet points per position/project as the original template — do NOT add extra bullets or sections.
+   - Keep every bullet concise (maximum 12 to 18 words per bullet) so that the tailored resume fits on the exact same page count.`;
 
 export interface ResumeLatexResult {
   text: string;
@@ -982,7 +1110,7 @@ export async function generateLatexResume(
   /** Pass `{ interactive: true }` when a user is waiting — see LLM_INTERACTIVE_TIMEOUT_MS. */
   opts: { interactive?: boolean; fixHint?: string } = {},
 ): Promise<ResumeLatexResult> {
-  const keywords = extractJdKeywords(jobDescription, jobTitle, 15);
+  const keywords = extractJdKeywords(jobDescription, jobTitle, 25);
   const requiredList = keywords.map((k) => k.term);
   const keywordsBlock = requiredList.length
     ? `\n\nREQUIRED ATS KEYWORDS (Ensure all these terms appear verbatim in \\section{Skills} and are seamlessly incorporated into experience / project bullets to achieve 99% ATS match):\n${requiredList.join(', ')}\n`
@@ -990,10 +1118,28 @@ export async function generateLatexResume(
   const fixBlock = opts.fixHint
     ? `\n\nA PREVIOUS VERSION OF YOUR OUTPUT FAILED TO COMPILE with the following engine error. Keep ALL content and design, but repair the STRUCTURE (balanced braces/environments, macros called with the correct arguments, all \\resumeProjectHeading-like macros given every argument they expect — e.g. an empty {date} group must still be present, every \\begin{X} matched by \\end{X}, no stray $ or }):\n---\n${opts.fixHint.slice(0, 1500)}\n---\nRespond with the FULL corrected .tex document again.\n`
     : '';
+  let targetPages = 1;
+  try {
+    const { getLatexPageCount } = await import('./apply/latex');
+    const cnt = await getLatexPageCount(resumeTex, 15_000);
+    if (cnt > 0) targetPages = cnt;
+  } catch {
+    // fallback to 1 page if template page count probe fails
+  }
+
+  const bulletCount = (resumeTex.match(/\\(?:resumeItem|item)\b/g) || []).length;
+  const budgetBlock = bulletCount > 0
+    ? `\nCRITICAL PAGE BUDGET & SECTION INTEGRITY CONSTRAINT:
+- The candidate's template spans EXACTLY ${targetPages} page(s) and has ${bulletCount} bullet points total across all sections.
+- Your tailored output MUST NOT exceed ${bulletCount} total bullet points.
+- Preserve EVERY single section (Profile, Work Experience, Education, Skills, Technical Expertise, Certifications) and EVERY project / position heading present in the template. DO NOT drop or empty any section or project.
+- Keep each bullet point concise (maximum 12 to 18 words per bullet, matching original template line lengths) so the entire document fits on exact target ${targetPages} page(s) without reducing font size or stripping sections.\n`
+    : '';
 
   const prompt = `${RESUME_LATEX_RULES}
 ${fixBlock}
 ${keywordsBlock}
+${budgetBlock}
 PARSED RESUME (facts):
 ${JSON.stringify(resumeJson, null, 2)}
 
@@ -1012,33 +1158,14 @@ Write the tailored .tex now:`;
 
   let text: string;
   try {
-    text = await primaryGenerate(prompt, 8192, 'creative', {
-      timeoutMs: opts.interactive ? LLM_INTERACTIVE_TIMEOUT_MS : undefined,
+    text = await primaryGenerate(prompt, 4096, 'creative', {
+      timeoutMs: opts.interactive ? Math.max(LLM_INTERACTIVE_TIMEOUT_MS, 90_000) : undefined,
     });
   } catch (e) {
     if (!opts.interactive) throw e;
     const why = e instanceof Error ? e.message.slice(0, 120) : String(e);
-    console.warn(`[creative] cloud providers unavailable (${why}) — drafting LaTeX résumé locally with Ollama`);
-    const localPrompt = `You are a professional LaTeX resume tailoring engine.
-TASK: Tailor the candidate's LaTeX resume for: ${jobTitle} at ${company}.
-REQUIRED ATS KEYWORDS TO WEAVE INTO \\section{Summary}, \\section{Skills}, AND Experience:
-${requiredList.slice(0, 12).join(', ')}
-
-INSTRUCTIONS:
-1. Update \\section{Summary} to state 3+ years experience and highlight: ${requiredList.slice(0, 5).join(', ')}.
-2. In \\section{Skills}, ensure ${requiredList.slice(0, 8).join(', ')} are included in appropriate categories.
-3. In \\section{Experience}, update the "\\resumeItem{\\textbf{Tools Used:} ...}" line to include: ${requiredList.slice(0, 6).join(', ')}.
-4. Keep the exact preamble, packages, macros, candidate name, employer, dates, and project structures.
-5. Return the full compilable .tex document from \\documentclass to \\end{document}.
-
-BASE LATEX TEMPLATE:
-${resumeTex}`;
-    const localWindow = Math.max(LLM_INTERACTIVE_TIMEOUT_MS * 3, 240_000);
-    text = await withLlmTimeout(
-      ollamaGenerate(localPrompt, undefined, undefined, 4096, localWindow),
-      'ollama (local LaTeX résumé)',
-      localWindow,
-    );
+    console.warn(`[creative] cloud providers unavailable (${why}) — LaTeX résumé generation failed`);
+    throw e; // No local fallback — Gemini is required for LaTeX résumé generation
   }
   const { matched, missing } = matchKeywordsInText(text, keywords);
   // Never trust the model to reproduce the user's preamble/design byte-for-byte — splice its NEW
@@ -1049,52 +1176,6 @@ ${resumeTex}`;
   return { text: repaired, coverage: { required: requiredList, matched, missing } };
 }
 
-/**
- * A deliberately SMALL prompt for the local (Ollama) cover-letter fallback.
- *
- * The cloud prompt is ~9-10K characters: the full rules block, the résumé JSON pretty-printed, and
- * 3,000 characters of job description. A hosted model ingests that instantly. Local CPU does not —
- * and the cost is the PROMPT, not the output. Measured on this machine with llama3.2:
- *   - short prompt + `num_predict` cap  -> complete 192-word letter in 35.7s
- *   - full prompt  + `num_predict` cap  -> did not finish inside 150s
- *
- * So the local path gets the same INFORMATION at a fraction of the size: identity, the skills that
- * actually matter, the two most recent roles, and enough of the posting to aim the letter. Anything
- * more is paid for twice — once in latency, once in a small model losing the thread.
- */
-function compactCoverLetterPrompt(
-  resumeJson: Record<string, unknown>,
-  jobTitle: string,
-  company: string,
-  jobDescription: string,
-): string {
-  const name = typeof resumeJson.name === 'string' ? resumeJson.name : 'the candidate';
-  const skills = Array.isArray(resumeJson.skills) ? (resumeJson.skills as string[]).slice(0, 12) : [];
-  const roles = Array.isArray(resumeJson.experience)
-    ? (resumeJson.experience as Array<Record<string, unknown>>).slice(0, 2).map((r) => {
-        const title = r.title ?? r.role ?? 'Engineer';
-        const org = r.company ?? r.organization ?? '';
-        return `${title}${org ? ` at ${org}` : ''}`;
-      })
-    : [];
-
-  return [
-    `Write a cover letter for ${name}.`,
-    '',
-    `ROLE: ${jobTitle}${company ? ` at ${company}` : ''}`,
-    skills.length ? `KEY SKILLS: ${skills.join(', ')}` : '',
-    roles.length ? `RECENT ROLES: ${roles.join('; ')}` : '',
-    '',
-    'ABOUT THE ROLE:',
-    jobDescription.replace(/\s+/g, ' ').slice(0, 1200),
-    '',
-    'Rules: 200-250 words. Four short paragraphs. Address "Dear Hiring Manager".',
-    'Only claim experience listed above — invent nothing. No clichés ("passionate", "results-driven").',
-    'Output ONLY the letter, no preamble or commentary.',
-  ]
-    .filter(Boolean)
-    .join('\n');
-}
 
 export async function generateCoverLetter(
   resumeJson: object,
@@ -1138,30 +1219,10 @@ Write the cover letter now:`;
       timeoutMs: opts.interactive ? LLM_INTERACTIVE_TIMEOUT_MS : undefined,
     });
   } catch (e) {
-    // LAST RESORT for a button the user is waiting on: draft it locally.
-    //
-    // Ollama is deliberately OUT of the chat chain (a weak model gives wrong ANSWERS, and job
-    // ratings must not be guesses). A cover letter is a different risk: it is a first draft the
-    // user reads and edits before anything is sent, so a local model producing something in ~20s
-    // beats a cloud chain producing nothing in 75s. Without this the button simply fails whenever
-    // the free tiers are exhausted — which is most of the time by late in the day.
     if (!opts.interactive) throw e;
     const why = e instanceof Error ? e.message.slice(0, 120) : String(e);
-    console.warn(`[creative] cloud providers unavailable (${why}) — drafting locally with Ollama`);
-    // 600 output tokens ~= a 250-word letter, which is what a cover letter should be anyway.
-    const localBudget = 600;
-    const localWindow = LLM_INTERACTIVE_TIMEOUT_MS * 2; // local CPU is slower, but free and always up
-    text = await withLlmTimeout(
-      ollamaGenerate(
-        compactCoverLetterPrompt(resumeJson as Record<string, unknown>, jobTitle, company, jobDescription),
-        undefined,
-        undefined,
-        localBudget,
-        localWindow,
-      ),
-      'ollama (local cover letter)',
-      localWindow,
-    );
+    console.warn(`[creative] cover letter generation failed — no local fallback available (${why})`);
+    throw e;
   }
   const { matched, missing } = matchKeywordsInText(text, keywords);
   return { text, coverage: { required: requiredList, matched, missing } };
@@ -1197,10 +1258,10 @@ export type JobEvaluation = {
 };
 
 // Coerce a parsed (possibly malformed) model object into a well-formed JobEvaluation.
-// Ollama's local JSON is far less reliable than Gemini/Anthropic structured output — fields can be
+// JSON output from weak models is far less reliable than Gemini/Anthropic structured output — fields can be
 // missing, numbers stringified, or notes returned as arrays/objects. Without this, downstream SQL
 // binds throw "SQLite3 can only bind numbers, strings, bigints, buffers, and null" and
-// `recommendation.toUpperCase()` crashes the whole rating run when the fallback chain reaches Ollama.
+// `recommendation.toUpperCase()` crashes the whole rating run when a weak model is used.
 function clampScore(x: unknown, fallback = 3): number {
   const n = typeof x === 'string' ? parseFloat(x) : x;
   if (typeof n !== 'number' || !Number.isFinite(n)) return fallback;
@@ -1566,10 +1627,12 @@ Research and produce the company brief as strict JSON.`;
   // Per-provider runner. Gemini keeps the two-step search-grounded pipeline (grounded prose
   // findings → structured extraction) to refresh data beyond its training cutoff; other kinds
   // use plain structured generation. Wrapped in callWithProviders so a quota'd provider rotates
-  // to the next configured key, then Ollama.
+  // to the next configured key.
   const runResearch = async (cfg: ProviderConfig): Promise<string> => {
     if (cfg.kind === 'gemini') {
       if (!cfg.apiKey) throw new Error('Gemini provider missing api_key');
+      const check = await ensureWorkingGeminiModel();
+      const activeModel = check.switched ? check.model : (cfg.model || 'gemini-3.8-flash');
       const client = new GoogleGenerativeAI(cfg.apiKey);
       // Two-step pipeline: (1) search-grounded research returning prose findings,
       // (2) structured extraction into the JSON schema. Gemini disallows tools +
@@ -1591,7 +1654,7 @@ Search for and summarize:
 Output: 6 short sections, one per topic above, with the most recent dated facts you can find. Cite source URLs inline as [Source: URL]. Keep it factual; no opinion.`;
 
         const groundedModel = client.getGenerativeModel({
-          model: cfg.model,
+          model: activeModel,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           tools: [{ googleSearchRetrieval: {} } as any],
           generationConfig: { maxOutputTokens: 4096 },
@@ -1610,7 +1673,7 @@ Output: 6 short sections, one per topic above, with the most recent dated facts 
         : prompt;
 
       const model = client.getGenerativeModel({
-        model: cfg.model,
+        model: activeModel,
         generationConfig: {
           responseMimeType: 'application/json',
           responseSchema: COMPANY_BRIEF_SCHEMA_GEMINI,
@@ -1703,13 +1766,8 @@ Write the optimized resume now:`;
   } catch (e) {
     if (!opts.interactive) throw e;
     const why = e instanceof Error ? e.message.slice(0, 120) : String(e);
-    console.warn(`[creative] cloud providers unavailable (${why}) — drafting résumé locally with Ollama`);
-    const localWindow = LLM_INTERACTIVE_TIMEOUT_MS * 2;
-    text = await withLlmTimeout(
-      ollamaGenerate(prompt, undefined, undefined, 900, localWindow),
-      'ollama (local résumé variant)',
-      localWindow,
-    );
+    console.warn(`[creative] résumé variant generation failed — no local fallback available (${why})`);
+    throw e;
   }
   const { matched, missing } = matchKeywordsInText(text, keywords);
   return { text, coverage: { required: requiredList, matched, missing } };
@@ -1754,7 +1812,7 @@ const RESUME_JSON_SCHEMA_ANTHROPIC = {
 };
 
 // Gemini's schema format uses SchemaType enum
-const RESUME_JSON_SCHEMA_GEMINI: Schema = {
+const RESUME_JSON_SCHEMA_GEMINI: any = {
   type: SchemaType.OBJECT,
   properties: {
     name: { type: SchemaType.STRING },
@@ -1765,7 +1823,7 @@ const RESUME_JSON_SCHEMA_GEMINI: Schema = {
     experience: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
     education: { type: SchemaType.ARRAY, items: { type: SchemaType.STRING } },
     location: { type: SchemaType.STRING },
-    seniority: { type: SchemaType.STRING, format: 'enum', enum: ['junior', 'mid', 'senior', 'lead', 'architect', 'director', 'vp', 'executive'] },
+    seniority: { type: SchemaType.STRING, enum: ['junior', 'mid', 'senior', 'lead', 'architect', 'director', 'vp', 'executive'] },
     title: { type: SchemaType.STRING },
     yearsOfExperience: { type: SchemaType.NUMBER },
   },
@@ -1791,7 +1849,7 @@ export async function parseResume(rawText: string): Promise<ParsedResume> {
 // broad (senior tech/architect across industries) — the user curates the list
 // on /profile, so over-suggesting is fine; under-suggesting loses coverage.
 // Provider-agnostic: uses primaryGenerate + tolerant JSON-array extraction so
-// it works on Groq/Ollama/etc. without per-provider schema plumbing.
+// it works on Groq/Freeway/etc. without per-provider schema plumbing.
 // ---------------------------------------------------------------------------
 
 const DERIVE_ROLES_RULES = `You are a job-search strategist. Given a candidate's parsed resume, output the set of JOB TITLES / SEARCH TERMS to hunt for on job boards and company career pages.
@@ -1861,7 +1919,7 @@ RULES:
 - Keep each term short (1-4 words). No company names, no locations, no seniority words.
 - Output ONLY a JSON array of strings. No markdown fences, no prose. Example: ["FHIR","HL7","interoperability","Azure","microservices","Kubernetes"]`;
 
-// Tolerant extraction of a term list from arbitrary model output. Ollama (the fallback
+// Tolerant extraction of a term list from arbitrary model output. Some providers (the fallback
 // provider) frequently ignores "JSON only" and returns prose, bullets, or fenced code —
 // which is what made a strict `[...]`-or-throw parse fail. Tries a JSON array first, then
 // quoted strings, then line/comma splitting.

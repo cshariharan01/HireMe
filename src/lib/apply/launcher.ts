@@ -9,18 +9,28 @@
 // behave like normal browsing.
 //
 // Falls back to the bundled Chromium binary when the `chrome` channel is unavailable.
+//
+// IMPORTANT: On Windows, Chrome stores cookies encrypted with DPAPI. A separate Chrome process
+// can ONLY decrypt cookies that were encrypted by the same profile it's opening. This means the
+// isolated `browser-profile` cannot use cookies copied from the user's real Chrome — they remain
+// encrypted and LinkedIn shows "not signed in". The fix: for platforms where login is required
+// (LinkedIn), launch using the user's REAL Chrome profile so Chrome decrypts its own cookies.
+// Use `getSystemChromeProfileDir()` to get that path.
 
-import { chromium, type BrowserContext } from 'playwright';
+import { chromium, type BrowserContext, type Page } from 'playwright';
 import { execSync, spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 
+export const FALLBACK_PROFILE_DIR = path.join(process.cwd(), 'data', 'playwright', 'browser-profile');
+
 const BASE_ARGS = [
-  '--new-window',
   '--start-maximized',
   '--lang=en-US',
   '--no-first-run',
   '--no-default-browser-check',
+  '--disable-blink-features=AutomationControlled',
+  '--test-type',
 ];
 
 export const AUTO_APPLY_SUCCESS_PAGE = `data:text/html;charset=utf-8,${encodeURIComponent(`
@@ -28,7 +38,7 @@ export const AUTO_APPLY_SUCCESS_PAGE = `data:text/html;charset=utf-8,${encodeURI
 <html>
 <head>
   <meta charset="utf-8">
-  <title>HireSignal Auto-Apply</title>
+  <title>HireMe Auto-Apply</title>
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -70,7 +80,7 @@ export const AUTO_APPLY_SUCCESS_PAGE = `data:text/html;charset=utf-8,${encodeURI
 <body>
   <div class="card">
     <div class="badge">✓ Application Submitted</div>
-    <h2>HireSignal Auto-Apply Active</h2>
+    <h2>HireMe Auto-Apply Active</h2>
     <p>Application completed successfully.<br>Holding browser window ready for the next job in queue.</p>
   </div>
 </body>
@@ -98,13 +108,49 @@ interface GlobalBrowserHolder {
   __hiresignal_activeUserDataDir?: string | null;
   __hiresignal_applyCancelled?: boolean;
   __hiresignal_cancelledAt?: number;
+  __hiresignal_windowBroughtToFront?: boolean;
+  __hiresignal_lastApplyAt?: number;
 }
 
 const g = globalThis as unknown as GlobalBrowserHolder;
 
+export function resetWindowFocusTracking(): void {
+  g.__hiresignal_windowBroughtToFront = false;
+  g.__hiresignal_lastApplyAt = 0;
+}
+
+export function shouldBringWindowToFront(force = false): boolean {
+  if (force) return true;
+  if (!g.__hiresignal_windowBroughtToFront) {
+    return true;
+  }
+  const now = Date.now();
+  if (g.__hiresignal_lastApplyAt && now - g.__hiresignal_lastApplyAt > 15 * 60 * 1000) {
+    return true;
+  }
+  return false;
+}
+
+export async function focusApplyPage(page?: Page | null, force = false): Promise<boolean> {
+  if (!shouldBringWindowToFront(force)) {
+    return false;
+  }
+  g.__hiresignal_windowBroughtToFront = true;
+  g.__hiresignal_lastApplyAt = Date.now();
+
+  if (page && !page.isClosed()) {
+    try {
+      await page.bringToFront().catch(() => {});
+      await page.evaluate(() => { try { window.focus(); } catch {} }).catch(() => {});
+    } catch {}
+  }
+  return bringWindowToFront('Chrome', true);
+}
+
 export function cancelApplySession(): void {
   g.__hiresignal_applyCancelled = true;
   g.__hiresignal_cancelledAt = Date.now();
+  resetWindowFocusTracking();
   void closeActiveApplyBrowser();
 }
 
@@ -144,6 +190,7 @@ export async function closeActiveApplyBrowser(): Promise<void> {
     } finally {
       g.__hiresignal_activeContext = null;
       g.__hiresignal_activeUserDataDir = null;
+      resetWindowFocusTracking();
     }
   }
   // Terminate any helper processes on our profile directories so Chrome cannot linger
@@ -163,55 +210,126 @@ export async function closeActiveApplyBrowser(): Promise<void> {
  * lock to clear, then fail with an actionable message instead of a cryptic launch crash.
  */
 
-export function bringWindowToFront(titleKeyword = 'Chrome') {
-  if (process.platform !== 'win32') return;
+export function bringWindowToFront(titleKeyword = 'Chrome', force = false): boolean {
+  if (process.platform !== 'win32') return false;
+  if (!shouldBringWindowToFront(force)) {
+    return false;
+  }
+  g.__hiresignal_windowBroughtToFront = true;
+  g.__hiresignal_lastApplyAt = Date.now();
+  try {
+    // Fast synchronous foreground switch (< 100ms) so Chrome is on top before any page clicks
+    execSync(
+      `powershell -NoProfile -NonInteractive -Command "$wshell = New-Object -ComObject WScript.Shell; $wshell.AppActivate('${titleKeyword}'); $wshell.AppActivate('Chrome')"`,
+      { stdio: 'ignore', timeout: 1000 }
+    );
+  } catch {}
+
+
   try {
     const psScript = `
 Add-Type @"
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
-public class WinWindow {
+public class WinWindowFocus {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")]
-    public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+    public static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")]
+    public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    [DllImport("user32.dll")]
+    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, IntPtr pvParam, uint fWinIni);
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")]
     public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
+
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_NOMOVE = 0x0002;
+    public const uint SWP_SHOWWINDOW = 0x0040;
+    public const uint SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001;
+
+    public static bool ForceForeground(IntPtr hwnd) {
+        if (hwnd == IntPtr.Zero) return false;
+        try {
+            SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, IntPtr.Zero, 0x0002);
+            uint fgProcId;
+            uint fgThreadId = GetWindowThreadProcessId(GetForegroundWindow(), out fgProcId);
+            uint curThreadId = GetCurrentThreadId();
+            if (fgThreadId != 0 && fgThreadId != curThreadId) {
+                AttachThreadInput(curThreadId, fgThreadId, true);
+            }
+            if (IsIconic(hwnd)) {
+                ShowWindow(hwnd, 9); // SW_RESTORE
+            }
+            ShowWindow(hwnd, 5); // SW_SHOW
+            ShowWindow(hwnd, 3); // SW_SHOWMAXIMIZED
+            keybd_event(0x12, 0, 0, 0); // Alt press
+            keybd_event(0x12, 0, 2, 0); // Alt release
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+            SwitchToThisWindow(hwnd, true);
+            if (fgThreadId != 0 && fgThreadId != curThreadId) {
+                AttachThreadInput(curThreadId, fgThreadId, false);
+            }
+            return true;
+        } catch { return false; }
+    }
+
+    public static bool FocusChromeWindows() {
+        bool focused = false;
+        EnumWindows((hwnd, lParam) => {
+            StringBuilder sbClass = new StringBuilder(256);
+            GetClassName(hwnd, sbClass, 256);
+            StringBuilder sbTitle = new StringBuilder(256);
+            GetWindowText(hwnd, sbTitle, 256);
+            string cls = sbClass.ToString();
+            string title = sbTitle.ToString();
+            if (cls == "Chrome_WidgetWin_1" && !string.IsNullOrEmpty(title)) {
+                ForceForeground(hwnd);
+                focused = true;
+            }
+            return true;
+        }, IntPtr.Zero);
+        return focused;
+    }
 }
 "@
-$activated = $false
-for ($attempt = 0; $attempt -lt 12; $attempt++) {
-  $procs = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" | Where-Object {
-    $_.CommandLine -like "*browser-profile*" -or $_.CommandLine -like "*naukri-profile*" -or $_.CommandLine -like "*playwright*"
-  }
-  foreach ($p in $procs) {
-    $proc = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
-    if ($proc -and $proc.MainWindowHandle -ne 0) {
-      [WinWindow]::ShowWindowAsync($proc.MainWindowHandle, 9)
-      [WinWindow]::ShowWindowAsync($proc.MainWindowHandle, 3)
-      [WinWindow]::BringWindowToTop($proc.MainWindowHandle)
-      [WinWindow]::keybd_event(0x12, 0, 0, 0)
-      [WinWindow]::keybd_event(0x12, 0, 2, 0)
-      [WinWindow]::SwitchToThisWindow($proc.MainWindowHandle, $true)
-      [WinWindow]::SetForegroundWindow($proc.MainWindowHandle)
-      $activated = $true
-      break
-    }
-  }
-  if ($activated) { break }
-  Start-Sleep -Milliseconds 250
+
+$focused = $false
+for ($i = 0; $i -lt 10; $i++) {
+    $focused = [WinWindowFocus]::FocusChromeWindows()
+    if ($focused) { break }
+    Start-Sleep -Milliseconds 300
 }
-if (-not $activated) {
+if (-not $focused) {
   $wshell = New-Object -ComObject WScript.Shell
   $wshell.AppActivate('${titleKeyword}')
-  $wshell.AppActivate('LinkedIn')
-  $wshell.AppActivate('Naukri')
   $wshell.AppActivate('Chrome')
 }
 `;
@@ -224,33 +342,36 @@ if (-not $activated) {
   } catch {
     // ignore
   }
+  return true;
 }
 
-function cleanupStaleProfileLock(userDataDir: string) {
+export function cleanupStaleProfileLock(userDataDir?: string) {
   try {
     if (process.platform === 'win32') {
-      // Terminate any leftover helper processes specifically attached to this user-data-dir
-      const dirBase = path.basename(userDataDir);
-      const psScript = [
-        `$procs = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'"`,
-        `$targets = $procs | Where-Object { $_.CommandLine -like "*${dirBase}*" }`,
-        `foreach ($t in $targets) { Stop-Process -Id $t.ProcessId -Force -ErrorAction SilentlyContinue }`,
-      ].join('; ');
-      const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
-      execSync(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`, { stdio: 'ignore', timeout: 7000 });
+      const dirBase = userDataDir ? path.basename(userDataDir) : '';
+      const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \\"Name = 'chrome.exe'\\" | Where-Object { $_.CommandLine -like '*browser-profile*' -or $_.CommandLine -like '*naukri-profile*' -or $_.CommandLine -like '*playwright*' ${dirBase ? `-or $_.CommandLine -like '*${dirBase}*'` : ''} } | Stop-Process -Force -ErrorAction SilentlyContinue"`;
+      execSync(cmd, { stdio: 'ignore', timeout: 2500 });
     } else {
-      execSync(`pkill -f "${userDataDir}"`, { stdio: 'ignore' });
+      execSync(`pkill -f "browser-profile|naukri-profile|remote-debugging-pipe"`, { stdio: 'ignore', timeout: 2000 });
     }
   } catch {
     // ignore
   }
 
-  // Also remove stale lockfile if left behind
-  try {
-    const lockPath = path.join(userDataDir, 'lockfile');
-    if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
-  } catch {
-    // ignore
+  // Also remove stale lockfiles if left behind
+  if (userDataDir) {
+    try {
+      const lockPath = path.join(userDataDir, 'lockfile');
+      if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
+    } catch {
+      // ignore
+    }
+    try {
+      const singletonLockPath = path.join(userDataDir, 'SingletonLock');
+      if (fs.existsSync(singletonLockPath)) fs.unlinkSync(singletonLockPath);
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -266,24 +387,90 @@ async function tryLaunchPersistent(userDataDir: string, opts: Parameters<typeof 
       if (!profileLocked || attempt === 2) throw err;
       console.warn('[apply] profile dir locked by another Chrome instance — cleaning up stale helpers and retrying...');
       cleanupStaleProfileLock(userDataDir);
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, 1000));
     }
   }
   throw lastErr;
+}
+
+/**
+ * Returns the user's real Chrome Default profile directory (Windows/macOS/Linux).
+ * When it exists, launching with this directory means Chrome decrypts its own DPAPI cookies,
+ * so LinkedIn/Naukri sessions are automatically active. Returns null if Chrome is not installed
+ * or the profile can't be found.
+ */
+export function getSystemChromeProfileDir(): string | null {
+  try {
+    let candidateDirs: string[] = [];
+    if (process.platform === 'win32') {
+      const localAppData = process.env.LOCALAPPDATA || '';
+      if (localAppData) candidateDirs.push(path.join(localAppData, 'Google', 'Chrome', 'User Data'));
+    } else if (process.platform === 'darwin') {
+      const home = process.env.HOME || '';
+      if (home) candidateDirs.push(path.join(home, 'Library', 'Application Support', 'Google', 'Chrome'));
+    } else {
+      const home = process.env.HOME || '';
+      if (home) candidateDirs.push(path.join(home, '.config', 'google-chrome'));
+    }
+    for (const dir of candidateDirs) {
+      const cookiesPath = path.join(dir, 'Default', 'Network', 'Cookies');
+      if (fs.existsSync(cookiesPath)) {
+        console.log('[apply] using real Chrome profile for login session:', dir);
+        return dir;
+      }
+    }
+  } catch {
+    // ignore — fallback to isolated profile
+  }
+  return null;
+}
+
+/**
+ * Seed non-cookie state from system Chrome into targetDir if targetDir is new.
+ * Note: Cookies are NOT copied because Windows ABE/DPAPI causes browser cookie purges.
+ */
+export function seedFromSystemChrome(targetDir: string) {
+  try {
+    const localAppData = process.env.LOCALAPPDATA;
+    if (!localAppData) return;
+    const sysUserData = path.join(localAppData, 'Google', 'Chrome', 'User Data');
+    if (!fs.existsSync(sysUserData) || sysUserData === targetDir) return;
+
+    if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+
+    // Copy Default directory non-cookie assets: Preferences, Local Storage, Session Storage
+    const sysDefaultDir = path.join(sysUserData, 'Default');
+    const targetDefaultDir = path.join(targetDir, 'Default');
+    if (fs.existsSync(sysDefaultDir)) {
+      if (!fs.existsSync(targetDefaultDir)) fs.mkdirSync(targetDefaultDir, { recursive: true });
+
+      const sysPref = path.join(sysDefaultDir, 'Preferences');
+      const targetPref = path.join(targetDefaultDir, 'Preferences');
+      if (fs.existsSync(sysPref) && !fs.existsSync(targetPref)) {
+        try { fs.copyFileSync(sysPref, targetPref); } catch {}
+      }
+
+      const sysLs = path.join(sysDefaultDir, 'Local Storage');
+      const targetLs = path.join(targetDefaultDir, 'Local Storage');
+      if (fs.existsSync(sysLs) && !fs.existsSync(targetLs)) {
+        try { fs.cpSync(sysLs, targetLs, { recursive: true, force: true }); } catch {}
+      }
+    }
+  } catch (err) {
+    console.warn('[apply] Error seeding from system Chrome:', err);
+  }
 }
 
 export async function launchApplyBrowser(
   userDataDir: string,
   opts: ApplyLaunchOptions = {},
 ): Promise<BrowserContext> {
+  const shouldFocus = opts.focus ?? true;
+
   // Reuse active connected browser session if one already exists for this profile
   const existing = await getActiveApplyBrowser(userDataDir);
-  const shouldFocus = opts.focus ?? true;
   if (existing) {
-    console.log('[apply] reusing existing active browser session');
-    if (shouldFocus) {
-      bringWindowToFront('Chrome');
-    }
+    console.log('[apply] reusing existing active browser session (already open) — keeping in background');
     return existing;
   }
 
@@ -292,7 +479,7 @@ export async function launchApplyBrowser(
     viewport: null,
     locale: opts.locale ?? 'en-US',
     extraHTTPHeaders: opts.extraHTTPHeaders ?? DEFAULT_HEADERS,
-    args: opts.args ?? BASE_ARGS,
+    args: Array.from(new Set([...BASE_ARGS, ...(opts.args || [])])),
     ignoreDefaultArgs: ['--enable-automation'],
   };
 
@@ -300,12 +487,13 @@ export async function launchApplyBrowser(
     const ctx = await tryLaunchPersistent(userDataDir, {
       ...launchOpts,
       channel: 'chrome',
-      ignoreDefaultArgs: [...launchOpts.ignoreDefaultArgs, '--no-sandbox'],
+      ignoreDefaultArgs: ['--enable-automation'],
     });
     console.log('[apply] launched real Chrome (channel=chrome)');
     try {
       await ctx.addInitScript(() => {
         try {
+          delete (Object.getPrototypeOf(navigator) as any).webdriver;
           Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         } catch {}
       });
@@ -316,38 +504,71 @@ export async function launchApplyBrowser(
       if (g.__hiresignal_activeContext === ctx) {
         g.__hiresignal_activeContext = null;
         g.__hiresignal_activeUserDataDir = null;
+        resetWindowFocusTracking();
       }
     });
-    if (shouldFocus) {
-      bringWindowToFront('Chrome');
+
+    if (shouldFocus && shouldBringWindowToFront(false)) {
+      try {
+        const page = ctx.pages()[0];
+        if (page && !page.isClosed()) {
+          await page.bringToFront().catch(() => {});
+          await page.evaluate(() => { try { window.focus(); } catch {} }).catch(() => {});
+        }
+      } catch {}
+      bringWindowToFront('Chrome', true);
+      setTimeout(() => bringWindowToFront('Chrome', true), 200);
+      setTimeout(() => bringWindowToFront('Chrome', true), 600);
+      setTimeout(() => bringWindowToFront('Chrome', true), 1200);
+      setTimeout(() => bringWindowToFront('Chrome', true), 2500);
     }
     return ctx;
   } catch (err) {
     const msg = (err as Error).message || '';
-    if (/RESULT_CODE_PROFILE_IN_USE|process did exit|browser has been closed|Target page, context or browser has been closed/i.test(msg)) {
-      throw new Error(PROFILE_IN_USE_ERROR);
-    }
-    console.warn(
-      `[apply] real Chrome unavailable (${(err as Error).message || 'unknown error'}) — falling back to bundled Chromium`,
-    );
-    const fallbackCtx = await tryLaunchPersistent(userDataDir, launchOpts);
+    console.warn(`[apply] Primary Chrome profile unavailable (${msg.slice(0, 100)}) — launching isolated profile fallback`);
+    const fallbackDir = userDataDir !== FALLBACK_PROFILE_DIR ? FALLBACK_PROFILE_DIR : userDataDir;
+    if (!fs.existsSync(fallbackDir)) fs.mkdirSync(fallbackDir, { recursive: true });
+    seedFromSystemChrome(fallbackDir);
+
+    const fallbackCtx = await tryLaunchPersistent(fallbackDir, {
+      ...launchOpts,
+      channel: 'chrome',
+      ignoreDefaultArgs: ['--enable-automation'],
+    }).catch(async () => {
+      return await tryLaunchPersistent(fallbackDir, launchOpts);
+    });
+
     try {
       await fallbackCtx.addInitScript(() => {
         try {
+          delete (Object.getPrototypeOf(navigator) as any).webdriver;
           Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         } catch {}
       });
     } catch {}
     g.__hiresignal_activeContext = fallbackCtx;
-    g.__hiresignal_activeUserDataDir = userDataDir;
+    g.__hiresignal_activeUserDataDir = fallbackDir;
     fallbackCtx.on('close', () => {
       if (g.__hiresignal_activeContext === fallbackCtx) {
         g.__hiresignal_activeContext = null;
         g.__hiresignal_activeUserDataDir = null;
+        resetWindowFocusTracking();
       }
     });
-    if (shouldFocus) {
-      bringWindowToFront('Chromium');
+
+    if (shouldFocus && shouldBringWindowToFront(false)) {
+      try {
+        const page = fallbackCtx.pages()[0];
+        if (page && !page.isClosed()) {
+          await page.bringToFront().catch(() => {});
+          await page.evaluate(() => { try { window.focus(); } catch {} }).catch(() => {});
+        }
+      } catch {}
+      bringWindowToFront('Chrome', true);
+      setTimeout(() => bringWindowToFront('Chrome', true), 200);
+      setTimeout(() => bringWindowToFront('Chrome', true), 600);
+      setTimeout(() => bringWindowToFront('Chrome', true), 1200);
+      setTimeout(() => bringWindowToFront('Chrome', true), 2500);
     }
     return fallbackCtx;
   }

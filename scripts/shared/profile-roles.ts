@@ -12,8 +12,7 @@ import type Database from 'better-sqlite3';
 
 /**
  * Return the user's enabled target roles (my_profile.parsed_json.targets.roles).
- * Returns [] when there is no profile, no roles, or the JSON can't be read — callers
- * should fall back to their own hardcoded defaults in that case.
+ * Falls back to parsed resume title or suggested roles when target roles are not explicitly set.
  */
 export function getEnabledRoles(db: Database.Database): string[] {
   try {
@@ -22,7 +21,14 @@ export function getEnabledRoles(db: Database.Database): string[] {
       | undefined;
     if (!row) return [];
     const parsed = JSON.parse(row.parsed_json);
-    const roles = parsed?.targets?.roles;
+    let roles = parsed?.targets?.roles;
+    if (!Array.isArray(roles) || roles.length === 0) {
+      if (parsed?.title && typeof parsed.title === 'string' && parsed.title.trim()) {
+        roles = [parsed.title.trim()];
+      } else if (Array.isArray(parsed?.suggested_roles) && parsed.suggested_roles.length > 0) {
+        roles = parsed.suggested_roles;
+      }
+    }
     if (!Array.isArray(roles)) return [];
     return roles
       .filter((r: unknown): r is string => typeof r === 'string')
@@ -40,7 +46,7 @@ export function resolveRoleQueries(db: Database.Database, fallback: string[]): s
 }
 
 /**
- * Return the user's years of experience from my_profile.parsed_json.
+ * Return the user's years of experience from my_profile.parsed_json (supports decimals e.g. 3.1, 3.5).
  * Returns the provided fallback (default 3) when not set.
  */
 export function getProfileYoe(db: Database.Database, fallback = 3): number {
@@ -55,10 +61,10 @@ export function getProfileYoe(db: Database.Database, fallback = 3): number {
       parsed?.yearsExperience ??
       parsed?.targets?.yearsOfExperience ??
       null;
-    if (typeof yoe === 'number' && yoe > 0) return Math.round(yoe);
+    if (typeof yoe === 'number' && yoe > 0) return yoe;
     if (typeof yoe === 'string') {
       const n = parseFloat(yoe);
-      if (!isNaN(n) && n > 0) return Math.round(n);
+      if (!isNaN(n) && n > 0) return n;
     }
     return fallback;
   } catch {
@@ -67,12 +73,77 @@ export function getProfileYoe(db: Database.Database, fallback = 3): number {
 }
 
 /**
+ * Return candidate domain terms from my_profile.parsed_json.
+ */
+export function getProfileDomainTerms(db: Database.Database): string[] {
+  try {
+    const row = db.prepare('SELECT parsed_json FROM my_profile WHERE id = 1').get() as
+      | { parsed_json: string }
+      | undefined;
+    if (!row) return [];
+    const parsed = JSON.parse(row.parsed_json);
+    const terms = [
+      ...(Array.isArray(parsed?.domain_terms) ? parsed.domain_terms : []),
+      ...(Array.isArray(parsed?.skills) ? parsed.skills : []),
+    ];
+    return terms
+      .filter((t: unknown): t is string => typeof t === 'string' && t.trim().length > 2)
+      .map((t) => t.trim());
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Check if a job text matches candidate's domain priority terms.
+ */
+export function isDomainPriorityJob(db: Database.Database, text: string): boolean {
+  const terms = getProfileDomainTerms(db);
+  if (terms.length === 0) return false;
+  const lower = (text || '').toLowerCase();
+  let count = 0;
+  for (const term of terms) {
+    if (lower.includes(term.toLowerCase())) {
+      count++;
+      if (count >= 2) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Build the final deduplicated search role list.
  * Uses profile roles when available, falls back to defaults.
- * Does NOT append hardcoded DE tech variants — those only made sense for one user.
  */
 export function resolveSearchRoles(db: Database.Database, defaults: string[]): string[] {
   const roles = getEnabledRoles(db);
   const base = roles.length ? roles : defaults;
   return Array.from(new Set(base));
 }
+
+/**
+ * Return candidate's enabled target locations (my_profile.parsed_json.targets.locations).
+ */
+export function getEnabledLocations(db: Database.Database): string[] {
+  try {
+    const row = db.prepare('SELECT parsed_json FROM my_profile WHERE id = 1').get() as
+      | { parsed_json: string }
+      | undefined;
+    if (!row) return [];
+    const parsed = JSON.parse(row.parsed_json);
+    let locs = parsed?.targets?.locations;
+    if (!Array.isArray(locs) || locs.length === 0) {
+      if (parsed?.location && typeof parsed.location === 'string') {
+        locs = [parsed.location];
+      }
+    }
+    if (!Array.isArray(locs)) return [];
+    return locs
+      .filter((l: unknown): l is string => typeof l === 'string')
+      .map((l) => l.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+

@@ -1,12 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { promoteDocumentsToApplication } from '@/lib/apply/documents';
 import db from '@/lib/db';
+import { getActiveOwnerId } from '@/lib/apply/screening-owner';
 import { prepareSubmission, checkRateLimit, type SubmissionPlan, type BrowserSubmissionPlan } from '@/lib/apply/prepare';
 import { submitGreenhouse } from '@/lib/apply/greenhouse';
 import { submitAshby } from '@/lib/apply/ashby';
 import { browserAutofill } from '@/lib/apply/browser';
-import { linkedInApply } from '@/lib/apply/linkedin';
-import { naukriApply } from '@/lib/apply/naukri';
+import { linkedInApply, preLaunchLinkedInBrowser } from '@/lib/apply/linkedin';
+import { naukriApply, preLaunchNaukriBrowser } from '@/lib/apply/naukri';
 import { getApplyConfig } from '@/lib/apply/questions';
 import { isApplyCancelled, resetApplyCancellation } from '@/lib/apply/launcher';
 
@@ -159,9 +160,26 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
     const overrides = (body.overrides || {}) as Record<string, unknown>;
     const resumeSource = body.resumeSource === 'original' || body.resumeSource === 'tailored' ? body.resumeSource : undefined;
 
+    // For Naukri / LinkedIn jobs: launch Chrome IMMEDIATELY — in parallel with prepareSubmission.
+    // This way the user sees the browser open right away when they click Apply,
+    // not after LLM calls and PDF generation (which can take 10–30 s).
+    const _pQuickJob = db.prepare('SELECT url FROM job_postings WHERE id = ?').get(jobId) as { url: string } | undefined;
+    const _pJobUrl = _pQuickJob?.url ?? '';
+    const _pIsNaukri = !!(_pJobUrl && /naukri\.com/i.test(_pJobUrl));
+    const _pIsLinkedIn = !!(_pJobUrl && /linkedin\.com/i.test(_pJobUrl));
+    const _naukriPrelaunchPromise = _pIsNaukri
+      ? preLaunchNaukriBrowser(_pJobUrl).catch(() => null)
+      : Promise.resolve(null);
+    const _linkedInPrelaunchPromise = _pIsLinkedIn
+      ? preLaunchLinkedInBrowser(_pJobUrl).catch(() => null)
+      : Promise.resolve(null);
+
     // Re-prepare the plan so we have fresh PDF bytes + a fresh schema snapshot
     const result = await prepareSubmission(jobId, { resumeSource });
     if (!result.ok || !result.plan) {
+      // Clean up any pre-launched browser if submission preparation failed
+      void _naukriPrelaunchPromise.then((p) => { if (p) p.ctx.close().catch(() => {}); });
+      void _linkedInPrelaunchPromise.then((p) => { if (p) p.ctx.close().catch(() => {}); });
       return NextResponse.json({ ok: false, error: result.error, warnings: result.warnings }, { status: 400 });
     }
 
@@ -181,6 +199,9 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
     // Apply user overrides — overwrite plan field values.
     // Greenhouse fields are keyed by `name`, Ashby fields by `path`.
     const plan = result.plan;
+    // Collect the pre-launched browsers (started in parallel with prepareSubmission)
+    const naukriPrelaunch   = plan.strategy === 'naukri'   ? (await _naukriPrelaunchPromise)   : null;
+    const linkedInPrelaunch = plan.strategy === 'linkedin' ? (await _linkedInPrelaunchPromise) : null;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     for (const f of plan.fields as any[]) {
       const key: string | undefined = f.name ?? f.path;
@@ -240,6 +261,7 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
                 ? new TextDecoder().decode(p.attachments.coverLetter.bytes)
                 : undefined,
               autoSubmit,
+              prelaunchedContext: linkedInPrelaunch ?? undefined,
             })
           : await naukriApply({
               jobUrl: p.url,
@@ -249,13 +271,17 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
               companyName: p.company,
               jobTitle: p.jobTitle,
               autoSubmit,
+              prelaunchedContext: naukriPrelaunch ?? undefined,
             });
 
         const stoppedForReview = platformResult.status === 'stopped_for_review';
         const submitted = platformResult.status === 'submitted';
+        const alreadyApplied = platformResult.status === 'already_applied';
         const loginRequired = platformResult.status === 'login_required';
         const captcha = platformResult.status === 'captcha';
-        const ok = submitted || stoppedForReview;
+        const isExpired = platformResult.status === 'expired' || Boolean(platformResult.error?.toLowerCase().includes('expired'));
+        const isExternal = platformResult.status === 'external_apply' || Boolean(platformResult.error?.toLowerCase().includes('company website') || platformResult.error?.toLowerCase().includes('company site'));
+        const ok = submitted || stoppedForReview || alreadyApplied;
         submitResult = {
           ok,
           status: ok ? 200 : 0,
@@ -267,23 +293,39 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
             filledFields: platformResult.filledFields,
             resumeAttached: platformResult.resumeAttached,
             stepCount: platformResult.stepCount,
-            submitted,
+            submitted: submitted || alreadyApplied,
             stoppedForReview,
+            alreadyApplied,
             readyForSubmit: platformResult.readyForSubmit ?? false,
             loginRequired,
             captcha,
+            expired: isExpired,
+            externalApply: isExternal,
           },
           submissionId: undefined,
-          error: ok
+          error: ok && !alreadyApplied
             ? undefined
-            : loginRequired
-              ? 'Naukri login required. Please log into your Naukri account in the Chrome window.'
-              : captcha
-                ? 'CAPTCHA detected. Please solve it in the Chrome window.'
-                : platformResult.error || `Platform flow failed (${platformResult.status})`,
+            : alreadyApplied
+              ? undefined
+              : loginRequired
+                ? `${plan.strategy === 'linkedin' ? 'LinkedIn' : 'Naukri'} login required. Please log into your account in the Chrome window.`
+                : captcha
+                  ? 'CAPTCHA detected. Please solve it in the Chrome window.'
+                  : isExpired
+                    ? 'Job has expired (no longer accepting applications).'
+                    : isExternal
+                      ? 'This job requires applying on the company website (external).'
+                      : platformResult.error || `Platform flow failed (${platformResult.status})`,
         };
 
-        if (!ok && platformResult.error?.includes('company website')) {
+        if (isExpired) {
+          try {
+            db.prepare("UPDATE job_postings SET url_status = 'dead', expired_at = datetime('now'), url_checked_at = datetime('now') WHERE id = ?").run(jobId);
+          } catch (e) {
+            console.warn('[apply] Failed to mark job expired in DB:', (e as Error).message);
+          }
+        }
+        if (isExternal) {
           try {
             db.prepare("UPDATE job_postings SET apply_type = 'external' WHERE id = ?").run(jobId);
           } catch {}
@@ -451,43 +493,49 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
       submitResult.error?.toLowerCase().includes('already applied') ||
       false;
     const isPlatformSubmitted = (submitResult.responseBody as { submitted?: boolean })?.submitted === true;
-    const shouldTrack = !dryRun && (
+    const loginRequired = (submitResult?.responseBody as { loginRequired?: boolean })?.loginRequired === true;
+    const captcha = (submitResult?.responseBody as { captcha?: boolean })?.captcha === true;
+    const shouldTrack = !dryRun && !loginRequired && !captcha && (
       submitResult.ok ||
       isPlatformSubmitted ||
-      browserUnconfirmed ||
       alreadyAppliedOnPlatform ||
-      (autoSubmit && (stoppedForReview || (submitResult.responseBody as { readyForSubmit?: boolean })?.readyForSubmit))
+      browserUnconfirmed
     );
     if (shouldTrack) {
-      const exists = db.prepare('SELECT id FROM my_applications WHERE job_id = ?').get(jobId);
+      const activeOwner = getActiveOwnerId();
+      const exists = db
+        .prepare('SELECT id FROM my_applications WHERE job_id = ? AND (owner_id = ? OR owner_id IS NULL)')
+        .get(jobId, activeOwner) as { id: number } | undefined;
       const now = new Date().toISOString();
       const today = now.slice(0, 10);
       const note = (submitResult.ok && !stoppedForReview)
         ? null
         : alreadyAppliedOnPlatform
           ? `Already applied on ${plan.strategy}`
-          : (autoSubmit && stoppedForReview)
-            ? 'Pre-filled in Chrome during Auto-Apply — confirm final submit in Tracker'
-            : UNCONFIRMED_NOTE;
+          : UNCONFIRMED_NOTE;
+      const appliedResumeSource = result.resumeSource || resumeSource || 'tailored';
       if (exists) {
         db.prepare(
           `UPDATE my_applications
            SET status = 'applied',
+               owner_id = COALESCE(owner_id, ?),
                submitted_via = ?,
                submitted_at = ?,
                applied_at = ?,
                applied_date = ?,
                submission_id = ?,
                submission_error = ?,
+               resume_source = ?,
+               tailored_score = CASE WHEN ? = 'original' THEN NULL ELSE tailored_score END,
                last_status_change_at = ?
-           WHERE job_id = ?`
-        ).run(plan.strategy, now, now, today, submitResult.submissionId || null, note, now, jobId);
+           WHERE id = ?`
+        ).run(activeOwner, plan.strategy, now, now, today, submitResult.submissionId || null, note, appliedResumeSource, appliedResumeSource, now, exists.id);
       } else {
         db.prepare(
           `INSERT INTO my_applications
-            (job_id, status, submitted_via, submitted_at, applied_at, applied_date, submission_id, submission_error, last_status_change_at)
-           VALUES (?, 'applied', ?, ?, ?, ?, ?, ?, ?)`
-        ).run(jobId, plan.strategy, now, now, today, submitResult.submissionId || null, note, now);
+            (job_id, owner_id, status, submitted_via, submitted_at, applied_at, applied_date, submission_id, submission_error, resume_source, last_status_change_at)
+           VALUES (?, ?, 'applied', ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(jobId, activeOwner, plan.strategy, now, now, today, submitResult.submissionId || null, note, appliedResumeSource, now);
       }
       // A real application now exists, so any speculatively-cached cover letter / resume variant
       // belongs ON it — the tracker should show what was actually sent.
@@ -501,13 +549,25 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
         console.warn('[apply] match cache invalidation error:', e);
       }
 
-      // Automatically calculate and store tailored match score for the applied job
-      try {
-        const { calculateAndStoreTailoredScore } = await import('@/lib/tailored-score');
-        await calculateAndStoreTailoredScore(jobId);
-      } catch (e) {
-        console.warn('[apply] auto tailored score error:', e);
+      if (appliedResumeSource !== 'original') {
+        // Automatically calculate and store tailored match score for the applied job
+        try {
+          const { calculateAndStoreTailoredScore } = await import('@/lib/tailored-score');
+          await calculateAndStoreTailoredScore(jobId);
+        } catch (e) {
+          console.warn('[apply] auto tailored score error:', e);
+        }
       }
+    }
+
+    const isJobExpired = (submitResult.responseBody as { expired?: boolean })?.expired ?? false;
+    const isCompanySite = (submitResult.responseBody as { externalApply?: boolean })?.externalApply ?? false;
+
+    if (isJobExpired) {
+      try {
+        const { invalidateMatchCache } = await import('@/lib/matches');
+        invalidateMatchCache(jobId, {});
+      } catch {}
     }
 
     return NextResponse.json({
@@ -516,6 +576,8 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
       stoppedForReview: stoppedForReview && !autoSubmit,
       alreadyApplied: alreadyAppliedOnPlatform,
       readyForSubmit: (submitResult.responseBody as { readyForSubmit?: boolean })?.readyForSubmit ?? false,
+      expired: isJobExpired,
+      externalApply: isCompanySite,
       dryRun,
       strategy: plan.strategy,
       submissionId: submitResult.submissionId,

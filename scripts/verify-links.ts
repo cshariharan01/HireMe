@@ -17,7 +17,8 @@ const VERIFY_LIMIT = Math.min(Math.max(MATCH_LIMIT * 2, 20), 300);
 const RECHECK_HOURS = parseInt(process.env.LINK_RECHECK_HOURS || '24', 10) || 24;
 const CONCURRENCY = 5;
 
-const db = new Database(path.join(process.cwd(), 'data', 'hiresignal.db'));
+const DB_PATH = process.env.HIREME_DB || process.env.HIRESIGNAL_DB || path.join(process.cwd(), 'data', 'hireme.db');
+const db = new Database(DB_PATH);
 sqliteVec.load(db);
 db.pragma('journal_mode = WAL');
 // Per-connection: the NORMAL set in src/lib/db.ts does not reach a standalone script, and

@@ -22,7 +22,7 @@ export interface SkillDef {
   canonical: string;
   aliases?: string[];
   /** Coarse grouping, used to explain a mismatch ("different language/runtime"). */
-  group: 'language' | 'runtime' | 'frontend' | 'backend' | 'data' | 'cloud' | 'devops' | 'healthcare' | 'practice';
+  group: 'language' | 'runtime' | 'frontend' | 'backend' | 'data' | 'cloud' | 'devops' | 'healthcare' | 'practice' | 'business' | 'analytics' | 'qa' | 'support' | 'infrastructure';
 }
 
 export const TECH_SKILLS: SkillDef[] = [
@@ -172,7 +172,9 @@ export const TECH_SKILLS: SkillDef[] = [
   { canonical: 'CMS Interoperability', aliases: ['cms-0057', 'cms 0057', 'cms-9115'], group: 'healthcare' },
 
   // --- AI / practice ---
-  { canonical: 'Generative AI', aliases: ['genai', 'gen ai', 'llm', 'llms', 'large language model'], group: 'practice' },
+  { canonical: 'Generative AI', aliases: ['genai', 'gen ai', 'llm', 'llms', 'large language model', 'large language models'], group: 'practice' },
+  { canonical: 'Agentic AI', aliases: ['agentic ai architecture', 'ai agents', 'agentic workflows'], group: 'practice' },
+  { canonical: 'Foundation Models', aliases: ['foundation model', 'fm'], group: 'practice' },
   { canonical: 'RAG', aliases: ['retrieval augmented generation'], group: 'practice' },
   { canonical: 'Prompt Engineering', group: 'practice' },
   { canonical: 'Machine Learning', aliases: ['ml'], group: 'practice' },
@@ -184,6 +186,44 @@ export const TECH_SKILLS: SkillDef[] = [
   { canonical: 'Agile', aliases: ['scrum', 'kanban', 'safe agile'], group: 'practice' },
   { canonical: 'System Design', aliases: ['scalable system design'], group: 'practice' },
   { canonical: 'Test Automation', aliases: ['selenium', 'cypress', 'playwright', 'robot framework'], group: 'practice' },
+
+  // --- business analysis & product management ---
+  { canonical: 'Business Analysis', aliases: ['business analyst', 'ba', 'business analytical'], group: 'business' },
+  { canonical: 'Business Requirements', aliases: ['requirement gathering', 'requirements gathering', 'brd', 'frd', 'business specification', 'user stories'], group: 'business' },
+  { canonical: 'User Acceptance Testing', aliases: ['uat', 'user acceptance test', 'uat testing', 'iterative testing'], group: 'business' },
+  { canonical: 'Product Management', aliases: ['product analyst', 'product lifecycle', 'product roadmap', 'backlog prioritization'], group: 'business' },
+  { canonical: 'Process Documentation', aliases: ['documentation', 'process mapping', 'workflow documentation'], group: 'business' },
+  { canonical: 'Change Management', group: 'business' },
+  { canonical: 'Stakeholder Management', aliases: ['stakeholder engagement', 'client presentations'], group: 'business' },
+  { canonical: 'Jira', aliases: ['atlassian jira', 'confluence'], group: 'business' },
+
+  // --- risk, audit, governance & analytics ---
+  { canonical: 'Risk Assessment', aliases: ['risk advisory', 'risk analytics', 'risk management', 'risk monitoring'], group: 'analytics' },
+  { canonical: 'Internal Controls', aliases: ['internal control', 'control automation', 'control monitoring', 'audit controls'], group: 'analytics' },
+  { canonical: 'Audit', aliases: ['internal audit', 'audit processes', 'audit advisory'], group: 'analytics' },
+  { canonical: 'Compliance', aliases: ['regulatory compliance', 'governance', 'grc'], group: 'analytics' },
+  { canonical: 'Data Analytics', aliases: ['analytics', 'business analytics', 'gap analysis', 'root cause analysis', 'data analysis', 'data analyst'], group: 'analytics' },
+  { canonical: 'KPI Tracking', aliases: ['mis', 'mis reporting', 'executive dashboards', 'performance monitoring'], group: 'analytics' },
+  { canonical: 'Excel', aliases: ['advanced excel', 'ms excel', 'vlookup', 'pivot tables'], group: 'analytics' },
+  { canonical: 'Data Science', aliases: ['data scientist', 'pandas', 'numpy', 'scipy', 'statistical analysis', 'predictive modeling'], group: 'analytics' },
+
+  // --- QA & test engineering ---
+  { canonical: 'Software Quality Assurance', aliases: ['qa engineer', 'qa analyst', 'quality assurance', 'sqa', 'software testing', 'qa'], group: 'qa' },
+  { canonical: 'Manual Testing', aliases: ['functional testing', 'regression testing', 'sanity testing', 'smoke testing', 'black box testing', 'test cases', 'test execution'], group: 'qa' },
+  { canonical: 'API Testing', aliases: ['postman', 'rest assured', 'restassured', 'soapui', 'api automation'], group: 'qa' },
+  { canonical: 'Performance Testing', aliases: ['jmeter', 'loadrunner', 'locust', 'load testing', 'stress testing'], group: 'qa' },
+  { canonical: 'Bug Tracking', aliases: ['defect tracking', 'defect management', 'bug life cycle'], group: 'qa' },
+
+  // --- technical support & IT services ---
+  { canonical: 'Technical Support', aliases: ['tech support', 'it support', 'helpdesk', 'l1 support', 'l2 support', 'l3 support', 'technical support engineer', 'customer support'], group: 'support' },
+  { canonical: 'Incident Management', aliases: ['troubleshooting', 'ticket resolution', 'sla management', 'servicenow', 'zendesk', 'itil'], group: 'support' },
+
+  // --- system engineering, infra & networking ---
+  { canonical: 'System Engineering', aliases: ['system engineer', 'systems engineer', 'systems engineering', 'systems administration', 'sysadmin', 'system administrator'], group: 'infrastructure' },
+  { canonical: 'Infrastructure Support', aliases: ['local infra support', 'infra support', 'infrastructure management', 'it infrastructure', 'desktop support', 'hardware troubleshooting'], group: 'infrastructure' },
+  { canonical: 'Network Configuration', aliases: ['network engineer', 'network configuration engineer', 'networking', 'tcp/ip', 'dns', 'dhcp', 'vpn', 'firewall', 'cisco', 'routers and switches', 'routing and switching'], group: 'infrastructure' },
+  { canonical: 'Windows Server', aliases: ['active directory', 'group policy', 'ad', 'windows administration'], group: 'infrastructure' },
+  { canonical: 'Virtualization', aliases: ['vmware', 'hyper-v', 'virtualbox', 'vcenter', 'vsphere'], group: 'infrastructure' },
 ];
 
 /** Names that are dangerous as substrings and must always match with strict boundaries. */

@@ -5,17 +5,16 @@ import { assertEmbeddingConsistent, recordEmbeddingSignature } from '@/lib/embed
 import { parseResume, deriveTargetRoles, deriveDomainTerms } from '@/lib/llm';
 import { setActiveResume, getActiveResumeId } from '@/lib/resumes';
 
-// Embedding failures surface as opaque errors — turn them into a clear, provider-aware message.
 function friendlyError(e: unknown): { message: string; status: number } {
   const msg = e instanceof Error ? e.message : String(e);
-  // Provider-mismatch guard message is already actionable — pass it through as 409 Conflict.
   if (/provider mismatch/i.test(msg)) return { message: msg, status: 409 };
+  if (/API_KEY_INVALID|API key not valid|invalid api key/i.test(msg)) {
+    return { message: 'The API key configured is invalid. Please get a free key at https://aistudio.google.com/apikey and save it in Settings.', status: 400 };
+  }
   if (/fetch failed|ECONNREFUSED|ENOTFOUND|network|11434|embedding|aborted|timeout|HTTP (401|403|429|5\d\d)/i.test(msg)) {
     const { provider, model } = getEmbeddingInfo();
-    if (provider === 'ollama') {
-      return { message: 'Embedding via Ollama failed or timed out (it may be down or overloaded). Ensure `ollama serve` is running with `nomic-embed-text` pulled, then retry.', status: 503 };
-    }
-    return { message: `Embedding via ${provider} (${model}) failed: ${msg.slice(0, 140)}. Check EMBEDDING_API_KEY / provider status, then retry.`, status: 503 };
+
+    return { message: `Embedding via ${provider} (${model}) failed. Please check your API key in Settings.`, status: 503 };
   }
   return { message: msg || 'Failed to process resume', status: 500 };
 }
@@ -40,14 +39,36 @@ export async function POST(request: NextRequest) {
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    // pdf-parse v1 tries to run a test on require() — import the inner lib directly
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const pdfParse = require('pdf-parse/lib/pdf-parse.js');
-    const pdfData = await pdfParse(buffer);
-    const rawText = pdfData.text;
+    let rawText = '';
+    let resumeTex: string | null = null;
+    let pdfBuffer: Buffer = buffer;
+
+    const fileContentStr = buffer.toString('utf8');
+    const isTexFile = file.name.endsWith('.tex') || file.type.includes('tex') || (fileContentStr.includes('\\documentclass') && fileContentStr.includes('\\end{document}'));
+
+    if (isTexFile) {
+      rawText = fileContentStr;
+      resumeTex = fileContentStr;
+      const { hasLatexCompiler, compileLatexWithRepair } = await import('@/lib/apply/latex');
+      if (await hasLatexCompiler()) {
+        try {
+          const { bytes, tex: repairedTex } = await compileLatexWithRepair(fileContentStr, async () => fileContentStr);
+          pdfBuffer = Buffer.from(bytes);
+          resumeTex = repairedTex;
+        } catch (e) {
+          console.warn('[resume] uploaded .tex compilation warning:', e);
+        }
+      }
+    } else {
+      // pdf-parse v1 tries to run a test on require() — import the inner lib directly
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const pdfParse = require('pdf-parse/lib/pdf-parse.js');
+      const pdfData = await pdfParse(buffer);
+      rawText = pdfData.text;
+    }
 
     if (!rawText || rawText.trim().length === 0) {
-      return NextResponse.json({ error: 'Could not extract text from PDF' }, { status: 400 });
+      return NextResponse.json({ error: 'Could not extract text from file' }, { status: 400 });
     }
 
     const parsedJson = await parseResume(rawText);
@@ -85,10 +106,10 @@ export async function POST(request: NextRequest) {
     // Insert into the resume library and make it active (which mirrors it into my_profile).
     // Store the original PDF bytes so the user can submit their real resume, not just the
     // AI-tailored variant.
-    const pdfFilename = file.name || `${label}.pdf`;
+    const pdfFilename = isTexFile ? (file.name.replace(/\.tex$/i, '.pdf')) : (file.name || `${label}.pdf`);
     const info = db.prepare(
-      'INSERT INTO resumes (label, raw_text, parsed_json, embedding, is_active, pdf_blob, pdf_filename) VALUES (?, ?, ?, ?, 0, ?, ?)'
-    ).run(label, rawText, JSON.stringify(enriched), embeddingBlob, buffer, pdfFilename);
+      'INSERT INTO resumes (label, raw_text, parsed_json, embedding, is_active, pdf_blob, pdf_filename, resume_tex) VALUES (?, ?, ?, ?, 0, ?, ?, ?)'
+    ).run(label, rawText, JSON.stringify(enriched), embeddingBlob, pdfBuffer, pdfFilename, resumeTex);
     setActiveResume(Number(info.lastInsertRowid));
     recordEmbeddingSignature(db); // first embed establishes the corpus's embedding space
 
@@ -155,6 +176,8 @@ export async function PATCH(request: NextRequest) {
       'currentSalary',
       'expectedSalary',
       'noticePeriodDays',
+      'yearsOfExperience',
+      'yearsExperience',
       'currentCompany',
       'currentJobTitle',
     ];

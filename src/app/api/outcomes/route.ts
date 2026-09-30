@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import db from '@/lib/db';
+import { getActiveOwnerId } from '@/lib/apply/screening-owner';
 
 interface ExistingApp {
   id: number;
@@ -32,9 +33,10 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid status' }, { status: 400 });
     }
 
+    const activeOwner = getActiveOwnerId();
     const existing = db
-      .prepare('SELECT id, status FROM my_applications WHERE job_id = ?')
-      .get(targetJobId) as ExistingApp | undefined;
+      .prepare('SELECT id, status FROM my_applications WHERE job_id = ? AND (owner_id = ? OR owner_id IS NULL)')
+      .get(targetJobId, activeOwner) as ExistingApp | undefined;
 
     const now = new Date().toISOString();
     const today = applied_date || now.slice(0, 10);
@@ -43,6 +45,7 @@ export async function POST(request: NextRequest) {
       db.prepare(
         `UPDATE my_applications
          SET status = ?,
+             owner_id = COALESCE(owner_id, ?),
              notes = COALESCE(?, notes),
              recruiter_name = COALESCE(?, recruiter_name),
              recruiter_contact = COALESCE(?, recruiter_contact),
@@ -51,9 +54,10 @@ export async function POST(request: NextRequest) {
              resume_source = COALESCE(?, resume_source),
              last_status_change_at = ?,
              applied_at = COALESCE(applied_at, ?)
-         WHERE job_id = ?`
+         WHERE id = ?`
       ).run(
         status,
+        activeOwner,
         notes ?? null,
         recruiter_name ?? null,
         recruiter_contact ?? null,
@@ -62,15 +66,16 @@ export async function POST(request: NextRequest) {
         resume_source ?? null,
         now,
         now,
-        targetJobId
+        existing.id
       );
     } else {
       db.prepare(
         `INSERT INTO my_applications
-          (job_id, status, notes, recruiter_name, recruiter_contact, next_follow_up_at, applied_date, applied_at, last_status_change_at, resume_source)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (job_id, owner_id, status, notes, recruiter_name, recruiter_contact, next_follow_up_at, applied_date, applied_at, last_status_change_at, resume_source)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         targetJobId,
+        activeOwner,
         status,
         notes ?? null,
         recruiter_name ?? null,
@@ -118,30 +123,98 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
-    const applications = db
-      .prepare(
-        `SELECT a.*,
-                COALESCE(a.tailored_score, d.tailored_score) AS tailored_score,
-                COALESCE(a.default_score, d.default_score) AS default_score,
-                COALESCE(j.company, 'Unknown Company') as company,
-                COALESCE(j.title, 'Job Application') as title,
-                j.location, j.url,
-                CASE WHEN (a.resume_tex IS NOT NULL OR a.resume_variant IS NOT NULL OR d.resume_tex IS NOT NULL OR d.resume_variant IS NOT NULL)
-                     THEN 1 ELSE 0 END AS has_tailored_resume
-         FROM my_applications a
-         LEFT JOIN job_postings j ON a.job_id = j.id
-         LEFT JOIN job_documents d ON a.job_id = d.job_id
-         ORDER BY 
-           REPLACE(COALESCE(a.applied_at, a.submitted_at, a.last_status_change_at, a.applied_date), ' ', 'T') DESC,
-           a.id DESC`
-      )
-      .all();
+    const { searchParams } = new URL(request.url);
+    const reqOwner = searchParams.get('owner');
+    const showAll = searchParams.get('all') === '1' || searchParams.get('scope') === 'all';
+    const activeOwner = getActiveOwnerId();
+    const targetOwner = showAll ? null : (reqOwner?.toLowerCase().trim() || activeOwner);
 
-    return NextResponse.json({ applications });
+    const query = `
+      SELECT a.*,
+             CASE WHEN a.resume_source = 'original' THEN NULL ELSE COALESCE(a.tailored_score, d.tailored_score) END AS tailored_score,
+             COALESCE(a.default_score, d.default_score) AS default_score,
+             COALESCE(j.company, 'Unknown Company') as company,
+             COALESCE(j.title, 'Job Application') as title,
+             j.location, j.url,
+             CASE WHEN a.resume_source = 'original' THEN 0
+                  WHEN (a.resume_tex IS NOT NULL OR a.resume_variant IS NOT NULL OR d.resume_tex IS NOT NULL OR d.resume_variant IS NOT NULL)
+                  THEN 1 ELSE 0 END AS has_tailored_resume
+      FROM my_applications a
+      LEFT JOIN job_postings j ON a.job_id = j.id
+      LEFT JOIN job_documents d ON a.job_id = d.job_id
+      ${targetOwner ? 'WHERE (a.owner_id = ? OR (a.owner_id IS NULL AND ? = \'default\'))' : ''}
+      ORDER BY 
+        REPLACE(COALESCE(a.applied_at, a.submitted_at, a.last_status_change_at, a.applied_date), ' ', 'T') DESC,
+        a.id DESC
+    `;
+
+    const applications = (targetOwner
+      ? db.prepare(query).all(targetOwner, targetOwner)
+      : db.prepare(query).all()) as Record<string, any>[];
+
+    // Ensure default_score is resolved for all applications if missing
+    for (const app of applications) {
+      if (app.default_score == null && app.job_id) {
+        try {
+          const { getRankedMatchById } = await import('@/lib/matches');
+          const match = getRankedMatchById(
+            { includeHidden: true, includeExpired: true, includeApplied: true, includeJobId: app.job_id },
+            app.job_id,
+          );
+          if (match && match.finalScore != null) {
+            app.default_score = Math.round(match.finalScore * 100);
+            db.prepare('UPDATE my_applications SET default_score = ? WHERE id = ? AND default_score IS NULL').run(
+              app.default_score,
+              app.id,
+            );
+          }
+        } catch {
+          // ignore lookup errors
+        }
+      }
+    }
+
+    return NextResponse.json({ applications, activeOwner });
   } catch (error) {
     console.error('Fetch applications error:', error);
     return NextResponse.json({ error: 'Failed to fetch applications' }, { status: 500 });
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const activeOwner = getActiveOwnerId();
+    const { jobIds, clearAll } = body;
+
+    if (clearAll) {
+      const deleted = db.prepare('DELETE FROM my_applications WHERE owner_id = ?').run(activeOwner);
+      try {
+        const { invalidateMatchCache } = await import('@/lib/matches');
+        invalidateMatchCache();
+      } catch {}
+      return NextResponse.json({ success: true, count: deleted.changes });
+    }
+
+    if (Array.isArray(jobIds) && jobIds.length > 0) {
+      const placeholders = jobIds.map(() => '?').join(',');
+      const deleted = db
+        .prepare(`DELETE FROM my_applications WHERE job_id IN (${placeholders}) AND (owner_id = ? OR owner_id IS NULL)`)
+        .run(...jobIds, activeOwner);
+      try {
+        const { invalidateMatchCache } = await import('@/lib/matches');
+        for (const jid of jobIds) {
+          invalidateMatchCache(jid, { applied: false });
+        }
+      } catch {}
+      return NextResponse.json({ success: true, count: deleted.changes });
+    }
+
+    return NextResponse.json({ error: 'Provide jobIds array or clearAll: true' }, { status: 400 });
+  } catch (error) {
+    console.error('Delete applications error:', error);
+    return NextResponse.json({ error: 'Failed to delete applications' }, { status: 500 });
   }
 }

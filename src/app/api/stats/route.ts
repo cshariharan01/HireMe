@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import db from '@/lib/db';
+import { getActiveOwnerId } from '@/lib/apply/screening-owner';
 
 /**
  * Counts-only endpoint for the dashboard stat tiles.
@@ -38,7 +39,10 @@ export async function GET() {
       )
       .get(windowArg, windowArg) as { c: number };
 
-    const applied = db.prepare('SELECT COUNT(*) c FROM my_applications').get() as { c: number };
+    const activeOwner = getActiveOwnerId();
+    const applied = db
+      .prepare('SELECT COUNT(*) c FROM my_applications WHERE (owner_id = ? OR (owner_id IS NULL AND ? = \'default\'))')
+      .get(activeOwner, activeOwner) as { c: number };
 
     return NextResponse.json({
       freshCount: fresh.c,

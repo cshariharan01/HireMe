@@ -303,8 +303,8 @@ function answerFromDefaults(
     case 'months_experience':
       return String((profile.totalExperienceMonths as number) ?? 6);
     case 'years_experience': {
-      const yoe = (profile.yearsOfExperience as number) ?? (profile.yearsExperience as number) ?? 3;
-      return String(yoe);
+      const rawYoe = Number((profile.yearsOfExperience as number) ?? (profile.yearsExperience as number) ?? 3);
+      return String(isNaN(rawYoe) ? 3 : Math.floor(rawYoe));
     }
     case 'why_company':
       // Always LLM-generated per-job; no usable default
@@ -473,20 +473,36 @@ const DEFAULT_CONFIG: ApplyConfig = {
 };
 
 export function getApplyConfig(): ApplyConfig {
+  let mode = 'smart';
+  try {
+    const modeRow = db.prepare("SELECT value FROM user_settings WHERE key = 'apply_mode'").get() as { value: string } | undefined;
+    if (modeRow?.value) mode = modeRow.value;
+  } catch {}
+
+  const defaultResumeSource: 'original' | 'tailored' = mode === 'smart' ? 'original' : 'tailored';
+
   try {
     const row = db.prepare('SELECT config_json FROM apply_settings WHERE id = 1').get() as { config_json: string } | undefined;
-    if (!row) return DEFAULT_CONFIG;
+    if (!row) {
+      return {
+        ...DEFAULT_CONFIG,
+        resumeSource: defaultResumeSource,
+      };
+    }
     const cfg = JSON.parse(row.config_json) as Partial<ApplyConfig>;
     return {
       defaults: { ...DEFAULT_CONFIG.defaults, ...(cfg.defaults || {}) },
       portals: { ...DEFAULT_CONFIG.portals, ...(cfg.portals || {}) },
       rateLimit: { ...DEFAULT_CONFIG.rateLimit, ...(cfg.rateLimit || {}) },
       dryRun: cfg.dryRun ?? DEFAULT_CONFIG.dryRun,
-      resumeSource: cfg.resumeSource ?? DEFAULT_CONFIG.resumeSource,
+      resumeSource: cfg.resumeSource ?? defaultResumeSource,
       updateNaukriProfileResume: cfg.updateNaukriProfileResume ?? DEFAULT_CONFIG.updateNaukriProfileResume,
     };
   } catch {
-    return DEFAULT_CONFIG;
+    return {
+      ...DEFAULT_CONFIG,
+      resumeSource: defaultResumeSource,
+    };
   }
 }
 

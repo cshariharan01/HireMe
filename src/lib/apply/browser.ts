@@ -17,7 +17,7 @@
 import { type BrowserContext, type Page, type Locator } from 'playwright';
 import path from 'path';
 import fs from 'fs';
-import { launchApplyBrowser, bringWindowToFront, AUTO_APPLY_SUCCESS_PAGE } from './launcher';
+import { launchApplyBrowser, bringWindowToFront, focusApplyPage, AUTO_APPLY_SUCCESS_PAGE } from './launcher';
 import { resolveLinkedInQuestionAnswerAsync } from './linkedin';
 
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), 'data', 'playwright', 'browser-profile');
@@ -261,7 +261,7 @@ const FIELD_RULES: FieldRule[] = [
       (p.postalCode as string) ||
       (p.pincode as string) ||
       (p.zip as string) ||
-      '625001',
+      '',
   },
   {
     label: 'Current Salary',
@@ -477,7 +477,38 @@ async function fillOrSelectElement(loc: Locator, value: string): Promise<boolean
   const existing = await loc.inputValue().catch(() => '');
   if (existing?.trim() && !['0', '0.00', '1', '3'].includes(existing.trim())) return true;
 
-  await loc.fill(value, { timeout: 3000 });
+  let textToFill = value;
+  const numVal = Number(value);
+  if (!isNaN(numVal) && !Number.isInteger(numVal)) {
+    const isIntegerOnlyNumberInput = await loc.evaluate((el) => {
+      if (el instanceof HTMLInputElement && el.type === 'number') {
+        const step = el.getAttribute('step');
+        if (!step || step === '1' || (!step.includes('.') && step !== 'any')) {
+          return true;
+        }
+      }
+      return false;
+    }).catch(() => false);
+
+    if (isIntegerOnlyNumberInput) {
+      textToFill = String(Math.round(numVal));
+    }
+  }
+
+  await loc.fill(textToFill, { timeout: 3000 });
+
+  if (!isNaN(numVal) && !Number.isInteger(numVal) && textToFill === value) {
+    const isValid = await loc.evaluate((el) => {
+      if (el instanceof HTMLInputElement) return el.checkValidity();
+      return true;
+    }).catch(() => true);
+
+    if (!isValid) {
+      const rounded = String(Math.round(numVal));
+      await loc.fill(rounded, { timeout: 3000 }).catch(() => {});
+    }
+  }
+
   return true;
 }
 
@@ -1492,9 +1523,14 @@ export async function browserAutofill(input: BrowserAutofillInput): Promise<Brow
     ctx = await launchApplyBrowser(BROWSER_PROFILE_DIR, { focus: true });
 
     const page = ctx.pages()[0] || (await ctx.newPage());
+    // Close any leftover blank tabs in Chrome context so the window stays clean
+    for (const p of ctx.pages()) {
+      if (p !== page && (p.url() === 'about:blank' || p.url().startsWith('chrome://'))) {
+        await p.close().catch(() => {});
+      }
+    }
     await page.goto(input.url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-    try { await page.bringToFront(); } catch {}
-    bringWindowToFront('Chrome');
+    await focusApplyPage(page, false);
     // Settle: wait for any client-side hydration / form rendering
     await page.waitForTimeout(3500);
 
@@ -1521,7 +1557,7 @@ export async function browserAutofill(input: BrowserAutofillInput): Promise<Brow
         console.log('[apply] filled fields:', filledFields);
         console.log('[apply] attached files:', attachedFiles);
         console.log('[apply] final page:', page.url());
-        await page.bringToFront();
+        await focusApplyPage(page, false);
     } catch { /* ignore */ }
 
     if (input.detachWait) {

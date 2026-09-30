@@ -1,18 +1,11 @@
-// Provider-aware embeddings.
+// Provider-aware embeddings (Gemini default, OpenAI / OpenAI-compatible supported).
 //
-// Ollama (local, free) is the default, but embeddings can also come from a cloud provider so the
-// app runs WITHOUT Ollama for people who don't want to (or can't) run a local model — they just
-// set EMBEDDING_PROVIDER + a key. Resolution is env-based (per-instance), NOT per-call: every
-// embedding in a DB must share the same model/vector space, or cosine distance is meaningless.
-// Switching providers therefore requires re-embedding everything (see .env.example).
-//
-// Env:
-//   EMBEDDING_PROVIDER  ollama | gemini | openai | openai-compatible   (default: ollama)
-//   EMBEDDING_MODEL     override the model (defaults per provider below)
-//   EMBEDDING_API_KEY   key for the cloud provider (falls back to GEMINI_API_KEY / OPENAI_API_KEY)
-//   EMBEDDING_BASE_URL  override endpoint (required for openai-compatible; default per provider)
+// Google Gemini (text-embedding-004) is the default cloud embedding provider.
+// Resolution is env-based (per-instance). Every embedding in a DB must share the same model/vector space.
 
-export type EmbeddingKind = 'ollama' | 'gemini' | 'openai' | 'openai-compatible';
+import db from './db';
+
+export type EmbeddingKind = 'gemini' | 'openai' | 'openai-compatible';
 
 interface EmbeddingConfig {
   kind: EmbeddingKind;
@@ -22,35 +15,46 @@ interface EmbeddingConfig {
 }
 
 const EMBED_TIMEOUT_MS = 30_000;
-const EMBED_RETRIES = 2; // total attempts = 1 + retries
-// nomic-embed-text has a 2048-token context; a long résumé/JD overflows it. Cap the input
-// (~4 chars/token → ~6000 chars is safe). Cloud models have larger contexts but capping is
-// harmless and keeps behavior/costs consistent. The head carries the strongest matching signal.
+const EMBED_RETRIES = 5; // retry attempts with exponential backoff on 429
 const EMBED_MAX_CHARS = 6000;
 
 const DEFAULT_MODELS: Record<EmbeddingKind, string> = {
-  ollama: 'nomic-embed-text',
-  gemini: 'text-embedding-004',        // 768-dim (same as nomic)
-  openai: 'text-embedding-3-small',    // 1536-dim
+  gemini: 'gemini-embedding-001',
+  openai: 'text-embedding-3-small',
   'openai-compatible': 'text-embedding-3-small',
 };
 
-const KINDS: EmbeddingKind[] = ['ollama', 'gemini', 'openai', 'openai-compatible'];
+const KINDS: EmbeddingKind[] = ['gemini', 'openai', 'openai-compatible'];
+
+function getDbApiKey(providerKind: string): string | null {
+  try {
+    const row = db
+      .prepare("SELECT api_key FROM llm_providers WHERE kind = ? AND api_key IS NOT NULL AND is_active = 1 LIMIT 1")
+      .get(providerKind) as { api_key: string } | undefined;
+    if (row?.api_key) return row.api_key;
+    const anyRow = db
+      .prepare("SELECT api_key FROM llm_providers WHERE kind = ? AND api_key IS NOT NULL LIMIT 1")
+      .get(providerKind) as { api_key: string } | undefined;
+    return anyRow?.api_key || null;
+  } catch {
+    return null;
+  }
+}
 
 function resolveEmbeddingConfig(): EmbeddingConfig {
-  const raw = (process.env.EMBEDDING_PROVIDER || 'ollama').toLowerCase();
-  const kind: EmbeddingKind = (KINDS as string[]).includes(raw) ? (raw as EmbeddingKind) : 'ollama';
-  const model = process.env.EMBEDDING_MODEL || DEFAULT_MODELS[kind];
+  let raw = process.env.EMBEDDING_PROVIDER ? process.env.EMBEDDING_PROVIDER.toLowerCase() : 'gemini';
+  if (raw === 'ollama') raw = 'gemini';
+  const kind: EmbeddingKind = (KINDS as string[]).includes(raw) ? (raw as EmbeddingKind) : 'gemini';
+  const model = process.env.EMBEDDING_MODEL || DEFAULT_MODELS[kind] || 'gemini-embedding-001';
   const apiKey =
     process.env.EMBEDDING_API_KEY ||
-    (kind === 'gemini' ? process.env.GEMINI_API_KEY || null
-      : kind === 'openai' ? process.env.OPENAI_API_KEY || null
+    (kind === 'gemini' ? process.env.GEMINI_API_KEY || getDbApiKey('gemini')
+      : kind === 'openai' ? process.env.OPENAI_API_KEY || getDbApiKey('openai')
       : null);
   const baseUrl =
     process.env.EMBEDDING_BASE_URL ||
-    (kind === 'ollama' ? (process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434')
-      : kind === 'openai' ? 'https://api.openai.com/v1'
-      : kind === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta'
+    (kind === 'openai' ? 'https://api.openai.com/v1'
+      : kind === 'gemini' ? 'https://generativelanguage.googleapis.com/v1'
       : ''); // openai-compatible must set EMBEDDING_BASE_URL
   return { kind, model, apiKey, baseUrl };
 }
@@ -95,31 +99,6 @@ async function fetchJson(url: string, init: RequestInit): Promise<Record<string,
 
 // --- per-provider batch embedders (one vector per input, order-preserving) ---
 
-async function embedOllama(cfg: EmbeddingConfig, inputs: string[]): Promise<number[][]> {
-  // Prefer the batched /api/embed; if a given Ollama build lacks it, fall back to /api/embeddings.
-  try {
-    const data = await fetchJson(`${cfg.baseUrl}/api/embed`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: cfg.model, input: inputs }),
-    });
-    if (Array.isArray(data.embeddings)) return data.embeddings as number[][];
-    throw new Error('no embeddings array in /api/embed response');
-  } catch {
-    const out: number[][] = [];
-    for (const text of inputs) {
-      const data = await fetchJson(`${cfg.baseUrl}/api/embeddings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: cfg.model, prompt: text }),
-      });
-      if (!Array.isArray(data.embedding)) throw new Error('Ollama returned no embedding array');
-      out.push(data.embedding as number[]);
-    }
-    return out;
-  }
-}
-
 async function embedOpenAI(cfg: EmbeddingConfig, inputs: string[]): Promise<number[][]> {
   if (!cfg.apiKey) throw new Error(`Embedding provider "${cfg.kind}" needs an API key (EMBEDDING_API_KEY)`);
   if (!cfg.baseUrl) throw new Error('openai-compatible embeddings require EMBEDDING_BASE_URL');
@@ -136,30 +115,88 @@ async function embedOpenAI(cfg: EmbeddingConfig, inputs: string[]): Promise<numb
 async function embedGemini(cfg: EmbeddingConfig, inputs: string[]): Promise<number[][]> {
   if (!cfg.apiKey) throw new Error('Gemini embeddings need an API key (EMBEDDING_API_KEY or GEMINI_API_KEY)');
   const modelPath = `models/${cfg.model}`;
-  const data = await fetchJson(`${cfg.baseUrl}/${modelPath}:batchEmbedContents?key=${cfg.apiKey}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      requests: inputs.map((text) => ({ model: modelPath, content: { parts: [{ text }] } })),
-    }),
-  });
-  const embs = (data.embeddings as Array<{ values: number[] }>) || [];
-  return embs.map((e) => e.values);
+  // Try batchEmbedContents first (efficient, one call for many texts)
+  try {
+    const data = await fetchJson(`${cfg.baseUrl}/${modelPath}:batchEmbedContents?key=${cfg.apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requests: inputs.map((text) => ({
+          model: modelPath,
+          content: { parts: [{ text }] },
+          outputDimensionality: 768,
+        })),
+      }),
+    });
+    const embs = (data.embeddings as Array<{ values: number[] }>) || [];
+    if (embs.length === inputs.length) return embs.map((e) => e.values);
+  } catch (batchErr) {
+    const msg = batchErr instanceof Error ? batchErr.message : String(batchErr);
+    // If outputDimensionality failed, try without it
+    if (/outputDimensionality|invalid argument|unknown field/i.test(msg)) {
+      try {
+        const data = await fetchJson(`${cfg.baseUrl}/${modelPath}:batchEmbedContents?key=${cfg.apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            requests: inputs.map((text) => ({
+              model: modelPath,
+              content: { parts: [{ text }] },
+            })),
+          }),
+        });
+        const embs = (data.embeddings as Array<{ values: number[] }>) || [];
+        if (embs.length === inputs.length) return embs.map((e) => e.values);
+      } catch {
+        // fall through to sequential
+      }
+    }
+    // 404 means batch not supported for this key/model — fall through to sequential embedContent
+    if (!/404|not found|not supported/i.test(msg)) throw batchErr;
+    console.warn('[embeddings] batchEmbedContents unavailable, falling back to sequential embedContent');
+  }
+  // Fallback: sequential embedContent calls (works with all key types)
+  const results: number[][] = [];
+  for (const text of inputs) {
+    try {
+      const data = await fetchJson(`${cfg.baseUrl}/${modelPath}:embedContent?key=${cfg.apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: modelPath,
+          content: { parts: [{ text }] },
+          outputDimensionality: 768,
+        }),
+      });
+      const embedding = (data.embedding as { values: number[] }) || { values: [] };
+      results.push(embedding.values);
+    } catch {
+      const data = await fetchJson(`${cfg.baseUrl}/${modelPath}:embedContent?key=${cfg.apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: modelPath,
+          content: { parts: [{ text }] },
+        }),
+      });
+      const embedding = (data.embedding as { values: number[] }) || { values: [] };
+      results.push(embedding.values);
+    }
+  }
+  return results;
 }
 
 async function embedBatchOnce(cfg: EmbeddingConfig, inputs: string[]): Promise<number[][]> {
   switch (cfg.kind) {
-    case 'ollama': return embedOllama(cfg, inputs);
     case 'openai':
     case 'openai-compatible': return embedOpenAI(cfg, inputs);
-    case 'gemini': return embedGemini(cfg, inputs);
-    default: throw new Error(`Unsupported embedding provider "${cfg.kind}"`);
+    case 'gemini': default: return embedGemini(cfg, inputs);
   }
 }
 
 /**
  * Embed a batch of texts → one Float32Array per input (order preserved). Retries transient
- * failures (network / 5xx / 429 / timeout) with backoff. Used by `npm run embed` for jobs.
+ * failures (network / 5xx / 429 / timeout) with exponential backoff.
  */
 export async function generateEmbeddings(texts: string[]): Promise<Float32Array[]> {
   const cfg = resolveEmbeddingConfig();
@@ -175,7 +212,11 @@ export async function generateEmbeddings(texts: string[]): Promise<Float32Array[
     } catch (e) {
       lastErr = e;
       const msg = e instanceof Error ? e.message : String(e);
-      if (attempt < EMBED_RETRIES && isTransient(msg)) { await sleep(500 * (attempt + 1)); continue; }
+      if (attempt < EMBED_RETRIES && isTransient(msg)) {
+        // Backoff: 1s, 2s, 4s, 8s, 16s on 429 rate limit
+        await sleep(1000 * Math.pow(2, attempt));
+        continue;
+      }
       throw new Error(`Embedding (${cfg.kind}/${cfg.model}) failed: ${msg}`);
     }
   }
