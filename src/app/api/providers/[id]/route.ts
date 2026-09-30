@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import db from '@/lib/db';
+import { invalidateProviderCache } from '@/lib/llm';
+import { syncEnvFromActiveProvider } from '@/lib/env-sync';
 
 const ALLOWED_PATCH = ['display_name', 'model', 'api_key', 'base_url'];
 
@@ -23,6 +25,8 @@ export async function PATCH(req: NextRequest, props: { params: Promise<{ id: str
     values.push(id);
     const result = db.prepare(`UPDATE llm_providers SET ${sets.join(', ')} WHERE id = ?`).run(...values);
     if (result.changes === 0) return NextResponse.json({ error: 'Provider not found' }, { status: 404 });
+    invalidateProviderCache();
+    syncEnvFromActiveProvider();
     return NextResponse.json({ success: true });
   } catch (error) {
     if (error instanceof SyntaxError) return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 });
@@ -37,6 +41,8 @@ export async function DELETE(_req: NextRequest, props: { params: Promise<{ id: s
     const id = parseInt(params.id);
     const result = db.prepare('DELETE FROM llm_providers WHERE id = ?').run(id);
     if (result.changes === 0) return NextResponse.json({ error: 'Provider not found' }, { status: 404 });
+    invalidateProviderCache();
+    syncEnvFromActiveProvider();
     return NextResponse.json({ success: true });
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : 'Failed' }, { status: 500 });

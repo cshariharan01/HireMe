@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import db from '@/lib/db';
 import { getLLMUsageStats, getAvailableModelsForKind, PROVIDER_MODEL_REGISTRY } from '@/lib/llm-models';
+import { invalidateProviderCache } from '@/lib/llm';
+import { syncEnvFromActiveProvider } from '@/lib/env-sync';
 
 interface ProviderRow {
   id: number;
@@ -100,11 +102,19 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
+    // If no provider is active yet, automatically activate this new provider
+    const activeRow = db.prepare('SELECT COUNT(*) as count FROM llm_providers WHERE is_active = 1').get() as { count: number };
+    const shouldAutoActivate = (activeRow?.count || 0) === 0 ? 1 : 0;
+
     const result = db
       .prepare(
-        'INSERT INTO llm_providers (kind, display_name, model, api_key, base_url) VALUES (?, ?, ?, ?, ?)'
+        'INSERT INTO llm_providers (kind, display_name, model, api_key, base_url, is_active) VALUES (?, ?, ?, ?, ?, ?)'
       )
-      .run(kind, display_name, model, api_key || null, resolvedBaseUrl || null);
+      .run(kind, display_name, model, api_key || null, resolvedBaseUrl || null, shouldAutoActivate);
+
+    invalidateProviderCache();
+    syncEnvFromActiveProvider();
+
     const row = db.prepare('SELECT * FROM llm_providers WHERE id = ?').get(result.lastInsertRowid) as ProviderRow;
     return NextResponse.json({ provider: rowToPublic(row) });
   } catch (error) {

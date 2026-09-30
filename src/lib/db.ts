@@ -739,6 +739,16 @@ const ADDITIVE_COLUMNS: Array<[string, string]> = [
 
   setupJobFts(db);
 
+  try {
+    const row = db.prepare("SELECT kind, api_key FROM llm_providers WHERE is_active = 1 LIMIT 1").get() as { kind: string; api_key: string | null } | undefined;
+    if (row?.api_key && row.kind === 'gemini') {
+      process.env.GEMINI_API_KEY = row.api_key;
+    }
+    if (!process.env.EMBEDDING_PROVIDER) {
+      process.env.EMBEDDING_PROVIDER = 'gemini';
+    }
+  } catch {}
+
   return db;
 }
 

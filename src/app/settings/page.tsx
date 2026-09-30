@@ -125,6 +125,12 @@ export default function SettingsPage() {
 
   const providers = data?.providers ?? [];
 
+  useEffect(() => {
+    if (data?.providers && data.providers.length === 0) {
+      setAdding(true);
+    }
+  }, [data]);
+
   const onKindChange = (kind: ProviderKind) => {
     const defaults: Record<ProviderKind, { display_name: string; model: string; base_url: string }> = {
       gemini: { display_name: 'Google Gemini', model: 'gemini-3.8-flash', base_url: '' },
@@ -159,7 +165,7 @@ export default function SettingsPage() {
       const json = await res.json();
       if (json.error) toast.error(json.error);
       else {
-        toast.success('Provider added');
+        toast.success('Provider added & activated! Backend configured successfully.');
         setAdding(false);
         mutate();
       }

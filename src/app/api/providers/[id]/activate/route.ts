@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import db from '@/lib/db';
 import { invalidateProviderCache } from '@/lib/llm';
+import { syncEnvFromActiveProvider } from '@/lib/env-sync';
 
 // POST /api/providers/[id]/activate — set this provider active, deactivate all others.
 // POST /api/providers/[id]/activate?clear=1 — deactivate this one (clear=1) returning to env-based selection.
@@ -15,6 +16,7 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
       const result = db.prepare('UPDATE llm_providers SET is_active = 0 WHERE id = ?').run(id);
       if (result.changes === 0) return NextResponse.json({ error: 'Provider not found' }, { status: 404 });
       invalidateProviderCache();
+      syncEnvFromActiveProvider();
       return NextResponse.json({ success: true, active: false });
     }
 
@@ -25,6 +27,7 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
     });
     tx();
     invalidateProviderCache();
+    syncEnvFromActiveProvider();
     return NextResponse.json({ success: true, active: true });
   } catch (error) {
     const msg = error instanceof Error ? error.message : 'Failed';
