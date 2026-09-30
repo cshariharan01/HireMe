@@ -60,6 +60,9 @@ When you first open HireMe, everything is configured from the web interface:
 ### Do I need to install Chromium or Playwright browsers?
 **No.** HireMe automatically detects and connects to your existing **Google Chrome** installation. You do not need to download extra browser binaries. *(Playwright's bundled Chromium is only downloaded as an optional fallback if Google Chrome is not installed on your system).*
 
+### How do I log in to LinkedIn or Naukri?
+The first time you apply to a LinkedIn or Naukri job, the browser will open so you can log in to your account. Your session cookies are saved securely on your computer in `data/playwright/`, so you only need to log in once! Subsequent applications run automatically.
+
 ### Does the auto-apply steal focus while I am working?
 **No.** The browser launches smoothly in the background. It will only come to the front once at the start or if manual action is needed (like solving an initial login CAPTCHA), leaving you free to work uninterrupted.
 

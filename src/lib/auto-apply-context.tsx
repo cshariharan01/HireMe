@@ -119,6 +119,19 @@ export function AutoApplyProvider({ children }: { children: React.ReactNode }) {
     void fetch('/api/apply/focus-browser', { method: 'PUT' }).catch(() => {});
     toast.success(`Starting Auto-Apply queue from job ${initialIdx + 1} of ${totalJobs}...`);
 
+    let perHourLimit = 10;
+    try {
+      const cfgRes = await fetch('/api/apply/config');
+      if (cfgRes.ok) {
+        const cfgJson = await cfgRes.json();
+        if (cfgJson?.config?.rateLimit?.perHour) {
+          perHourLimit = cfgJson.config.rateLimit.perHour;
+        }
+      }
+    } catch {}
+
+    let processedInRun = 0;
+
     for (let i = initialIdx; i < queue.length; i++) {
       if (autoApplyStopRef.current) break;
 
@@ -128,6 +141,13 @@ export function AutoApplyProvider({ children }: { children: React.ReactNode }) {
         await new Promise((r) => setTimeout(r, 400));
       }
       if (autoApplyStopRef.current) break;
+
+      if (perHourLimit > 0 && processedInRun >= perHourLimit) {
+        const limitMsg = `Hourly limit of ${perHourLimit} jobs reached. Auto-apply stopped to respect your settings.`;
+        toast.info(limitMsg, { duration: 6000 });
+        setAutoApplyStatusMessage(limitMsg);
+        break;
+      }
 
       const job = queue[i];
       setActiveJobId(job.id);
@@ -199,6 +219,14 @@ export function AutoApplyProvider({ children }: { children: React.ReactNode }) {
           };
         }
 
+        if (res.status === 429 || json.error?.toLowerCase().includes('cap') || json.error?.toLowerCase().includes('rate limit')) {
+          const limitMsg = json.error || `Hourly limit of ${perHourLimit} jobs reached. Auto-apply stopped to protect your account.`;
+          toast.error(limitMsg, { duration: 6000 });
+          setAutoApplyStatusMessage(limitMsg);
+          autoApplyStopRef.current = true;
+          break;
+        }
+
         const isAlreadyApplied = Boolean(
           json.alreadyApplied ||
           json.response?.platformStatus === 'already_applied' ||
@@ -215,6 +243,7 @@ export function AutoApplyProvider({ children }: { children: React.ReactNode }) {
         );
 
         if (isSubmitted) {
+          processedInRun++;
           revalidateApplications();
           revalidateMatches();
           revalidateDashboardStats();
@@ -245,6 +274,7 @@ export function AutoApplyProvider({ children }: { children: React.ReactNode }) {
             await new Promise((r) => setTimeout(r, 100));
           }
         } else if (json.stoppedForReview) {
+          processedInRun++;
           revalidateApplications();
           revalidateMatches();
           revalidateDashboardStats();

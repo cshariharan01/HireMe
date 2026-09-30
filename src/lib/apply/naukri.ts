@@ -133,15 +133,24 @@ const CHATBOT_SKIP_BUTTON = [
 ].join(', ');
 
 const CHATBOT_RADIO = [
+  `${CHATBOT_DRAWER} input[type="radio"]`,
+  `${CHATBOT_DRAWER} [role="radio"]`,
   `${CHATBOT_DRAWER} label.ssrc__label`,
   `${CHATBOT_DRAWER} .ssrc__radio-btn-container`,
   `${CHATBOT_DRAWER} .singleselect-radiobutton`,
   `${CHATBOT_DRAWER} label[class*="radio" i]`,
   `${CHATBOT_DRAWER} div[class*="radio" i]`,
   `${CHATBOT_DRAWER} div[class*="singleselect" i]`,
+  `${CHATBOT_DRAWER} [class*="radio-item" i]`,
+  `${CHATBOT_DRAWER} [class*="radioBtn" i]`,
+  `${CHATBOT_DRAWER} [class*="radio-btn" i]`,
+  'input[type="radio"]',
+  '[role="radio"]',
   'label.ssrc__label',
+  '.ssrc__radio-btn-container',
   '.singleselect-radiobutton',
   'label[class*="radio" i]',
+  'div[class*="radio" i]',
   'div[class*="singleselect" i]',
 ].join(', ');
 
@@ -744,19 +753,66 @@ async function detectQuestionType(page: Page, questionText: string): Promise<'ra
 
 /**
  * Read the available options for a radio button question.
+ * Uses comprehensive DOM inspection (inputs, labels, containers, ARIA roles)
+ * with robust whitespace and newline normalization.
  */
 async function getRadioOptions(page: Page): Promise<string[]> {
   try {
-    const labels = page.locator(`${CHATBOT_DRAWER} label.ssrc__label, ${CHATBOT_DRAWER} label, ${CHATBOT_DRAWER} .singleselect-radiobutton`);
+    const options = await page.evaluate(() => {
+      const drawer = document.querySelector(
+        'div.chatbot_DrawerContentWrapper, div[class*="chatbot" i], div[class*="drawer" i], div[class*="applyDrawer" i], div[class*="apply-container" i]'
+      ) || document.body;
+
+      const items = Array.from(drawer.querySelectorAll(
+        'input[type="radio"], [role="radio"], label.ssrc__label, .singleselect-radiobutton, .ssrc__radio-btn-container, label[class*="radio" i], div[class*="radio" i], div[class*="singleselect" i], [class*="radio-item" i]'
+      ));
+
+      const results: string[] = [];
+      for (const el of items) {
+        let text = '';
+        if (el instanceof HTMLInputElement && el.type === 'radio') {
+          if (el.id) {
+            const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+            if (lbl) text = lbl.textContent || '';
+          }
+          if (!text) {
+            const parentLbl = el.closest('label');
+            if (parentLbl) text = parentLbl.textContent || '';
+          }
+          if (!text) {
+            const sibLbl = el.nextElementSibling;
+            if (sibLbl && /label|span/i.test(sibLbl.tagName)) text = sibLbl.textContent || '';
+          }
+          if (!text && el.value && el.value !== 'on') text = el.value;
+          if (!text) text = el.getAttribute('aria-label') || '';
+        } else {
+          const childTextEl = el.querySelector('.ssrc__label, span, label, p');
+          text = (childTextEl?.textContent || (el as HTMLElement).innerText || el.textContent || '');
+        }
+
+        const clean = text.replace(/\s+/g, ' ').replace(/\b(?:required|mandatory)\b/gi, '').trim();
+        if (clean && clean.length > 0 && clean.length < 100 && !/skip this question|botItem|chatbot|drawer|step/i.test(clean)) {
+          if (!results.some((r) => r.toLowerCase() === clean.toLowerCase())) {
+            results.push(clean);
+          }
+        }
+      }
+      return results;
+    }).catch(() => []);
+
+    if (options && options.length > 0) return options;
+
+    // Fallback locator
+    const labels = page.locator(`${CHATBOT_DRAWER} label.ssrc__label, ${CHATBOT_DRAWER} label, ${CHATBOT_DRAWER} .singleselect-radiobutton, ${CHATBOT_DRAWER} input[type="radio"]`);
     const count = await labels.count();
-    const options: string[] = [];
+    const fallbackOptions: string[] = [];
     for (let i = 0; i < count; i++) {
-      const text = (await labels.nth(i).innerText().catch(() => '')).trim();
-      if (text && !text.includes('\n') && !options.includes(text)) {
-        options.push(text);
+      const text = (await labels.nth(i).innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+      if (text && text.length < 100 && !fallbackOptions.includes(text) && !/skip this question/i.test(text)) {
+        fallbackOptions.push(text);
       }
     }
-    return options;
+    return fallbackOptions;
   } catch {
     return [];
   }
@@ -821,13 +877,21 @@ export function matchExperienceOption(options: string[], candidateYears: number)
 /**
  * Answer a radio button question by clicking the matching option.
  */
+/**
+ * Answer a radio button question by clicking the matching option.
+ * Uses robust multi-tier selection (label click, radio check, ARIA role check,
+ * and in-page JavaScript evaluation with trusted event dispatch).
+ */
 export async function answerRadioQuestion(
   page: Page,
   questionText: string,
   profile: CandidateProfile,
   options: string[],
 ): Promise<boolean> {
-  const lowerQuestion = questionText.toLowerCase();
+  let activeOptions = [...options];
+  if (activeOptions.length === 0) {
+    activeOptions = await getRadioOptions(page);
+  }
 
   let targetIndex = -1;
   let targetAnswer: string | null = null;
@@ -835,9 +899,9 @@ export async function answerRadioQuestion(
   // 1. Ex-employee / previous employment with target company
   if (/ex[- ](employee|emp|infosys|tcs|wipro|cognizant|accenture|hcl|tech mahindra|capgemini)|former employee|previous employee|past employee|previously worked/i.test(questionText)) {
     targetAnswer = 'No';
-    targetIndex = options.findIndex((o) => o.toLowerCase() === 'no');
+    targetIndex = activeOptions.findIndex((o) => o.toLowerCase() === 'no');
     if (targetIndex < 0) {
-      targetIndex = options.findIndex((o) => /na|none|never|false/i.test(o));
+      targetIndex = activeOptions.findIndex((o) => /na|none|never|false/i.test(o));
     }
   }
 
@@ -845,172 +909,272 @@ export async function answerRadioQuestion(
   else if (matchCityResidenceQuestion(questionText, profile.location)) {
     const cityCheck = matchCityResidenceQuestion(questionText, profile.location)!;
     targetAnswer = cityCheck.answer;
-    targetIndex = options.findIndex((o) => o.trim().toLowerCase() === cityCheck.answer.toLowerCase());
+    targetIndex = activeOptions.findIndex((o) => o.trim().toLowerCase() === cityCheck.answer.toLowerCase());
+    if (targetIndex < 0 && activeOptions.length > 0) {
+      // If options are city names, match target city or profile location
+      const cityMatchIdx = activeOptions.findIndex((o) =>
+        o.toLowerCase().includes(cityCheck.targetCity.toLowerCase()) ||
+        (profile.location && o.toLowerCase().includes(profile.location.toLowerCase()))
+      );
+      if (cityMatchIdx >= 0) {
+        targetIndex = cityMatchIdx;
+        targetAnswer = activeOptions[cityMatchIdx];
+      }
+    }
   }
 
-  // 3. Work from office / hybrid / on-site / shifts / travel / walk-in / interview attendance
+  // 3. Relocation / willing to relocate
+  else if (/relocat/i.test(questionText)) {
+    targetAnswer = 'Yes';
+    targetIndex = activeOptions.findIndex((o) => /yes|true|agree|willing|sure/i.test(o));
+    if (targetIndex < 0 && activeOptions.length > 0) {
+      targetIndex = 0;
+      targetAnswer = activeOptions[0];
+    }
+  }
+
+  // 4. Work from office / hybrid / on-site / shifts / travel / walk-in / interview attendance
   else if (/work from office|wfo|hybrid|on[- ]?site|in[- ]?office|night shift|rotational|shifts|travel|business travel|attend|walk[- ]?in|drive|in[- ]?person|interview|venue|slot/i.test(questionText)) {
     targetAnswer = 'Yes';
-    targetIndex = options.findIndex((o) => /yes|true|attend|agree|willing|sure/i.test(o));
-    if (targetIndex < 0 && options.length > 0) {
+    targetIndex = activeOptions.findIndex((o) => /yes|true|attend|agree|willing|sure/i.test(o));
+    if (targetIndex < 0 && activeOptions.length > 0) {
       targetIndex = 0;
-      targetAnswer = options[0];
+      targetAnswer = activeOptions[0];
     }
   }
 
-  // 4. General Yes/No & Willingness questions (willingness, relocate, ready to, comfortable, can you, will you, etc.)
-  else if (/(?:will|can|do|are|would|is|have)\s+you|willing|able|relocate|ready to|comfortable|okay with|open to|authorized|agree/i.test(questionText)) {
+  // 5. Negative background / legal / sponsorship questions
+  else if (/criminal|felon|convict|disciplinary|sponsorship|visa support/i.test(questionText)) {
+    targetAnswer = 'No';
+    targetIndex = activeOptions.findIndex((o) => /no|false|never|none/i.test(o));
+    if (targetIndex < 0 && activeOptions.length > 0) {
+      targetIndex = activeOptions.findIndex((o) => !/yes/i.test(o));
+    }
+  }
+
+  // 6. General Yes/No & Willingness questions (willingness, relocate, ready to, comfortable, can you, will you, etc.)
+  else if (/(?:will|can|do|are|would|is|have)\s+you|willing|able|ready to|comfortable|okay with|open to|authorized|agree/i.test(questionText)) {
     targetAnswer = 'Yes';
-    targetIndex = options.findIndex((o) => /yes|true|agree|willing/i.test(o));
-    if (targetIndex < 0 && options.length > 0) {
+    targetIndex = activeOptions.findIndex((o) => /yes|true|agree|willing/i.test(o));
+    if (targetIndex < 0 && activeOptions.length > 0) {
       targetIndex = 0;
-      targetAnswer = options[0];
+      targetAnswer = activeOptions[0];
     }
   }
 
-  // 5. Experience / years questions
+  // 7. Experience / years questions
   else if (/experience|years|yoe|how many.*year/i.test(questionText)) {
     const candidateYears = profile.yearsExperience || profile.yearsOfExperience || 4;
-    targetIndex = matchExperienceOption(options, candidateYears);
-    if (targetIndex >= 0 && targetIndex < options.length) {
-      targetAnswer = options[targetIndex];
+    targetIndex = matchExperienceOption(activeOptions, candidateYears);
+    if (targetIndex >= 0 && targetIndex < activeOptions.length) {
+      targetAnswer = activeOptions[targetIndex];
     }
   }
 
-  // 6. Notice period / serving notice / joining
+  // 8. Notice period / serving notice / joining
   else if (/notice period|serving notice|lwd|last working|joining/i.test(questionText)) {
     targetAnswer = '15 Days';
-    targetIndex = options.findIndex((o) => o.includes('15') || o.toLowerCase().includes('immediate') || o.includes('< 15') || o.includes('0-15'));
-    if (targetIndex < 0 && options.length > 0) {
+    targetIndex = activeOptions.findIndex((o) => o.includes('15') || o.toLowerCase().includes('immediate') || o.includes('< 15') || o.includes('0-15'));
+    if (targetIndex < 0 && activeOptions.length > 0) {
       targetIndex = 0;
-      targetAnswer = options[0];
+      targetAnswer = activeOptions[0];
     }
   }
 
-  // 7. Employment type (Full-time / Part-time / Contract)
+  // 9. Employment type (Full-time / Part-time / Contract)
   else if (/employment type|full.?time|part.?time/i.test(questionText)) {
     targetAnswer = 'Full-time';
-    targetIndex = options.findIndex((o) => o.toLowerCase().includes('full'));
-    if (targetIndex < 0 && options.length > 0) {
+    targetIndex = activeOptions.findIndex((o) => o.toLowerCase().includes('full'));
+    if (targetIndex < 0 && activeOptions.length > 0) {
       targetIndex = 0;
-      targetAnswer = options[0];
+      targetAnswer = activeOptions[0];
     }
   }
 
   // Default fallback: pick via Gemini or first non-skip option
-  if (targetIndex < 0 && options.length > 0) {
+  if (targetIndex < 0 && activeOptions.length > 0) {
     try {
       const geminiChoice = await resolveScreeningQuestionWithGemini(
         questionText,
         'radio',
-        options,
+        activeOptions,
         profile
       );
       if (geminiChoice) {
-        const found = options.findIndex(
+        const found = activeOptions.findIndex(
           (o) => o.trim().toLowerCase() === geminiChoice.toLowerCase() || o.toLowerCase().includes(geminiChoice.toLowerCase())
         );
         if (found >= 0) {
           targetIndex = found;
-          targetAnswer = options[found];
+          targetAnswer = activeOptions[found];
         }
       }
     } catch {}
 
     if (targetIndex < 0) {
-      targetIndex = options.findIndex((o) => !/skip|decline|none of/i.test(o));
+      targetIndex = activeOptions.findIndex((o) => !/skip|decline|none of/i.test(o));
       if (targetIndex < 0) targetIndex = 0;
-      targetAnswer = options[targetIndex];
+      targetAnswer = activeOptions[targetIndex];
     }
   }
 
   if (targetIndex < 0 && !targetAnswer) return false;
 
-  // First try: JS evaluation inside the chatbot drawer to find and click the exact option element
-  const clickedInJs = await page.evaluate(({ tIndex, tText }) => {
-    const drawer = document.querySelector(
-      'div.chatbot_DrawerContentWrapper, div[class*="chatbot" i], div[class*="drawer" i], div[class*="applyDrawer" i], div[class*="apply-container" i]'
-    );
-    const root = drawer || document;
-
-    const items = Array.from(root.querySelectorAll(
-      'label.ssrc__label, .singleselect-radiobutton, .ssrc__radio-btn-container, label[class*="radio" i], div[class*="radio" i], input[type="radio"], label'
-    ));
-
-    const validOptions: { element: HTMLElement; text: string; radioInput: HTMLInputElement | null }[] = [];
-    for (const el of items) {
-      const text = ((el as HTMLElement).innerText || el.textContent || '').trim();
-      if (text && !text.includes('\n') && text.length < 100 && !/skip this question|bot|drawer|step/i.test(text)) {
-        if (!validOptions.some((v) => v.text === text)) {
-          const radioInput = (el instanceof HTMLInputElement && el.type === 'radio')
-            ? el
-            : el.querySelector('input[type="radio"]');
-          validOptions.push({ element: el as HTMLElement, text, radioInput: radioInput as HTMLInputElement | null });
-        }
-      }
-    }
-
-    let chosen: { element: HTMLElement; text: string; radioInput: HTMLInputElement | null } | undefined;
-
-    if (tText) {
-      const lower = tText.toLowerCase();
-      chosen = validOptions.find((v) => v.text.toLowerCase() === lower) ||
-               validOptions.find((v) => v.text.toLowerCase().includes(lower));
-    }
-
-    if (!chosen && tIndex >= 0 && tIndex < validOptions.length) {
-      chosen = validOptions[tIndex];
-    }
-
-    if (!chosen && validOptions.length > 0) {
-      chosen = validOptions[0];
-    }
-
-    if (chosen) {
-      const { element, radioInput } = chosen;
-      element.scrollIntoView({ block: 'nearest' });
-      element.click();
-
-      if (radioInput) {
-        radioInput.checked = true;
-        radioInput.dispatchEvent(new Event('change', { bubbles: true }));
-        radioInput.dispatchEvent(new Event('click', { bubbles: true }));
-      }
-
-      const sendBtn = root.querySelector('div.send, [class*="send" i], [class*="save" i]');
-      if (sendBtn) sendBtn.classList.remove('disabled');
-
-      return true;
-    }
-    return false;
-  }, { tIndex: targetIndex, tText: targetAnswer }).catch(() => false);
-
-  if (clickedInJs) {
-    await page.waitForTimeout(500);
-    return true;
-  }
-
-  // Playwright locator click fallback
+  // Tier 1: Direct Playwright label click with force: true
   if (targetAnswer) {
     try {
-      const byText = page.locator(
+      const labelLoc = page.locator(
         `${CHATBOT_DRAWER} label.ssrc__label:has-text("${targetAnswer}"), ${CHATBOT_DRAWER} label:has-text("${targetAnswer}"), ${CHATBOT_DRAWER} .singleselect-radiobutton:has-text("${targetAnswer}")`
       ).first();
-      if ((await byText.count()) > 0 && (await byText.isVisible().catch(() => false))) {
-        await byText.click({ timeout: 2000 });
-        await page.waitForTimeout(500);
-        return true;
+      if ((await labelLoc.count()) > 0 && (await labelLoc.isVisible().catch(() => false))) {
+        await labelLoc.scrollIntoViewIfNeeded().catch(() => {});
+        await labelLoc.click({ force: true, timeout: 2000 }).catch(() => {});
+        await page.waitForTimeout(150);
       }
     } catch {}
   }
 
-  // Fallback locator by index
+  // Tier 2: Direct Playwright radio check with force: true
+  if (targetAnswer) {
+    try {
+      const radioLoc = page.locator(
+        `${CHATBOT_DRAWER} input[type="radio"][value="${targetAnswer}" i], ${CHATBOT_DRAWER} input[type="radio"]:has(+ label:has-text("${targetAnswer}"))`
+      ).first();
+      if ((await radioLoc.count()) > 0) {
+        await radioLoc.scrollIntoViewIfNeeded().catch(() => {});
+        await radioLoc.check({ force: true, timeout: 2000 }).catch(() => {});
+        await page.waitForTimeout(150);
+      }
+    } catch {}
+  }
+
+  // Tier 3: Playwright getByRole('radio')
+  if (targetAnswer) {
+    try {
+      const escaped = targetAnswer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const roleLoc = page.getByRole('radio', { name: new RegExp(`^\\s*${escaped}\\s*$`, 'i') }).first();
+      if ((await roleLoc.count()) > 0) {
+        await roleLoc.check({ force: true, timeout: 2000 }).catch(() => {});
+        await page.waitForTimeout(150);
+      }
+    } catch {}
+  }
+
+  // Tier 4: In-page JS evaluation with trusted event emulation and Naukri chatbot send-button activation
+  const clickedInJs = await page.evaluate(({ tAnswer, tIndex }) => {
+    const drawer = document.querySelector(
+      'div.chatbot_DrawerContentWrapper, div[class*="chatbot" i], div[class*="drawer" i], div[class*="applyDrawer" i], div[class*="apply-container" i]'
+    ) || document.body;
+
+    const allRadios = Array.from(drawer.querySelectorAll<HTMLInputElement>('input[type="radio"], [role="radio"]'));
+    const allLabels = Array.from(drawer.querySelectorAll(
+      'label.ssrc__label, .singleselect-radiobutton, .ssrc__radio-btn-container, label[class*="radio" i], div[class*="radio" i], div[class*="singleselect" i], [class*="radio-item" i], label'
+    ));
+
+    type OptionEntry = {
+      element: HTMLElement;
+      radio: HTMLInputElement | null;
+      text: string;
+      value: string;
+    };
+
+    const optionsList: OptionEntry[] = [];
+
+    for (const r of allRadios) {
+      let text = '';
+      if (r.id) {
+        const lbl = document.querySelector(`label[for="${CSS.escape(r.id)}"]`);
+        if (lbl) text = lbl.textContent || '';
+      }
+      if (!text) {
+        const parentLbl = r.closest('label');
+        if (parentLbl) text = parentLbl.textContent || '';
+      }
+      if (!text) {
+        const sib = r.nextElementSibling;
+        if (sib) text = sib.textContent || '';
+      }
+      if (!text) text = r.value || r.getAttribute('aria-label') || '';
+      text = text.replace(/\s+/g, ' ').trim();
+      optionsList.push({
+        element: r.closest('label') || r.parentElement || r,
+        radio: r,
+        text,
+        value: r.value || '',
+      });
+    }
+
+    for (const l of allLabels) {
+      const r = l.querySelector<HTMLInputElement>('input[type="radio"]') || (l instanceof HTMLInputElement && l.type === 'radio' ? l : null);
+      const text = (l.textContent || '').replace(/\s+/g, ' ').trim();
+      if (text && !optionsList.some((o) => o.element === l || (r && o.radio === r))) {
+        optionsList.push({
+          element: l as HTMLElement,
+          radio: r,
+          text,
+          value: r?.value || '',
+        });
+      }
+    }
+
+    let chosen: OptionEntry | undefined;
+    if (tAnswer) {
+      const lower = tAnswer.toLowerCase().trim();
+      chosen = optionsList.find((o) => o.text.toLowerCase() === lower || o.value.toLowerCase() === lower);
+      if (!chosen && (lower === 'yes' || lower === 'no')) {
+        chosen = optionsList.find((o) => new RegExp(`^${lower}\\b`, 'i').test(o.text) || new RegExp(`^${lower}\\b`, 'i').test(o.value));
+      }
+      if (!chosen) {
+        chosen = optionsList.find((o) => o.text.toLowerCase().includes(lower) || lower.includes(o.text.toLowerCase()));
+      }
+    }
+
+    if (!chosen && tIndex >= 0 && tIndex < optionsList.length) {
+      chosen = optionsList[tIndex];
+    }
+
+    if (!chosen && optionsList.length > 0) {
+      chosen = optionsList[0];
+    }
+
+    if (chosen) {
+      const { element, radio } = chosen;
+      element.scrollIntoView({ block: 'nearest' });
+      element.click();
+
+      if (radio) {
+        radio.checked = true;
+        radio.dispatchEvent(new Event('input', { bubbles: true }));
+        radio.dispatchEvent(new Event('change', { bubbles: true }));
+        radio.dispatchEvent(new Event('click', { bubbles: true }));
+      }
+
+      if (element.getAttribute('role') === 'radio') {
+        element.setAttribute('aria-checked', 'true');
+        element.dispatchEvent(new Event('click', { bubbles: true }));
+      }
+
+      // Un-disable save/send buttons in Naukri chatbot
+      const sendBtns = drawer.querySelectorAll('div.send, [class*="send" i], [class*="save" i], button');
+      sendBtns.forEach((b) => b.classList.remove('disabled'));
+
+      return true;
+    }
+    return false;
+  }, { tAnswer: targetAnswer, tIndex: targetIndex }).catch(() => false);
+
+  if (clickedInJs) {
+    await page.waitForTimeout(300);
+    return true;
+  }
+
+  // Tier 5: Fallback locator by index
   try {
-    const labels = page.locator(`${CHATBOT_DRAWER} label.ssrc__label, ${CHATBOT_DRAWER} .singleselect-radiobutton`);
+    const labels = page.locator(`${CHATBOT_DRAWER} label.ssrc__label, ${CHATBOT_DRAWER} .singleselect-radiobutton, ${CHATBOT_DRAWER} input[type="radio"]`);
     const count = await labels.count();
     if (targetIndex >= 0 && targetIndex < count) {
-      await labels.nth(targetIndex).click({ timeout: 2000 });
-      await page.waitForTimeout(500);
+      await labels.nth(targetIndex).click({ force: true, timeout: 2000 });
+      await page.waitForTimeout(300);
       return true;
     }
   } catch {}
@@ -1654,11 +1818,19 @@ async function clickChatbotSave(page: Page): Promise<boolean> {
       `${CHATBOT_DRAWER} div.sendMsg`,
       `${CHATBOT_DRAWER} button:has-text("Save")`,
       `${CHATBOT_DRAWER} button:has-text("Next")`,
+      `${CHATBOT_DRAWER} button:has-text("Submit")`,
+      `${CHATBOT_DRAWER} button:has-text("Apply")`,
+      `${CHATBOT_DRAWER} button[type="submit"]`,
       `${CHATBOT_DRAWER} div.send`,
+      `${CHATBOT_DRAWER} [class*="sendBtn" i]`,
+      `${CHATBOT_DRAWER} [class*="saveBtn" i]`,
       'div.send div.sendMsg',
       'div.sendMsg',
       'button:has-text("Save")',
       'button:has-text("Next")',
+      'button:has-text("Submit")',
+      'button:has-text("Apply")',
+      'button[type="submit"]',
       'div.send',
     ];
 
@@ -1685,10 +1857,10 @@ async function clickChatbotSave(page: Page): Promise<boolean> {
       }
 
       // Prioritize clicking send msg div or save button over the outer send wrapper
-      const clickables = Array.from(root.querySelectorAll('div.sendMsg, button, [class*="send" i], [class*="save" i], div.send'));
+      const clickables = Array.from(root.querySelectorAll('div.sendMsg, button, [class*="send" i], [class*="save" i], [class*="submit" i], div.send'));
       for (const el of clickables) {
         const text = (el.textContent || '').trim().toLowerCase();
-        if (text === 'save' || text === 'next' || text === 'send' || el.classList.contains('sendMsg') || el.classList.contains('send')) {
+        if (text === 'save' || text === 'next' || text === 'send' || text === 'submit' || text === 'apply' || el.classList.contains('sendMsg') || el.classList.contains('send')) {
           const rect = el.getBoundingClientRect();
           if (rect.width > 0 && rect.height > 0) {
             (el as HTMLElement).click();

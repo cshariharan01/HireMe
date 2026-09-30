@@ -502,10 +502,10 @@ export function checkRateLimit(strategy: SubmissionStrategy): { ok: boolean; rea
   // `datetime('now', ...)` is evaluated by SQLite in the same format and timezone (UTC) as
   // CURRENT_TIMESTAMP, so the comparison is now like-for-like.
   const todayRow = db
-    .prepare(`SELECT COUNT(*) as n FROM apply_audit WHERE attempted_at >= datetime('now', '-1 day') AND status = 'success'`)
+    .prepare(`SELECT COUNT(*) as n FROM apply_audit WHERE attempted_at >= datetime('now', '-1 day') AND status IN ('success', 'stopped_for_review')`)
     .get() as { n: number };
   const hourRow = db
-    .prepare(`SELECT COUNT(*) as n FROM apply_audit WHERE attempted_at >= datetime('now', '-1 hour') AND status = 'success'`)
+    .prepare(`SELECT COUNT(*) as n FROM apply_audit WHERE attempted_at >= datetime('now', '-1 hour') AND status IN ('success', 'stopped_for_review')`)
     .get() as { n: number };
   const counts = { today: todayRow.n, thisHour: hourRow.n };
 

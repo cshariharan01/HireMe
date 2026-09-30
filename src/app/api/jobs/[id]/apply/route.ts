@@ -160,6 +160,18 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
     const overrides = (body.overrides || {}) as Record<string, unknown>;
     const resumeSource = body.resumeSource === 'original' || body.resumeSource === 'tailored' ? body.resumeSource : undefined;
 
+    // Rate-limit check BEFORE doing heavy preparation or launching any browser window!
+    if (!dryRun) {
+      const _pQuickJob = db.prepare('SELECT url, apply_type FROM job_postings WHERE id = ?').get(jobId) as { url?: string; apply_type?: string } | undefined;
+      const _pJobUrl = _pQuickJob?.url ?? '';
+      const _quickStrategy = /naukri\.com/i.test(_pJobUrl) ? 'naukri' : /linkedin\.com/i.test(_pJobUrl) ? 'linkedin' : 'browser';
+      const rl = checkRateLimit(_quickStrategy);
+      if (!rl.ok) {
+        db.prepare(`INSERT INTO apply_audit (job_id, strategy, status, error) VALUES (?, ?, 'rate_limited', ?)`).run(jobId, _quickStrategy, rl.reason || 'Rate limited');
+        return NextResponse.json({ ok: false, error: rl.reason, rateLimit: rl.counts }, { status: 429 });
+      }
+    }
+
     // For Naukri / LinkedIn jobs: launch Chrome IMMEDIATELY — in parallel with prepareSubmission.
     // This way the user sees the browser open right away when they click Apply,
     // not after LLM calls and PDF generation (which can take 10–30 s).

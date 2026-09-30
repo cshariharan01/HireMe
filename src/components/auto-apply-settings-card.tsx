@@ -124,6 +124,14 @@ export function AutoApplySettingsCard() {
                   min={1}
                   defaultValue={config.rateLimit.perDay}
                   disabled={saving}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      const perDay = parseInt((e.target as HTMLInputElement).value, 10);
+                      if (Number.isFinite(perDay) && perDay !== config.rateLimit.perDay) {
+                        patch({ rateLimit: { ...config.rateLimit, perDay } });
+                      }
+                    }
+                  }}
                   onBlur={(e) => {
                     const perDay = parseInt(e.target.value, 10);
                     if (Number.isFinite(perDay) && perDay !== config.rateLimit.perDay) {
@@ -141,6 +149,14 @@ export function AutoApplySettingsCard() {
                   min={1}
                   defaultValue={config.rateLimit.perHour}
                   disabled={saving}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      const perHour = parseInt((e.target as HTMLInputElement).value, 10);
+                      if (Number.isFinite(perHour) && perHour !== config.rateLimit.perHour) {
+                        patch({ rateLimit: { ...config.rateLimit, perHour } });
+                      }
+                    }
+                  }}
                   onBlur={(e) => {
                     const perHour = parseInt(e.target.value, 10);
                     if (Number.isFinite(perHour) && perHour !== config.rateLimit.perHour) {
