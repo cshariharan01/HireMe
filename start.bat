@@ -36,13 +36,21 @@ if not exist node_modules (
   echo  Dependencies installed.
 )
 
-:: Install Playwright browser if needed (required for auto-apply automation)
-:: Ollama is NOT required - configure a free Gemini key in the app Settings instead.
-if not exist "node_modules\playwright-core\.local-chromium" (
-  if not exist "node_modules\playwright\.local-chromium" (
-    echo.
-    echo  Installing browser engine (one-time ~150 MB download)...
-    call npx playwright install chromium
+:: Check if Google Chrome exists
+set CHROME_FOUND=0
+if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" set CHROME_FOUND=1
+if exist "%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe" set CHROME_FOUND=1
+if exist "%LocalAppData%\Google\Chrome\Application\chrome.exe" set CHROME_FOUND=1
+
+if "!CHROME_FOUND!"=="1" (
+  echo  Google Chrome detected on system.
+) else (
+  if not exist "node_modules\playwright-core\.local-chromium" (
+    if not exist "node_modules\playwright\.local-chromium" (
+      echo.
+      echo  Chrome not found. Installing bundled browser engine (~150 MB download)...
+      call npx playwright install chromium
+    )
   )
 )
 

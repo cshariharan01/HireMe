@@ -28,13 +28,20 @@ if [ ! -d "node_modules" ]; then
   echo " Dependencies installed."
 fi
 
-# Install Playwright browser if needed (required for auto-apply automation)
-# Ollama is NOT required - configure a free Gemini key in the app Settings instead.
-if [ ! -d "node_modules/playwright-core/.local-chromium" ] && \
-   [ ! -d "node_modules/playwright/.local-chromium" ]; then
-  echo ""
-  echo " Installing browser engine (one-time ~150 MB)..."
-  npx playwright install chromium
+# Check if Chrome / Chromium is installed
+CHROME_FOUND=0
+if [ -d "/Applications/Google Chrome.app" ] || command -v google-chrome &>/dev/null || command -v google-chrome-stable &>/dev/null || command -v chromium-browser &>/dev/null || command -v chromium &>/dev/null; then
+  CHROME_FOUND=1
+  echo " Google Chrome / Chromium detected on system."
+fi
+
+if [ "$CHROME_FOUND" -eq 0 ]; then
+  if [ ! -d "node_modules/playwright-core/.local-chromium" ] && \
+     [ ! -d "node_modules/playwright/.local-chromium" ]; then
+    echo ""
+    echo " Chrome not found. Installing browser engine (one-time ~150 MB)..."
+    npx playwright install chromium
+  fi
 fi
 
 # Create data directories
