@@ -17,6 +17,11 @@ import type { CandidateProfile, PlatformResult } from './platform';
 import { launchApplyBrowser, bringWindowToFront, focusApplyPage, shouldBringWindowToFront, AUTO_APPLY_SUCCESS_PAGE, isApplyCancelled, getSystemChromeProfileDir } from './launcher';
 import { getApplyConfig, answerScreeningQuestion, normalizeCityName, matchCityResidenceQuestion } from './questions';
 import { resolveScreeningQuestionWithGemini, type FieldConstraints } from './llm-screening';
+import {
+  resolveLinkedInQuestionAnswer,
+  resolveLinkedInQuestionAnswerAsync,
+  resolvePreferredLocationOption,
+} from './linkedin';
 
 export { normalizeCityName, matchCityResidenceQuestion };
 
@@ -141,9 +146,14 @@ const CHATBOT_RADIO = [
   `${CHATBOT_DRAWER} label[class*="radio" i]`,
   `${CHATBOT_DRAWER} div[class*="radio" i]`,
   `${CHATBOT_DRAWER} div[class*="singleselect" i]`,
+  `${CHATBOT_DRAWER} li[class*="singleselect" i]`,
+  `${CHATBOT_DRAWER} [class*="single-select" i]`,
   `${CHATBOT_DRAWER} [class*="radio-item" i]`,
   `${CHATBOT_DRAWER} [class*="radioBtn" i]`,
   `${CHATBOT_DRAWER} [class*="radio-btn" i]`,
+  `${CHATBOT_DRAWER} [class*="radioWrap" i]`,
+  `${CHATBOT_DRAWER} [class*="radio_option" i]`,
+  `${CHATBOT_DRAWER} div.ssrc__radio`,
   'input[type="radio"]',
   '[role="radio"]',
   'label.ssrc__label',
@@ -152,6 +162,11 @@ const CHATBOT_RADIO = [
   'label[class*="radio" i]',
   'div[class*="radio" i]',
   'div[class*="singleselect" i]',
+  'li[class*="singleselect" i]',
+  '[class*="single-select" i]',
+  '[class*="radio-item" i]',
+  '[class*="radioBtn" i]',
+  '[class*="radio-btn" i]',
 ].join(', ');
 
 const CHATBOT_CHECKBOX = `${CHATBOT_DRAWER} div.multiselectcheckboxes, ${CHATBOT_DRAWER} .mcc__checkbox, ${CHATBOT_DRAWER} label.mcc__label, div.multiselectcheckboxes, .mcc__checkbox, label.mcc__label`;
