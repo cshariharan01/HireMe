@@ -13,11 +13,28 @@ Runs **100% locally on your computer** — no cloud subscriptions, no shared acc
 
 ---
 
+---
+
 ## ⚡ Setup in 3 Minutes
+
+```mermaid
+graph LR
+    A[1. Clone Repo] --> B[2. npm install]
+    B --> C[3. npm run dev]
+    C --> D[4. Open http://localhost:3000]
+    D --> E[5. Paste Free Key in Settings UI]
+    E --> F[🎉 Start Applying!]
+    style A fill:#e1f5fe,stroke:#0288d1
+    style B fill:#e1f5fe,stroke:#0288d1
+    style C fill:#e1f5fe,stroke:#0288d1
+    style D fill:#e8f5e9,stroke:#388e3c
+    style E fill:#fff3e0,stroke:#f57c00
+    style F fill:#c8e6c9,stroke:#2e7d32,font-weight:bold
+```
 
 ### Prerequisites
 1. **Node.js (v18+)**: Download the LTS installer from [nodejs.org](https://nodejs.org) if you haven't already.
-2. **Google Chrome**: Already on your computer. HireMe connects directly to your normal Chrome browser.
+2. **Google Chrome**: Already installed on almost all computers. HireMe connects directly to your normal Chrome browser.
 
 ---
 
@@ -33,7 +50,8 @@ npm run dev
 ```
 
 > 💡 **Windows Shortcut:** You can also simply double-click `start.bat`!  
-> 💡 **Mac / Linux Shortcut:** You can run `bash start.sh`!
+> 💡 **Mac / Linux Shortcut:** You can run `bash start.sh`!  
+> 💡 **No terminal configuration needed:** You do NOT need to touch any code, backend files, or terminal scripts after running this command!
 
 Open your browser and navigate to:  
 👉 **[http://localhost:3000](http://localhost:3000)** *(or `http://localhost:3001` if using `start.bat`)*
@@ -45,7 +63,7 @@ Open your browser and navigate to:
 1. Get a **100% free API key** from [Google AI Studio](https://aistudio.google.com/apikey) *(takes 15 seconds, no credit card required, includes 1,500 free requests per day)*.
 2. Open HireMe at **[http://localhost:3000/settings](http://localhost:3000/settings)** (or click **Settings** in the top navigation).
 3. Under **Google Gemini**, paste your API key and click **Add Provider**.
-4. **Done!** HireMe automatically validates the key, activates it, and configures the backend immediately without needing to restart the server or edit any files.
+4. **Done!** HireMe automatically validates the key, activates it, and configures the backend immediately. You never need to edit `.env` or restart your server.
 
 ---
 
@@ -70,10 +88,12 @@ Open your browser and navigate to:
 ## ❓ Frequently Asked Questions (FAQ)
 
 ### Do my friends or I need to copy `.env.example` to `.env`?
-**No, absolutely not.** You never need to touch `.env` files. When you enter your API key in the **Settings** page of the web application, HireMe automatically saves and synchronizes it to the backend environment in real time.
+**No, absolutely not.** You never need to create, copy, or edit `.env` files. When you enter your API key in the **Settings** page of the web application, HireMe automatically writes, encrypts, and synchronizes it to the backend environment in real time.
 
 ### Do I need to install Chromium or run `npx playwright install`?
-**No.** HireMe has native Chrome auto-detection. As long as you have standard **Google Chrome** installed on your computer, HireMe will use it directly. You do not need to download hundreds of megabytes of extra browser binaries.
+**No.** HireMe features native Chrome auto-detection. As long as you have standard **Google Chrome** installed on your computer (Windows, Mac, or Linux), HireMe will use it directly. You do not need to download hundreds of megabytes of extra browser binaries.
+
+*Note: If you do not have Google Chrome installed, HireMe will automatically prompt or fall back to Playwright's Chromium (`npx playwright install chromium`).*
 
 ### How do logins work for LinkedIn and Naukri?
 When you trigger an application for the first time:
