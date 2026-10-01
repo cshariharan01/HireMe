@@ -71,4 +71,26 @@ describe('auto-apply rate limits', () => {
     expect(r.counts.today).toBe(0);
     expect(r.ok).toBe(true);
   });
+
+  it('resets daily cap at local midnight and excludes yesterday applications', () => {
+    saveApplyConfig({ ...getApplyConfig(), rateLimit: { perDay: 5, perHour: 100 } });
+    // Insert 10 applications from yesterday (before local midnight)
+    for (let i = 0; i < 10; i++) {
+      db.prepare(`
+        INSERT INTO apply_audit (job_id, strategy, status, attempted_at)
+        VALUES (?, 'greenhouse', 'success', datetime('now', 'localtime', 'start of day', '-2 hours', 'utc'))
+      `).run(jobId);
+    }
+    // Yesterday applications should NOT count towards today's daily cap
+    const beforeToday = checkRateLimit('greenhouse');
+    expect(beforeToday.counts.today).toBe(0);
+    expect(beforeToday.ok).toBe(true);
+
+    // Apply 3 jobs today
+    record(3);
+    const afterThree = checkRateLimit('greenhouse');
+    expect(afterThree.counts.today).toBe(3);
+    expect(afterThree.ok).toBe(true);
+  });
 });
+

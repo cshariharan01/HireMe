@@ -500,9 +500,14 @@ export function checkRateLimit(strategy: SubmissionStrategy): { ok: boolean; rea
   // before the check produced `thisHour = 0`.
   //
   // `datetime('now', ...)` is evaluated by SQLite in the same format and timezone (UTC) as
-  // CURRENT_TIMESTAMP, so the comparison is now like-for-like.
+  // CURRENT_TIMESTAMP, so the comparison is like-for-like.
+  //
+  // Daily cap counts submissions since midnight of the current day in the user's local timezone
+  // (`datetime('now', 'localtime', 'start of day', 'utc')`). This prevents yesterday's evening
+  // applications from consuming today's quota.
+  // Hourly cap uses a rolling 1-hour window (`datetime('now', '-1 hour')`) for burst protection.
   const todayRow = db
-    .prepare(`SELECT COUNT(*) as n FROM apply_audit WHERE attempted_at >= datetime('now', '-1 day') AND status IN ('success', 'stopped_for_review')`)
+    .prepare(`SELECT COUNT(*) as n FROM apply_audit WHERE attempted_at >= datetime('now', 'localtime', 'start of day', 'utc') AND status IN ('success', 'stopped_for_review')`)
     .get() as { n: number };
   const hourRow = db
     .prepare(`SELECT COUNT(*) as n FROM apply_audit WHERE attempted_at >= datetime('now', '-1 hour') AND status IN ('success', 'stopped_for_review')`)
