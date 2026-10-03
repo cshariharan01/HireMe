@@ -382,9 +382,8 @@ function Dashboard() {
   }, [activeJobId, filtered]);
 
   const startAutoApply = useCallback(() => {
-    const startIdx = currentFilteredIndex >= 0 ? currentFilteredIndex : 0;
-    startAutoApplyRunner(filtered, startIdx);
-  }, [currentFilteredIndex, filtered, startAutoApplyRunner]);
+    startAutoApplyRunner(filtered, 0);
+  }, [filtered, startAutoApplyRunner]);
 
   const handleNextAutoApply = useCallback(() => {
     if (filtered.length === 0) return;

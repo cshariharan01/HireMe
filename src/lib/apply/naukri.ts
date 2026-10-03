@@ -1035,21 +1035,34 @@ export async function answerRadioQuestion(
 
   if (targetIndex < 0 && !targetAnswer) return false;
 
-  // Tier 1: Direct Playwright label click with force: true
+  // Tier 1: Direct Playwright exact text / label click with force: true
   if (targetAnswer) {
     try {
-      const labelLoc = page.locator(
-        `${CHATBOT_DRAWER} label.ssrc__label:has-text("${targetAnswer}"), ${CHATBOT_DRAWER} label:has-text("${targetAnswer}"), ${CHATBOT_DRAWER} .singleselect-radiobutton:has-text("${targetAnswer}")`
+      const escaped = targetAnswer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const textLoc = page.locator(
+        `${CHATBOT_DRAWER} :is(label, .singleselect-radiobutton, div[class*="radio" i], div[class*="option" i], li, span, p):has-text("${targetAnswer}")`
       ).first();
-      if ((await labelLoc.count()) > 0 && (await labelLoc.isVisible().catch(() => false))) {
-        await labelLoc.scrollIntoViewIfNeeded().catch(() => {});
-        await labelLoc.click({ force: true, timeout: 2000 }).catch(() => {});
-        await page.waitForTimeout(150);
+      if ((await textLoc.count()) > 0 && (await textLoc.isVisible().catch(() => false))) {
+        await textLoc.scrollIntoViewIfNeeded().catch(() => {});
+        await textLoc.click({ force: true, timeout: 2000 }).catch(() => {});
+        await page.waitForTimeout(200);
       }
     } catch {}
   }
 
-  // Tier 2: Direct Playwright radio check with force: true
+  // Tier 2: Playwright getByText exact match
+  if (targetAnswer) {
+    try {
+      const exactTextLoc = page.getByText(targetAnswer, { exact: true }).first();
+      if ((await exactTextLoc.count()) > 0 && (await exactTextLoc.isVisible().catch(() => false))) {
+        await exactTextLoc.scrollIntoViewIfNeeded().catch(() => {});
+        await exactTextLoc.click({ force: true, timeout: 2000 }).catch(() => {});
+        await page.waitForTimeout(200);
+      }
+    } catch {}
+  }
+
+  // Tier 3: Direct Playwright radio check with force: true
   if (targetAnswer) {
     try {
       const radioLoc = page.locator(
@@ -1058,19 +1071,7 @@ export async function answerRadioQuestion(
       if ((await radioLoc.count()) > 0) {
         await radioLoc.scrollIntoViewIfNeeded().catch(() => {});
         await radioLoc.check({ force: true, timeout: 2000 }).catch(() => {});
-        await page.waitForTimeout(150);
-      }
-    } catch {}
-  }
-
-  // Tier 3: Playwright getByRole('radio')
-  if (targetAnswer) {
-    try {
-      const escaped = targetAnswer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const roleLoc = page.getByRole('radio', { name: new RegExp(`^\\s*${escaped}\\s*$`, 'i') }).first();
-      if ((await roleLoc.count()) > 0) {
-        await roleLoc.check({ force: true, timeout: 2000 }).catch(() => {});
-        await page.waitForTimeout(150);
+        await page.waitForTimeout(200);
       }
     } catch {}
   }
@@ -1083,7 +1084,7 @@ export async function answerRadioQuestion(
 
     const allRadios = Array.from(drawer.querySelectorAll<HTMLInputElement>('input[type="radio"], [role="radio"]'));
     const allLabels = Array.from(drawer.querySelectorAll(
-      'label.ssrc__label, .singleselect-radiobutton, .ssrc__radio-btn-container, label[class*="radio" i], div[class*="radio" i], div[class*="singleselect" i], [class*="radio-item" i], label'
+      'label.ssrc__label, .singleselect-radiobutton, .ssrc__radio-btn-container, label[class*="radio" i], div[class*="radio" i], div[class*="singleselect" i], [class*="radio-item" i], div[class*="option" i], label, span'
     ));
 
     type OptionEntry = {
@@ -1112,7 +1113,7 @@ export async function answerRadioQuestion(
       if (!text) text = r.value || r.getAttribute('aria-label') || '';
       text = text.replace(/\s+/g, ' ').trim();
       optionsList.push({
-        element: r.closest('label') || r.parentElement || r,
+        element: (r.closest('label') || r.parentElement || r) as HTMLElement,
         radio: r,
         text,
         value: r.value || '',
@@ -1122,7 +1123,7 @@ export async function answerRadioQuestion(
     for (const l of allLabels) {
       const r = l.querySelector<HTMLInputElement>('input[type="radio"]') || (l instanceof HTMLInputElement && l.type === 'radio' ? l : null);
       const text = (l.textContent || '').replace(/\s+/g, ' ').trim();
-      if (text && !optionsList.some((o) => o.element === l || (r && o.radio === r))) {
+      if (text && text.length < 80 && !optionsList.some((o) => o.element === l || (r && o.radio === r))) {
         optionsList.push({
           element: l as HTMLElement,
           radio: r,
@@ -1155,23 +1156,32 @@ export async function answerRadioQuestion(
     if (chosen) {
       const { element, radio } = chosen;
       element.scrollIntoView({ block: 'nearest' });
-      element.click();
+      
+      // Dispatch trusted full mouse & pointer event chain to activate React event listeners
+      const mouseEvents = ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+      for (const evName of mouseEvents) {
+        try {
+          element.dispatchEvent(new MouseEvent(evName, { bubbles: true, cancelable: true, view: window }));
+          if (radio) radio.dispatchEvent(new MouseEvent(evName, { bubbles: true, cancelable: true, view: window }));
+        } catch {}
+      }
 
       if (radio) {
         radio.checked = true;
         radio.dispatchEvent(new Event('input', { bubbles: true }));
         radio.dispatchEvent(new Event('change', { bubbles: true }));
-        radio.dispatchEvent(new Event('click', { bubbles: true }));
       }
 
       if (element.getAttribute('role') === 'radio') {
         element.setAttribute('aria-checked', 'true');
-        element.dispatchEvent(new Event('click', { bubbles: true }));
       }
 
-      // Un-disable save/send buttons in Naukri chatbot
-      const sendBtns = drawer.querySelectorAll('div.send, [class*="send" i], [class*="save" i], button');
-      sendBtns.forEach((b) => b.classList.remove('disabled'));
+      // Un-disable save/send buttons in Naukri chatbot drawer
+      const sendBtns = drawer.querySelectorAll('div.send, [class*="send" i], [class*="save" i], button, [class*="submit" i]');
+      sendBtns.forEach((b) => {
+        b.classList.remove('disabled');
+        b.removeAttribute('disabled');
+      });
 
       return true;
     }
@@ -1411,14 +1421,6 @@ export function resolveChatbotTextAnswer(
     }
   }
 
-  // 2. Questions explicitly instructing to write/enter NA if not applicable / none
-  if (/(?:if not|else|otherwise|or)\s*,?\s*(?:write|enter|type)?\s*na\b/i.test(q)) {
-    // If not a core personal identity field, safe default is NA
-    if (!/email|phone|mobile|\byour\s*name\b|full\s*name|total\s*exp/i.test(q)) {
-      return 'NA';
-    }
-  }
-
   // 3. Contact & identity
   if (/\bemail\b/i.test(q)) return profile.email || '';
   if (/\b(phone|mobile|contact number)\b/i.test(q)) return profile.phone || '';
@@ -1476,6 +1478,11 @@ export function resolveChatbotTextAnswer(
   }
 
   // 8. Location & Relocation
+  if (/which.*location|locations?.*relocate|preferred location|preferred city/i.test(q) && !/^(are you|do you|can you|will you|have you|would you)/i.test(q.trim())) {
+    const targets = profile.targets as { locations?: string[] } | undefined;
+    const loc = (targets?.locations && targets.locations.length > 0) ? targets.locations[0] : ((profile.location as string) || (profile.city as string) || '');
+    if (loc) return loc;
+  }
   if (/willing to relocate|ready to relocate|comfortable to relocate|open to relocate/i.test(q)) {
     return 'Yes';
   }
@@ -1831,6 +1838,7 @@ async function clickChatbotSave(page: Page): Promise<boolean> {
     const saveSelectors = [
       `${CHATBOT_DRAWER} div.send div.sendMsg`,
       `${CHATBOT_DRAWER} div.sendMsg`,
+      `${CHATBOT_DRAWER} :is(button, div, span, a):has-text("Save")`,
       `${CHATBOT_DRAWER} button:has-text("Save")`,
       `${CHATBOT_DRAWER} button:has-text("Next")`,
       `${CHATBOT_DRAWER} button:has-text("Submit")`,
@@ -1839,8 +1847,10 @@ async function clickChatbotSave(page: Page): Promise<boolean> {
       `${CHATBOT_DRAWER} div.send`,
       `${CHATBOT_DRAWER} [class*="sendBtn" i]`,
       `${CHATBOT_DRAWER} [class*="saveBtn" i]`,
+      `${CHATBOT_DRAWER} [class*="save" i]`,
       'div.send div.sendMsg',
       'div.sendMsg',
+      ':is(button, div, span, a):has-text("Save")',
       'button:has-text("Save")',
       'button:has-text("Next")',
       'button:has-text("Submit")',
@@ -1853,12 +1863,21 @@ async function clickChatbotSave(page: Page): Promise<boolean> {
       try {
         const btn = page.locator(sel).first();
         if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
-          await btn.click({ timeout: 1000 }).catch(() => {});
+          await btn.click({ timeout: 1000, force: true }).catch(() => {});
           await page.waitForTimeout(400);
           return true;
         }
       } catch {}
     }
+
+    try {
+      const saveTextBtn = page.getByText('Save', { exact: true }).first();
+      if ((await saveTextBtn.count()) > 0 && (await saveTextBtn.isVisible().catch(() => false))) {
+        await saveTextBtn.click({ timeout: 1000, force: true }).catch(() => {});
+        await page.waitForTimeout(400);
+        return true;
+      }
+    } catch {}
 
     // 3. Fallback: JS click inside evaluate, prioritizing child sendMsg over outer send
     const clickedInJs = await page.evaluate(() => {

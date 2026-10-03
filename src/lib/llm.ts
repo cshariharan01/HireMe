@@ -1018,13 +1018,15 @@ CRITICAL INSTRUCTIONS:
    - Categorize the candidate's technical and professional skills into clean lines (e.g., **Core Skills:**, **Tools & Technologies:**, **Frameworks & Databases:**).
    - Ensure target job description keywords that match the candidate's capabilities are highlighted in ## Skills so ATS keyword scanners rate the resume at 95%+.
 
-3. ACTIVELY REWRITE WORK EXPERIENCE (## Experience):
-   - Rewrite work experience bullets under the candidate's REAL employers to feature target job responsibilities, tools, and methodologies where applicable.
-   - Preserve candidate's real metrics, scale figures, and true achievements from their original resume.
-   - Keep candidate's real employer names, role titles, employment dates, and degrees exactly as provided.
+3. WORK EXPERIENCE (## Experience):
+   - Under the candidate's current/latest organization (and recent employment history), modify the content by ADDING NEW BULLET LINES based on the target Job Description's tech stack, keywords, and domain requirements.
+   - All newly added experience bullet lines MUST match and align with the candidate's current organization domain (as derived from their existing work experience and project details).
+   - Keep the candidate's real employer names, role titles, employment dates, and original core achievements intact.
 
-4. ACTIVELY TAILOR & EXPAND PROJECTS (## Projects):
-   - Adapt project titles, tech stack descriptions, and bullet points of candidate's REAL projects to highlight relevant technologies and analytical/engineering methodologies requested in the JD.
+4. PROJECTS SECTION (## Projects):
+   - DO NOT MODIFY EXISTING PROJECTS! Leave all of the candidate's existing projects completely intact as they are.
+   - For every new job application, ADD ONE OR TWO NEW PROJECTS tailored specifically to the target Job Description's required technologies and methodologies.
+   - The newly added projects MUST match the candidate's current working domain and technical capabilities.
 
 5. ATS-SAFE FORMATTING:
    - Use proper Markdown sections in this order: # Name (heading), contact line under it, ## Summary, ## Skills, ## Experience, ## Projects (if present), ## Education.
@@ -1078,13 +1080,15 @@ CRITICAL SECTION-BY-SECTION INSTRUCTIONS:
    - Every single keyword under REQUIRED ATS KEYWORDS and key skills from the Job Description MUST appear explicitly in \\section{Skills} under clean, professional category headers appropriate to candidate background (e.g., Domain \\& Business Analysis, Methodologies \\& Testing, Tools \\& Technologies, AI \\& Analytics).
    - Never omit required target skills or title skills — this is critical for passing ATS thresholding (>90%+ match).
 
-5. PRESERVE ORIGINAL WORK EXPERIENCE WITH DEEP TARGET ALIGNMENT (\\section{Experience}):
+5. WORK EXPERIENCE (\\section{Experience}):
    - The candidate's original employers, role titles, dates, locations, and core achievements MUST remain intact.
-   - Rewrite experience bullet points (and any tools summary lines) to weave in the target job's relevant technologies, domain terms, responsibilities, and high-impact metrics (e.g., process automation %, UAT cycle time reduction, requirement accuracy, risk control efficiency).
+   - Under the candidate's current/latest organization, modify the content by ADDING NEW BULLET LINES (\\resumeItem{...}) tailored to the target Job Description's tech stack, keywords, and domain requirements.
+   - All newly added experience lines MUST strictly match the candidate's current organization domain (derived from existing work experience and project details).
 
-6. PRESERVE ORIGINAL PROJECTS WITH TARGET ALIGNMENT (\\section{Projects}):
-   - DO NOT REMOVE the candidate's original projects.
-   - Adapt project bullet points to integrate relevant target technologies and analytical/engineering methodologies requested in the JD.
+6. PROJECTS (\\section{Projects}):
+   - DO NOT MODIFY EXISTING PROJECTS! Leave all original projects from the candidate's LaTeX template completely unchanged.
+   - For the new job application, ADD ONE OR TWO NEW PROJECTS (using \\resumeProjectHeading and \\resumeItem) tailored specifically to the target Job Description.
+   - The newly added project(s) MUST match the candidate's current working domain and technical background.
 
 7. COMPILATION SAFETY:
    - Clean ASCII / standard LaTeX only: escape %, &, _, # properly (e.g. \\%, \\&, \\_, \\#).
@@ -1092,9 +1096,7 @@ CRITICAL SECTION-BY-SECTION INSTRUCTIONS:
 
 8. STRICT WORD & SENTENCE BUDGET (NO FONT RESIZING):
    - DO NOT change the font size or \\documentclass options.
-   - You MUST edit the content so the word count and sentence count in each section matches the budget available in the template.
-   - Maintain the EXACT same number of bullet points per position/project as the original template — do NOT add extra bullets or sections.
-   - Keep every bullet concise (maximum 12 to 18 words per bullet) so that the tailored resume fits on the exact same page count.`;
+   - Keep each bullet concise (maximum 12 to 18 words per bullet) so that the tailored resume fits neatly.`;
 
 export interface ResumeLatexResult {
   text: string;
@@ -1130,10 +1132,11 @@ export async function generateLatexResume(
   const bulletCount = (resumeTex.match(/\\(?:resumeItem|item)\b/g) || []).length;
   const budgetBlock = bulletCount > 0
     ? `\nCRITICAL PAGE BUDGET & SECTION INTEGRITY CONSTRAINT:
-- The candidate's template spans EXACTLY ${targetPages} page(s) and has ${bulletCount} bullet points total across all sections.
-- Your tailored output MUST NOT exceed ${bulletCount} total bullet points.
-- Preserve EVERY single section (Profile, Work Experience, Education, Skills, Technical Expertise, Certifications) and EVERY project / position heading present in the template. DO NOT drop or empty any section or project.
-- Keep each bullet point concise (maximum 12 to 18 words per bullet, matching original template line lengths) so the entire document fits on exact target ${targetPages} page(s) without reducing font size or stripping sections.\n`
+- The candidate's template spans EXACTLY ${targetPages} page(s).
+- DO NOT modify or remove any existing projects — leave all existing projects completely intact.
+- Under current organization, modify work experience by adding new bullet lines tailored to the target JD (matching current organization domain).
+- Add 1 or 2 new projects tailored to the job description (matching current working domain).
+- Keep each bullet point concise (maximum 12 to 18 words per bullet) so the entire document fits on target page(s) without reducing font size.\n`
     : '';
 
   const prompt = `${RESUME_LATEX_RULES}

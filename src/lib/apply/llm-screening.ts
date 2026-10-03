@@ -97,6 +97,14 @@ export interface FieldConstraints {
   errorMessage?: string;
 }
 
+export interface JobDetails {
+  jobTitle?: string;
+  company?: string;
+  jobDescription?: string;
+  tailoredResumeText?: string;
+  tailoredSkills?: string[];
+}
+
 /**
  * Uses LLM (primaryGenerate) to resolve custom, qualitative, or multiline screening questions.
  * Works with ANY configured provider (Gemini, Freeway, OpenAI, Groq, Anthropic, Ollama).
@@ -107,7 +115,8 @@ export async function resolveScreeningQuestionWithGemini(
   inputType: string = 'text',
   options: string[] = [],
   profile: CandidateProfile = {},
-  constraints: FieldConstraints = {}
+  constraints: FieldConstraints = {},
+  jobDetails: JobDetails = {}
 ): Promise<string | null> {
   const normLabel = label.trim();
   if (!normLabel) return null;
@@ -169,13 +178,33 @@ export async function resolveScreeningQuestionWithGemini(
     };
 
     let prompt = `You are assisting a job candidate with answering a screening question on a job application.
-Answer truthfully, professionally, and directly on behalf of the candidate based on their profile facts and the field constraints.
+Answer truthfully, professionally, and directly on behalf of the candidate based on their profile facts, tailored resume details, and field constraints.
 
 Candidate Profile:
 ${JSON.stringify(profileSummary, null, 2)}
+`;
 
-Screening Question: "${normLabel}"
+    if (jobDetails.jobTitle || jobDetails.company || jobDetails.jobDescription) {
+      prompt += `\nTarget Application Details:
+Job Title: ${jobDetails.jobTitle || 'N/A'}
+Company: ${jobDetails.company || 'N/A'}
+Job Description Summary: ${(jobDetails.jobDescription || '').slice(0, 1500)}
+`;
+    }
+
+    if (jobDetails.tailoredResumeText) {
+      prompt += `\nTailored Resume Facts & Experience:
+${jobDetails.tailoredResumeText.slice(0, 2500)}
+`;
+    }
+
+    prompt += `\nScreening Question: "${normLabel}"
 Input Field Type: ${inputType}
+
+CRITICAL RULES:
+- Use the candidate's real skills, projects, and experience from their profile & tailored resume.
+- If the question asks to enter "NA" if not applicable, ONLY output "NA" if the candidate has zero relevant experience or applicability for that skill/domain. If the candidate has relevant skills/experience in their profile or resume, provide their actual experience/years/details.
+- If the question asks which locations the candidate wants to relocate to or preferred locations, output candidate's preferred location(s) (e.g. ${profileSummary.preferredLocations.join(', ') || profileSummary.city || 'Bangalore'}). Do NOT answer "Yes" to location selection questions.
 `;
 
     const isNumericQuestion =

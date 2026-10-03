@@ -1736,12 +1736,15 @@ export function resolveLinkedInQuestionAnswer(
   const isStreet = /(?:street|address\s*line\s*1|home\s*address|\bstreet\s*address\b)/i.test(normLabel) || (/\baddress\b/i.test(normLabel) && !/email|url|link/i.test(normLabel));
   if (isStreet && inputType !== 'radio') return street;
 
-  const isRelocation = /(?:willing|open|comfortable|ready)\s*(?:to\s*)?relocat/i.test(normLabel);
-  if (isRelocation) {
+  const isRelocationYesNo = (/^(?:are\s*you|do\s*you|can\s*you|will\s*you|have\s*you|is\s*there|would\s*you)\b/i.test(normLabel)
+    || /\b(?:yes\s*\/\s*no|yes\s*or\s*no|\[yes\/no\]|\(yes\/no\))\b/i.test(normLabel))
+    && /(?:willing|open|comfortable|ready)\s*(?:to\s*)?relocat/i.test(normLabel);
+
+  if (isRelocationYesNo) {
     return 'Yes';
   }
 
-  const isLocationPref = /(?:preferr?ed\s*(?:work\s*)?location|work\s*location|office\s*location|base\s*location|current\s*location|job\s*location|desired\s*location|where\s*are\s*you\s*(?:based|located)|which\s*location|select\s*(?:your\s*)?(?:preferr?ed)?\s*location|location\s*preference|^\s*location\s*[\?\*:]*$)/i.test(normLabel)
+  const isLocationPref = /(?:preferr?ed\s*(?:work\s*)?location|work\s*location|office\s*location|base\s*location|current\s*location|job\s*location|desired\s*location|where\s*are\s*you\s*(?:based|located)|which\s*location|locations?\s*(?:do\s*you\s*want\s*to|to)?\s*relocate|select\s*(?:your\s*)?(?:preferr?ed)?\s*location|location\s*preference|^\s*location\s*[\?\*:]*$)/i.test(normLabel)
     && !/^(?:have\s*you|do\s*you|are\s*you|did\s*you|can\s*you|will\s*you)\b/i.test(normLabel);
 
   if (isLocationPref) {

@@ -464,8 +464,8 @@ const DEFAULT_CONFIG: ApplyConfig = {
     browser: true,
   },
   rateLimit: {
-    perDay: 20,
-    perHour: 5,
+    perDay: 200,
+    perHour: 50,
   },
   dryRun: false,
   resumeSource: 'tailored', // default to JD-tailored resume for every application
