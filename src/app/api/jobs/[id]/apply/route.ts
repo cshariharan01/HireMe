@@ -507,11 +507,11 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
     const isPlatformSubmitted = (submitResult.responseBody as { submitted?: boolean })?.submitted === true;
     const loginRequired = (submitResult?.responseBody as { loginRequired?: boolean })?.loginRequired === true;
     const captcha = (submitResult?.responseBody as { captcha?: boolean })?.captcha === true;
-    const shouldTrack = !dryRun && !loginRequired && !captcha && (
-      submitResult.ok ||
+    const shouldTrack = !dryRun && !loginRequired && !captcha && !stoppedForReview && (
       isPlatformSubmitted ||
       alreadyAppliedOnPlatform ||
-      browserUnconfirmed
+      browserUnconfirmed ||
+      (submitResult.ok && !stoppedForReview)
     );
     if (shouldTrack) {
       const activeOwner = getActiveOwnerId();

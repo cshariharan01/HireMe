@@ -364,6 +364,11 @@ export const NAUKRI_EXPIRED_PATTERNS = [
   /applications are closed/i,
   /vacancy closed/i,
   /job closed/i,
+  /not compatible/i,
+  /job is not compatible/i,
+  /oops.*not compatible/i,
+  /incompatible job/i,
+  /not matching your profile/i,
   /expired job/i,
 ];
 
