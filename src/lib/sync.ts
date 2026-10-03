@@ -7,6 +7,7 @@
 import { spawn } from 'child_process';
 import path from 'path';
 import db from './db';
+import { buildMatchesPage } from './matches-page';
 
 export type SyncMode = 'linkedin' | 'naukri' | 'full' | 'quick' | 'rate';
 type StepStatus = 'pending' | 'running' | 'done' | 'error' | 'skipped';
@@ -142,15 +143,14 @@ function dbCounts(): DbCounts {
     const active = (db.prepare("SELECT COUNT(*) n FROM job_postings WHERE expired_at IS NULL AND (url_status IS NULL OR url_status != 'dead')").get() as { n: number }).n;
     const embedded = (db.prepare('SELECT COUNT(*) n FROM job_postings WHERE embedding IS NOT NULL AND expired_at IS NULL').get() as { n: number }).n;
     const evaluated = (db.prepare('SELECT COUNT(*) n FROM job_evaluations').get() as { n: number }).n;
-    let dashboardMatches = active;
+    let dashboardMatches = 0;
     try {
-      const { buildMatchesPage } = require('./matches-page');
       const page = buildMatchesPage({ limit: 1, applyScoreFilter: true });
       if (typeof page?.totalFiltered === 'number') {
         dashboardMatches = page.totalFiltered;
       }
     } catch {
-      dashboardMatches = active;
+      dashboardMatches = 0;
     }
     return { active, embedded, evaluated, dashboardMatches };
   } catch { return { active: 0, embedded: 0, evaluated: 0, dashboardMatches: 0 }; }
