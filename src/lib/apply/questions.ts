@@ -284,8 +284,15 @@ function answerFromDefaults(
       return defaults.startDate || (defaults.noticePeriodDays === 0 ? 'Immediately' : null);
     case 'location': {
       const candidateLocation = (profile.location as string) || '';
+      if (/(?:work\s*from\s*office|wfo|hybrid|on[- ]?site|in[- ]?office|5\s*days|five\s*days)/i.test(question)) {
+        return 'Yes';
+      }
       const cityResidence = matchCityResidenceQuestion(question, candidateLocation);
       if (cityResidence) return cityResidence.answer;
+      if (/which.*location|locations?.*relocate|preferred\s*locations?/i.test(question) && !/^(are you|do you|can you|will you|have you|would you)/i.test(question.trim())) {
+        const targets = (profile.targets as { locations?: string[] })?.locations || (Array.isArray(profile.targetLocations) ? profile.targetLocations : []);
+        if (targets.length > 0) return targets.join(', ');
+      }
       return (profile.location as string) || null;
     }
     case 'eeo_race':

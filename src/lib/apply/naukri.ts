@@ -1400,7 +1400,30 @@ export function resolveChatbotTextAnswer(
 ): string {
   const q = questionText.trim();
 
-  // 1. Ex-employee / previous employee / employee ID / re-hire questions
+  // 0. Explicit "write NA" instructions (e.g. "Do you have AWS certification? if not, write NA")
+  if (/(?:if not|else|otherwise|or)\s*,?\s*(?:write|enter|type)?\s*na\b/i.test(q)) {
+    return 'NA';
+  }
+
+  // 1. Explicit Yes/No & Willingness prompts (e.g. "Important Note: This role requires working from office all 5 days of the week. Are you comfortable with this ?")
+  const isYesNoPrompt =
+    /^(?:important\s*note:?\s*)?(?:are\s+you|do\s+you|can\s+you|will\s+you|have\s+you|is\s+there|would\s+you|did\s+you)\b/i.test(q) ||
+    /(?:comfortable\s*with|willing\s*to|ready\s*to|open\s*to|agree\s*to|comfortable\s*to)/i.test(q);
+
+  // 2. Open-ended location list / relocation target questions (e.g. "Which are the locations do you want to relocate?", "Preferred locations to relocate")
+  const isLocationListQuestion =
+    /which\s*(?:are\s*)?(?:the\s*)?locations|which\s*cities|locations?\s*(?:do\s*you\s*)?(?:want|prefer|wish|like)\s*to\s*relocate|preferred\s*locations?\s*(?:to\s*relocate)?|select\s*(?:preferred\s*)?locations?/i.test(q) &&
+    !/^(?:are\s+you|do\s+you|can\s+you|will\s+you|have\s+you|would\s+you)\b/i.test(q);
+
+  if (isLocationListQuestion) {
+    const targets = (profile.targets as { locations?: string[] })?.locations || (Array.isArray(profile.targetLocations) ? profile.targetLocations : []);
+    if (targets && targets.length > 0) {
+      return targets.join(', ');
+    }
+    return (profile.location as string) || (profile.city as string) || 'Madurai, Coimbatore, Chennai, Bangalore, Remote';
+  }
+
+  // 3. Ex-employee / previous employee / employee ID / re-hire questions
   const isExEmployeeQuestion =
     /ex[- ](employee|emp|infosys|tcs|wipro|cognizant|accenture|hcl|tech mahindra|capgemini)|former employee|previous employee|past employee|employee id|emp id|previously worked|worked with us|worked at/i.test(q);
 
@@ -1426,7 +1449,7 @@ export function resolveChatbotTextAnswer(
     }
   }
 
-  // 3. Contact & identity
+  // 4. Contact & identity
   if (/\bemail\b/i.test(q)) return profile.email || '';
   if (/\b(phone|mobile|contact number)\b/i.test(q)) return profile.phone || '';
   if (/\b(full\s*name|your\s*name|candidate\s*name)\b/i.test(q) || (/name/i.test(q) && !/company|employer/i.test(q))) {
@@ -1435,14 +1458,14 @@ export function resolveChatbotTextAnswer(
   if (/\blinkedin\b/i.test(q)) return profile.linkedin || '';
   if (/\b(github|portfolio|website)\b/i.test(q)) return profile.portfolioUrl || '';
 
-  // 4. Notice period / LWD / Joining time
+  // 5. Notice period / LWD / Joining time
   if (/notice period|serving notice|last working day|lwd|how soon can you join/i.test(q)) {
     const days = profile.noticePeriodDays ?? (profile.notice_period_days as number) ?? 30;
     if (/in days|\bdays\b/i.test(q)) return String(days);
     return `${days} Days`;
   }
 
-  // 5. Current CTC / Compensation (e.g. "What is your current CTC in Lacs per annum?")
+  // 6. Current CTC / Compensation
   if (/current\s*(ctc|salary|compensation|fixed|take home|package)|present\s*(ctc|salary)/i.test(q)) {
     const inr = (profile.currentCtcInr as number | undefined) ?? (profile.current_ctc_inr as number | undefined);
     const targetMin = (profile.targets as any)?.comp_min;
@@ -1458,7 +1481,7 @@ export function resolveChatbotTextAnswer(
     return formattedLakhs;
   }
 
-  // 6. Expected CTC / Compensation
+  // 7. Expected CTC / Compensation
   if (/expected\s*(ctc|salary|compensation|package)|salary expectation/i.test(q)) {
     const targets = profile.targets as { comp_min?: number; locations?: string[] } | undefined;
     const inr = (profile.expectedCtcInr as number | undefined) ?? (profile.expected_ctc_inr as number | undefined) ?? targets?.comp_min;
@@ -1474,20 +1497,21 @@ export function resolveChatbotTextAnswer(
     return formattedLakhs;
   }
 
-  // 7. Experience / Years (e.g. "How many years of experience do you have in Power Bi?", "Years of experience in Python")
-  if (/(?:total|relevant|overall|years of|work)?\s*(?:experience|exp|yoe)\b|how many years|years in\b/i.test(q)) {
+  // 8. Work from office / Hybrid / Shift / Travel Yes-No
+  if (/(?:work\s*from\s*office|wfo|hybrid|on[- ]?site|in[- ]?office|5\s*days|five\s*days)/i.test(q) && !/how\s*many/i.test(q)) {
+    return 'Yes';
+  }
+
+  // 9. Experience / Years (e.g. "How many years of experience do you have in Power Bi?", "Years of experience in Python")
+  // MUST require explicit experience/exp/yoe keywords and not be a Yes/No prompt
+  if (!isYesNoPrompt && /(?:total|relevant|overall|years\s+of)?\s*(?:experience|exp|yoe)\b|how\s+many\s+years|years\s+in\b/i.test(q)) {
     const expList = Array.isArray(profile.experience) ? profile.experience : [];
     const rawYoe = (profile.yearsOfExperience as number) ?? (profile.yearsExperience as number) ?? (expList.length ? Math.max(1, expList.length * 2) : 3);
     const numYoe = Number(rawYoe);
     return !isNaN(numYoe) && numYoe >= 0 ? String(Math.floor(numYoe)) : '3';
   }
 
-  // 8. Location & Relocation
-  if (/which.*location|locations?.*relocate|preferred location|preferred city/i.test(q) && !/^(are you|do you|can you|will you|have you|would you)/i.test(q.trim())) {
-    const targets = profile.targets as { locations?: string[] } | undefined;
-    const loc = (targets?.locations && targets.locations.length > 0) ? targets.locations[0] : ((profile.location as string) || (profile.city as string) || '');
-    if (loc) return loc;
-  }
+  // 10. Location & Relocation
   if (/willing to relocate|ready to relocate|comfortable to relocate|open to relocate/i.test(q)) {
     return 'Yes';
   }
@@ -1500,13 +1524,11 @@ export function resolveChatbotTextAnswer(
   }
   if (/preferred location|preferred city/i.test(q)) {
     const targets = profile.targets as { locations?: string[] } | undefined;
-    return (targets?.locations && targets.locations.length > 0) ? targets.locations[0] : ((profile.location as string) || '');
-  }
-  if (/work from office|wfo|hybrid|on[- ]?site|in[- ]?office/i.test(q)) {
-    return 'Yes';
+    const locs = (targets?.locations && targets.locations.length > 0) ? targets.locations.join(', ') : ((profile.location as string) || '');
+    return locs;
   }
 
-  // 9. Current Company / Title
+  // 11. Current Company / Title
   if (/current (organization|company|employer)|present (organization|company|employer)/i.test(q)) {
     return (profile.currentCompany as string) || '';
   }
@@ -1514,7 +1536,7 @@ export function resolveChatbotTextAnswer(
     return (profile.currentJobTitle as string) || (profile.title as string) || '';
   }
 
-  // 10. Education / College / Years
+  // 12. Education / College / Years
   if (/highest (qualification|education|degree)|qualification|degree/i.test(q)) {
     const edu = Array.isArray(profile.education) ? profile.education : [];
     return edu.length > 0 ? String(edu[0]) : ((profile.degree as string) || (profile.qualification as string) || 'Bachelor Degree');
@@ -1532,12 +1554,12 @@ export function resolveChatbotTextAnswer(
     return '2020';
   }
 
-  // 11. Willingness / Yes-No prompts
-  if (/willing|ready|able|can you|agree/i.test(q)) {
+  // 13. General Yes-No / Willingness prompts
+  if (isYesNoPrompt || /willing|ready|able|can you|agree/i.test(q)) {
     return 'Yes';
   }
 
-  // 12. Certifications
+  // 14. Certifications
   if (/certification|certified/i.test(q)) {
     return 'NA';
   }
@@ -1747,17 +1769,23 @@ export async function answerTextQuestion(
     constraints.errorMessage = retryErrorMessage;
   }
 
+  const isYesNoPrompt =
+    /^(?:important\s*note:?\s*)?(?:are\s+you|do\s+you|can\s+you|will\s+you|have\s+you|is\s+there|would\s+you|did\s+you)\b/i.test(questionText.trim()) ||
+    /(?:comfortable\s*with|willing\s*to|ready\s*to|open\s*to|agree\s*to|comfortable\s*to)/i.test(questionText);
+
   const isCtcQuestion =
     /(?:current|present|expected)?\s*(?:ctc|salary|compensation|package)|salary expectation/i.test(questionText);
   const isYearsOrExpQuestion =
-    /(?:how many\s+)?(?:years|months|days)(?:\s+of)?(?:\s+experience|\s+exp)?\b|experience in\b|years in\b|\byoe\b/i.test(questionText);
+    !isYesNoPrompt &&
+    /(?:how\s+many\s+)?(?:years|months)\s+(?:of\s+)?(?:experience|exp)\b|experience\s+in\b|years\s+in\b|\byoe\b/i.test(questionText);
   const isStandardProfileQuestion =
     isCtcQuestion ||
     isYearsOrExpQuestion ||
     /notice period|serving notice|last working day|lwd|how soon/i.test(questionText) ||
     /\b(email|phone|mobile|name|linkedin|portfolio)\b/i.test(questionText) ||
     /willing to relocate|ready to relocate|current location|where are you|residing/i.test(questionText) ||
-    /ex[- ](employee|emp)|former employee|previous employee/i.test(questionText);
+    /ex[- ](employee|emp)|former employee|previous employee/i.test(questionText) ||
+    isYesNoPrompt;
 
   // 1. Try deterministic heuristics for standard profile fields
   const heuristicAnswer = resolveChatbotTextAnswer(questionText, profile, companyName);
@@ -1768,7 +1796,7 @@ export async function answerTextQuestion(
   if (isStandardProfileQuestion && heuristicAnswer && !retryErrorMessage) {
     answer = heuristicAnswer;
   } else if (!heuristicAnswer || constraints.isNumeric || constraints.errorMessage || /experience in|role|tech stack|how many|years|skills/i.test(questionText)) {
-    if (isYearsOrExpQuestion || isCtcQuestion) {
+    if ((isYearsOrExpQuestion || isCtcQuestion) && !isYesNoPrompt) {
       constraints.isNumeric = true;
     }
     answer = await resolveScreeningQuestionWithGemini(
@@ -1776,7 +1804,8 @@ export async function answerTextQuestion(
       'text',
       [],
       profile,
-      constraints
+      constraints,
+      { jobTitle, company: companyName }
     );
   }
 
@@ -1787,7 +1816,7 @@ export async function answerTextQuestion(
   if (!answer) {
     if (/(?:if not|else|otherwise|or)\s*,?\s*(?:write|enter|type)?\s*na\b/i.test(questionText)) {
       answer = 'NA';
-    } else if (/^(?:are\s+you|do\s+you|can\s+you|will\s+you|have\s+you|is\s+there|would\s+you|did\s+you)\b/i.test(questionText.trim())) {
+    } else if (isYesNoPrompt || /^(?:are\s+you|do\s+you|can\s+you|will\s+you|have\s+you|is\s+there|would\s+you|did\s+you)\b/i.test(questionText.trim())) {
       answer = /ex[- ]employee|former employee|criminal|convict|backlog|bond|disciplinary/i.test(questionText) ? 'No' : 'Yes';
     } else {
       answer = 'NA';

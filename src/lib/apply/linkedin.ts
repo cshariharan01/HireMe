@@ -1736,7 +1736,12 @@ export function resolveLinkedInQuestionAnswer(
   const isStreet = /(?:street|address\s*line\s*1|home\s*address|\bstreet\s*address\b)/i.test(normLabel) || (/\baddress\b/i.test(normLabel) && !/email|url|link/i.test(normLabel));
   if (isStreet && inputType !== 'radio') return street;
 
-  const isRelocationYesNo = (/^(?:are\s*you|do\s*you|can\s*you|will\s*you|have\s*you|is\s*there|would\s*you)\b/i.test(normLabel)
+  const isWfoComfort = /(?:work\s*from\s*office|wfo|hybrid|on[- ]?site|in[- ]?office|5\s*days|five\s*days)/i.test(normLabel) && !/how\s*many/i.test(normLabel);
+  if (isWfoComfort) {
+    return 'Yes';
+  }
+
+  const isRelocationYesNo = (/^(?:important\s*note:?\s*)?(?:are\s*you|do\s*you|can\s*you|will\s*you|have\s*you|is\s*there|would\s*you)\b/i.test(normLabel)
     || /\b(?:yes\s*\/\s*no|yes\s*or\s*no|\[yes\/no\]|\(yes\/no\))\b/i.test(normLabel))
     && /(?:willing|open|comfortable|ready)\s*(?:to\s*)?relocat/i.test(normLabel);
 
@@ -1752,7 +1757,10 @@ export function resolveLinkedInQuestionAnswer(
       const matched = resolvePreferredLocationOption(options, profile);
       if (matched) return matched;
     }
-    const targetLocs = (profile.targets as { locations?: string[] })?.locations || [];
+    const targetLocs = (profile.targets as { locations?: string[] })?.locations || (Array.isArray(profile.targetLocations) ? profile.targetLocations : []);
+    if (inputType !== 'radio' && targetLocs.length > 0) {
+      return targetLocs.join(', ');
+    }
     return targetLocs[0] || city || (profile.location as string) || null;
   }
 

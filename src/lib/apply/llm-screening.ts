@@ -203,16 +203,23 @@ Input Field Type: ${inputType}
 
 CRITICAL RULES:
 - Use the candidate's real skills, projects, and experience from their profile & tailored resume.
-- If the question asks to enter "NA" if not applicable, ONLY output "NA" if the candidate has zero relevant experience or applicability for that skill/domain. If the candidate has relevant skills/experience in their profile or resume, provide their actual experience/years/details.
-- If the question asks which locations the candidate wants to relocate to or preferred locations, output candidate's preferred location(s) (e.g. ${profileSummary.preferredLocations.join(', ') || profileSummary.city || 'Bangalore'}). Do NOT answer "Yes" to location selection questions.
+- For Yes/No or comfort/willingness questions (e.g. "Important Note: This role requires working from office all 5 days of the week. Are you comfortable with this ?"): Output "Yes" or "No". Do NOT output numbers or "NA".
+- If the question asks to enter "NA" if not applicable, ONLY output "NA" if the candidate genuinely has zero relevant experience or applicability for that skill/domain. If the candidate has relevant skills/experience in their profile or resume, provide their actual experience/years/details.
+- If the question asks which locations the candidate wants to relocate to or preferred locations, output candidate's preferred location(s) (e.g. ${profileSummary.preferredLocations.join(', ') || profileSummary.city || 'Madurai, Coimbatore, Chennai, Bangalore, Remote'}). Do NOT answer "Yes" to location list questions.
 `;
 
+    const isYesNoPrompt =
+      /^(?:important\s*note:?\s*)?(?:are\s+you|do\s+you|can\s+you|will\s+you|have\s+you|is\s+there|would\s+you|did\s+you)\b/i.test(normLabel) ||
+      /(?:comfortable\s*with|willing\s*to|ready\s*to|open\s*to|agree\s*to|comfortable\s*to)/i.test(normLabel);
+
     const isNumericQuestion =
-      Boolean(constraints.isNumeric) ||
-      constraints.inputMode === 'numeric' ||
-      Boolean(constraints.pattern?.includes('0-9')) ||
-      Boolean(constraints.pattern?.includes('\\d')) ||
-      /(?:how many|total|relevant|overall)?\s*years(?:\s+of)?(?:\s+experience|\s+exp)?\b|years in\b|\byoe\b|how many\s+(?:years|months|days|projects|people|teams|clients)\b/i.test(normLabel);
+      !isYesNoPrompt && (
+        Boolean(constraints.isNumeric) ||
+        constraints.inputMode === 'numeric' ||
+        Boolean(constraints.pattern?.includes('0-9')) ||
+        Boolean(constraints.pattern?.includes('\\d')) ||
+        /(?:how many|total|relevant|overall)?\s*years(?:\s+of)?(?:\s+experience|\s+exp)?\b|years in\b|\byoe\b|how many\s+(?:years|months|days|projects|people|teams|clients)\b/i.test(normLabel)
+      );
 
     if (isNumericQuestion) {
       prompt += `\nFIELD CONSTRAINT: NUMERIC ONLY. The question is asking for a numeric count or number of years. Output ONLY pure digits (e.g. 3, or notice period days like 30, or CTC amount like 700000). DO NOT output text like "Yes", "No", "3 years", or "30 days". Output ONLY digits.`;
