@@ -21,17 +21,19 @@ process.env.HIRESIGNAL_DB = TEST_DB_PATH;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function seedJob(
   db: any,
-  overrides: Partial<{ title: string; company: string; url: string; description: string; dedup: string }> = {},
+  overrides: Partial<{ title: string; company: string; url: string; description: string; dedup: string; applyType: string }> = {},
 ): number {
   const title = overrides.title ?? 'Integration Architect';
   const company = overrides.company ?? 'Acme Health';
-  const url = overrides.url ?? 'https://example.com/jobs/1';
+  const url = overrides.url ?? 'https://www.linkedin.com/jobs/view/1';
   const dedup = overrides.dedup ?? `dedup-${Math.random().toString(36).slice(2)}`;
+  const applyType = overrides.applyType ?? 'easy_apply';
+  const dummyEmbedding = Buffer.alloc(768 * 4);
   const res = db
     .prepare(
-      `INSERT INTO job_postings (source, company, title, location, description, url, dedup_hash)
-       VALUES ('test', ?, ?, 'Remote', ?, ?, ?)`,
+      `INSERT INTO job_postings (source, company, title, location, description, url, dedup_hash, apply_type, embedding)
+       VALUES ('test', ?, ?, 'Remote', ?, ?, ?, ?, ?)`,
     )
-    .run(company, title, overrides.description ?? 'Build FHIR pipelines.', url, dedup);
+    .run(company, title, overrides.description ?? 'Build FHIR pipelines.', url, dedup, applyType, dummyEmbedding);
   return Number(res.lastInsertRowid);
 }

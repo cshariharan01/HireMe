@@ -12,12 +12,17 @@ import { NextRequest } from 'next/server';
 describe('Dashboard Actions Behavior: Remove from dashboard & Mark as Applied', () => {
   let origJson: string | null = null;
   beforeAll(() => {
-    try {
-      const row = db.prepare('SELECT parsed_json FROM my_profile WHERE id = 1').get() as { parsed_json: string } | undefined;
-      origJson = row?.parsed_json ?? null;
-      db.prepare(`UPDATE my_profile SET parsed_json = json_set(parsed_json, '$.targets.locations', json('["India", "Remote", "Bangalore", "Chennai", "Hyderabad", "Pune", "Mumbai", "Noida", "Gurgaon", "Delhi"]')) WHERE id = 1`).run();
-      invalidateMatchCache();
-    } catch {}
+    const row = db.prepare('SELECT parsed_json FROM my_profile WHERE id = 1').get() as { parsed_json: string } | undefined;
+    origJson = row?.parsed_json ?? null;
+    const dummyEmbedding = Buffer.alloc(768 * 4);
+    const baseJson = origJson || '{}';
+    db.prepare(`INSERT OR REPLACE INTO my_profile (id, raw_text, parsed_json, embedding) VALUES (1, 'profile', json_set(?, '$.targets.locations', json('["India", "Remote", "Bangalore", "Chennai", "Hyderabad", "Pune", "Mumbai", "Noida", "Gurgaon", "Delhi"]'), '$.targets.roles', json('[]')), ?)`).run(baseJson, dummyEmbedding);
+    seedJob(db, {
+      company: 'Behavior Test Corp',
+      title: 'Data Engineer',
+      url: 'https://www.linkedin.com/jobs/view/behavior-test-job-1',
+    });
+    invalidateMatchCache();
   });
 
   afterAll(() => {

@@ -349,10 +349,10 @@ export function cleanupStaleProfileLock(userDataDir?: string) {
   try {
     if (process.platform === 'win32') {
       const dirBase = userDataDir ? path.basename(userDataDir) : '';
-      const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \\"Name = 'chrome.exe'\\" | Where-Object { $_.CommandLine -like '*browser-profile*' -or $_.CommandLine -like '*naukri-profile*' -or $_.CommandLine -like '*playwright*' ${dirBase ? `-or $_.CommandLine -like '*${dirBase}*'` : ''} } | Stop-Process -Force -ErrorAction SilentlyContinue"`;
+      const cmd = `powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \\"Name = 'chrome.exe'\\" | Where-Object { $_.CommandLine -like '*browser-profile*' -or $_.CommandLine -like '*naukri-profile*' ${dirBase ? `-or $_.CommandLine -like '*${dirBase}*'` : ''} } | Stop-Process -Force -ErrorAction SilentlyContinue"`;
       execSync(cmd, { stdio: 'ignore', timeout: 2500 });
     } else {
-      execSync(`pkill -f "browser-profile|naukri-profile|remote-debugging-pipe"`, { stdio: 'ignore', timeout: 2000 });
+      execSync(`pkill -f "browser-profile|naukri-profile"`, { stdio: 'ignore', timeout: 2000 });
     }
   } catch {
     // ignore
