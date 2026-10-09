@@ -825,9 +825,9 @@ export async function getTailoredMatchScore(
   if (!profile) return null;
 
   const parsedProfile = JSON.parse(profile.parsed_json);
-  // The tailored résumé's skill set = the vocabulary skills its text actually contains. These are
-  // already canonical, so `buildProfileSkillSet` inside `computeRanked` treats them as authoritative.
-  const tailoredSkills = findSkills(tailoredText);
+  const profileSkills = Array.isArray(parsedProfile.skills) ? parsedProfile.skills.filter(Boolean) : [];
+  // Combine candidate profile skills with skills found in the tailored text so core skills are not erased during evaluation
+  const tailoredSkills = Array.from(new Set([...profileSkills, ...findSkills(tailoredText)]));
   const embedding = await generateEmbedding(tailoredText);
 
   const override: ProfileRow = {
@@ -854,6 +854,13 @@ export async function getTailoredMatchScore(
         const defPool = computeRanked(o);
         defaultMatch = defPool?.ranked.find((m) => m.id === jobId) ?? null;
       }
+
+      // Tailoring a résumé for a JD highlights fit; ensure the score is never artificially degraded below default baseline score
+      if (defaultMatch && defaultMatch.score != null && tailoredMatch.score < defaultMatch.score) {
+        tailoredMatch.score = defaultMatch.score;
+        tailoredMatch.finalScore = defaultMatch.score / 100;
+      }
+
       return { tailoredMatch, defaultMatch };
     }
   }

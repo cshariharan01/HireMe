@@ -41,6 +41,18 @@ export async function POST(request: NextRequest) {
     const now = new Date().toISOString();
     const today = applied_date || now.slice(0, 10);
 
+    let initialDefaultScore: number | null = null;
+    try {
+      const { getRankedMatchById } = await import('@/lib/matches');
+      const match = getRankedMatchById(
+        { includeHidden: true, includeExpired: true, includeApplied: true, includeJobId: targetJobId },
+        targetJobId,
+      );
+      if (match && match.score != null) {
+        initialDefaultScore = Math.round(match.score);
+      }
+    } catch {}
+
     if (existing) {
       db.prepare(
         `UPDATE my_applications
@@ -52,6 +64,7 @@ export async function POST(request: NextRequest) {
              next_follow_up_at = COALESCE(?, next_follow_up_at),
              applied_date = COALESCE(?, applied_date),
              resume_source = COALESCE(?, resume_source),
+             default_score = COALESCE(default_score, ?),
              last_status_change_at = ?,
              applied_at = COALESCE(applied_at, ?)
          WHERE id = ?`
@@ -64,6 +77,7 @@ export async function POST(request: NextRequest) {
         next_follow_up_at ?? null,
         today,
         resume_source ?? null,
+        initialDefaultScore,
         now,
         now,
         existing.id
@@ -71,8 +85,8 @@ export async function POST(request: NextRequest) {
     } else {
       db.prepare(
         `INSERT INTO my_applications
-          (job_id, owner_id, status, notes, recruiter_name, recruiter_contact, next_follow_up_at, applied_date, applied_at, last_status_change_at, resume_source)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (job_id, owner_id, status, notes, recruiter_name, recruiter_contact, next_follow_up_at, applied_date, applied_at, last_status_change_at, resume_source, default_score)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         targetJobId,
         activeOwner,
@@ -84,7 +98,8 @@ export async function POST(request: NextRequest) {
         today,
         now,
         now,
-        resume_source ?? 'tailored'
+        resume_source ?? 'tailored',
+        initialDefaultScore
       );
     }
 

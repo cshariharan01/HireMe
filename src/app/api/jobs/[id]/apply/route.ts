@@ -526,6 +526,18 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
           ? `Already applied on ${plan.strategy}`
           : UNCONFIRMED_NOTE;
       const appliedResumeSource = result.resumeSource || resumeSource || 'tailored';
+      let initialDefaultScore: number | null = null;
+      try {
+        const { getRankedMatchById } = await import('@/lib/matches');
+        const match = getRankedMatchById(
+          { includeHidden: true, includeExpired: true, includeApplied: true, includeJobId: jobId },
+          jobId,
+        );
+        if (match && match.score != null) {
+          initialDefaultScore = Math.round(match.score);
+        }
+      } catch {}
+
       if (exists) {
         db.prepare(
           `UPDATE my_applications
@@ -539,15 +551,16 @@ export async function POST(req: NextRequest, props: { params: Promise<{ id: stri
                submission_error = ?,
                resume_source = ?,
                tailored_score = CASE WHEN ? = 'original' THEN NULL ELSE tailored_score END,
+               default_score = COALESCE(default_score, ?),
                last_status_change_at = ?
            WHERE id = ?`
-        ).run(activeOwner, plan.strategy, now, now, today, submitResult.submissionId || null, note, appliedResumeSource, appliedResumeSource, now, exists.id);
+        ).run(activeOwner, plan.strategy, now, now, today, submitResult.submissionId || null, note, appliedResumeSource, appliedResumeSource, initialDefaultScore, now, exists.id);
       } else {
         db.prepare(
           `INSERT INTO my_applications
-            (job_id, owner_id, status, submitted_via, submitted_at, applied_at, applied_date, submission_id, submission_error, resume_source, last_status_change_at)
-           VALUES (?, ?, 'applied', ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(jobId, activeOwner, plan.strategy, now, now, today, submitResult.submissionId || null, note, appliedResumeSource, now);
+            (job_id, owner_id, status, submitted_via, submitted_at, applied_at, applied_date, submission_id, submission_error, resume_source, default_score, last_status_change_at)
+           VALUES (?, ?, 'applied', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(jobId, activeOwner, plan.strategy, now, now, today, submitResult.submissionId || null, note, appliedResumeSource, initialDefaultScore, now);
       }
       // A real application now exists, so any speculatively-cached cover letter / resume variant
       // belongs ON it — the tracker should show what was actually sent.

@@ -628,20 +628,20 @@ export default function TrackerPage() {
                                 >
                                   <FileText className="h-2.5 w-2.5 text-muted-foreground" />
                                   <span>Applied via Original Resume</span>
-                                  {app.default_score != null && (
-                                    <span className="font-semibold ml-0.5">({Math.round(app.default_score)}% match)</span>
+                                  {(app.default_score != null || app.tailored_score != null) && (
+                                    <span className="font-semibold ml-0.5">({Math.round((app.default_score ?? app.tailored_score)!)}% match)</span>
                                   )}
                                 </div>
                               ) : (
                                 <>
-                                  {/* Original Match Score (calculated with candidate's default resume) */}
-                                  {app.default_score != null && (
+                                  {/* Main Match Score (calculated with candidate's default profile/resume, matching Dashboard) */}
+                                  {(app.default_score != null || app.tailored_score != null) && (
                                     <div
                                       className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium text-muted-foreground bg-muted/60 border border-border"
-                                      title={`Original match score calculated with your default résumé: ${Math.round(app.default_score)}%`}
+                                      title={`Match score calculated against your profile: ${Math.round((app.default_score ?? app.tailored_score)!)}%`}
                                     >
-                                      <ScoreBadge score={app.default_score / 100} size="sm" />
-                                      <span className="font-semibold">{Math.round(app.default_score)}% match</span>
+                                      <ScoreBadge score={(app.default_score ?? app.tailored_score!) / 100} size="sm" />
+                                      <span className="font-semibold">{Math.round((app.default_score ?? app.tailored_score)!)}% match</span>
                                     </div>
                                   )}
 
@@ -666,9 +666,9 @@ export default function TrackerPage() {
                                         >
                                           <Sparkles className="h-2.5 w-2.5 text-primary" />
                                           {Math.round(app.tailored_score)}%
-                                          {app.default_score != null && app.tailored_score !== app.default_score && (
-                                            <span className={cn('font-bold ml-0.5', app.tailored_score > app.default_score ? 'text-emerald-600 dark:text-emerald-400' : 'text-destructive')}>
-                                              ({app.tailored_score > app.default_score ? '+' : ''}{Math.round(app.tailored_score - app.default_score)})
+                                          {app.default_score != null && app.tailored_score > app.default_score && (
+                                            <span className="font-bold ml-0.5 text-emerald-600 dark:text-emerald-400">
+                                              (+{Math.round(app.tailored_score - app.default_score)})
                                             </span>
                                           )}
                                         </span>
