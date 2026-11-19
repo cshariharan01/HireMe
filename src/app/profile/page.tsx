@@ -88,6 +88,7 @@ export default function ProfilePage() {
   // Focus areas (resume-derived domain vocabulary that drives the matcher's soft boost).
   const [domainDraft, setDomainDraft] = useState<string[]>([]);
   const [newDomainTerm, setNewDomainTerm] = useState('');
+  const [newRole, setNewRole] = useState('');
   const [regenDomains, setRegenDomains] = useState(false);
   const [savingDomains, setSavingDomains] = useState(false);
   const [targets, setTargets] = useState({
@@ -244,6 +245,26 @@ export default function ProfilePage() {
     if (idx >= 0) list.splice(idx, 1);
     else list.push(role);
     setTargets({ ...targets, roles: list.join(', ') });
+  };
+
+  const addRole = (roleToAdd?: string) => {
+    const raw = (roleToAdd !== undefined ? roleToAdd : newRole).trim().replace(/\s+/g, ' ');
+    if (!raw) return;
+    const list = currentRoleList();
+    if (!list.some((r) => r.toLowerCase() === raw.toLowerCase())) {
+      list.push(raw);
+      setTargets({ ...targets, roles: list.join(', ') });
+    }
+    setNewRole('');
+  };
+
+  const removeRole = (roleToRemove: string) => {
+    const list = currentRoleList().filter((r) => r.toLowerCase() !== roleToRemove.toLowerCase());
+    setTargets({ ...targets, roles: list.join(', ') });
+  };
+
+  const clearRoles = () => {
+    setTargets({ ...targets, roles: '' });
   };
 
   const selectAllRoles = () => {
@@ -647,6 +668,56 @@ export default function ProfilePage() {
                   <p className="text-[10px] text-muted-foreground/70">
                     Selected roles drive job hunting (search terms) and rank matching roles higher. Remember to Save.
                   </p>
+                </div>
+              )}
+              <div className="flex items-center gap-1.5 pt-1">
+                <Input
+                  value={newRole}
+                  onChange={(e) => setNewRole(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      addRole();
+                    }
+                  }}
+                  placeholder="Add custom role (e.g. Lead Fullstack Engineer)"
+                  className="h-8 text-xs"
+                />
+                <button
+                  type="button"
+                  onClick={() => addRole()}
+                  className="shrink-0 rounded-md border border-input bg-card px-3 py-1 text-xs font-medium text-foreground hover:bg-accent hover:border-primary/40 transition-colors"
+                >
+                  Add
+                </button>
+              </div>
+              {currentRoleList().length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                  <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground mr-1">Active:</span>
+                  {currentRoleList().map((role) => (
+                    <span
+                      key={role}
+                      className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/10 px-2.5 py-0.5 text-xs text-primary"
+                    >
+                      {role}
+                      <button
+                        type="button"
+                        onClick={() => removeRole(role)}
+                        className="ml-0.5 text-primary/60 hover:text-primary transition-colors text-sm leading-none"
+                        title={`Remove ${role}`}
+                        aria-label={`Remove ${role}`}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={clearRoles}
+                    className="text-[11px] text-muted-foreground hover:text-destructive underline ml-1"
+                  >
+                    Clear all
+                  </button>
                 </div>
               )}
               <Input

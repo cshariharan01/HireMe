@@ -66,9 +66,10 @@ function relTime(s: string | null): string {
 
 export function SyncButton({ isSidebarExpanded = false }: { isSidebarExpanded?: boolean }) {
   const { data, mutate } = useSWR<SyncStatus>('/api/sync', fetcher, { refreshInterval: (d) => (d?.running ? 1500 : 0) });
-  const { data: applyModeData } = useSWR<{ mode: string; threshold: number }>('/api/profile/apply-mode', fetcher, { dedupingInterval: 30_000 });
+  const { data: applyModeData } = useSWR<{ mode: string; threshold: number; resumeSource?: string }>('/api/profile/apply-mode', fetcher, { dedupingInterval: 10_000 });
   const applyMode = applyModeData?.mode ?? 'smart';
   const applyThreshold = applyModeData?.threshold ?? 60;
+  const applyResumeSource = applyModeData?.resumeSource ?? (applyMode === 'smart' ? 'original' : 'tailored');
   const [menuOpen, setMenuOpen] = useState(false);
   const [starting, setStarting] = useState(false);
   const [feedExpanded, setFeedExpanded] = useState(false);
@@ -493,7 +494,7 @@ export function SyncButton({ isSidebarExpanded = false }: { isSidebarExpanded?: 
           ? 'border-primary/30 bg-primary/10 text-primary'
           : 'border-info/30 bg-info/10 text-info'
       )}>
-        {applyMode === 'smart' ? `Smart ≥${applyThreshold}` : 'Apply All'}
+        {applyMode === 'smart' ? `Smart ≥${applyThreshold}` : `Apply All (${applyResumeSource === 'original' ? 'Original' : 'Tailored'})`}
       </div>
 
       {/* Platform Buttons */}

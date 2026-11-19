@@ -86,6 +86,18 @@ describe('matchesPreferredRole — dynamic profile role matching', () => {
     expect(matchesPreferredRole('HR Specialist', preferred)).toBe(false);
   });
 
+  it('rejects non-software physical engineering roles (mechanical, automotive, etc.)', () => {
+    const roles = ['Integration Engineer', 'Support Engineer'];
+    expect(matchesPreferredRole('Vehicle Integration Engineer', roles)).toBe(false);
+    expect(matchesPreferredRole('Mechanical Integration Engineer', roles)).toBe(false);
+    expect(matchesPreferredRole('HVAC Support Engineer', roles)).toBe(false);
+    expect(matchesPreferredRole('Aviation Support Engineer', roles)).toBe(false);
+    // But keeps tech / software roles
+    expect(matchesPreferredRole('API Integration Engineer', roles)).toBe(true);
+    expect(matchesPreferredRole('Data Integration Engineer', roles)).toBe(true);
+    expect(matchesPreferredRole('System Integration Engineer', roles)).toBe(true);
+  });
+
   it('allows all roles when user has no preferred roles configured', () => {
     expect(matchesPreferredRole('Any Role', [])).toBe(true);
   });

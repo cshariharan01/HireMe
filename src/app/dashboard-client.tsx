@@ -5,7 +5,8 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import {
   Building2, Globe2, MapPin, Plane, RefreshCw, Search, Sparkles, Target, TrendingUp,
   CheckCircle2, AlertTriangle, Loader2, ThumbsUp, ThumbsDown, CircleHelp, Wand2, X,
-  Eye, EyeOff, Bookmark, BookmarkPlus, Clock, Play, Pause, Square, ChevronLeft, ChevronRight,
+  Eye, EyeOff, Bookmark, BookmarkPlus, Clock, Play, Pause, Square, ChevronLeft, ChevronRight, FileText,
+  Trash2, CheckSquare,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -122,6 +123,7 @@ function Dashboard() {
   // Job Mode — Smart Apply (score ≥ threshold) vs Apply All (no score filter). Persisted in DB.
   const [jobMode, setJobModeState] = useState<'smart' | 'all'>('smart');
   const [scoreThreshold, setScoreThreshold] = useState(60);
+  const [applyResumeSource, setApplyResumeSource] = useState<'original' | 'tailored'>('tailored');
   const [jobModeLoaded, setJobModeLoaded] = useState(false);
 
   useEffect(() => {
@@ -130,6 +132,11 @@ function Dashboard() {
       .then((d) => {
         if (d.mode === 'smart' || d.mode === 'all') setJobModeState(d.mode);
         if (typeof d.threshold === 'number') setScoreThreshold(d.threshold);
+        if (d.resumeSource === 'original' || d.resumeSource === 'tailored') {
+          setApplyResumeSource(d.resumeSource);
+        } else if (d.mode === 'smart') {
+          setApplyResumeSource('original');
+        }
         setJobModeLoaded(true);
       })
       .catch(() => setJobModeLoaded(true));
@@ -152,20 +159,36 @@ function Dashboard() {
   // just to read `.length` was two full payloads for two integers.
   const { freshCount, appliedCount } = useDashboardStats();
 
-  const setJobMode = useCallback(async (mode: 'smart' | 'all') => {
+  const setJobMode = useCallback(async (mode: 'smart' | 'all', overrideResumeSource?: 'original' | 'tailored') => {
     setJobModeState(mode);
+    const newResumeSource = overrideResumeSource ?? (mode === 'smart' ? 'original' : applyResumeSource);
+    setApplyResumeSource(newResumeSource);
     try {
       await fetch('/api/profile/apply-mode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode, threshold: scoreThreshold }),
+        body: JSON.stringify({ mode, threshold: scoreThreshold, resumeSource: newResumeSource }),
       });
       // Refresh matches to apply the new score filter
       await refreshMatches();
     } catch {
       toast.error('Failed to save mode');
     }
-  }, [scoreThreshold, refreshMatches]);
+  }, [scoreThreshold, applyResumeSource, refreshMatches]);
+
+  const toggleResumeSource = useCallback(async (source: 'original' | 'tailored') => {
+    setApplyResumeSource(source);
+    try {
+      await fetch('/api/profile/apply-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: jobMode, threshold: scoreThreshold, resumeSource: source }),
+      });
+      toast.success(source === 'original' ? 'Using Original Resume for all applications' : 'Using AI-Tailored Resume for all applications');
+    } catch {
+      toast.error('Failed to update resume option');
+    }
+  }, [jobMode, scoreThreshold]);
 
 
 
@@ -482,6 +505,62 @@ function Dashboard() {
   };
   const cancelBulkEval = () => { bulkCancelRef.current = true; };
 
+  // Multiselect state for batch actions (e.g. bulk remove from dashboard)
+  const [selectedJobIds, setSelectedJobIds] = useState<Set<number>>(new Set());
+  const [bulkRemoving, setBulkRemoving] = useState(false);
+
+  const toggleSelectJob = useCallback((id: number) => {
+    setSelectedJobIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const selectAllJobs = useCallback(() => {
+    setSelectedJobIds(new Set(filtered.map((m) => m.id)));
+  }, [filtered]);
+
+  const clearSelection = useCallback(() => {
+    setSelectedJobIds(new Set());
+  }, []);
+
+  const bulkRemoveJobs = useCallback(async () => {
+    if (selectedJobIds.size === 0) return;
+    const ids = Array.from(selectedJobIds);
+    setBulkRemoving(true);
+    for (const id of ids) {
+      removeMatch(id, 1);
+    }
+    setSelectedId((prev) => (prev && selectedJobIds.has(prev) ? null : prev));
+    setSelectedJobIds(new Set());
+
+    toast(`Removed ${ids.length} ${ids.length === 1 ? 'job' : 'jobs'} from dashboard`, {
+      action: {
+        label: 'Undo',
+        onClick: async () => {
+          await Promise.all(ids.map((id) => fetch(`/api/jobs/${id}/hide`, { method: 'DELETE' })));
+          refreshMatches();
+          revalidateDashboardStats();
+          revalidateMatches();
+          toast.success(`Restored ${ids.length} jobs`);
+        },
+      },
+    });
+
+    try {
+      await Promise.all(ids.map((id) => fetch(`/api/jobs/${id}/hide`, { method: 'POST' })));
+      revalidateDashboardStats();
+      revalidateMatches();
+    } catch {
+      toast.error('Failed to remove some jobs; refreshing');
+      refreshMatches();
+    } finally {
+      setBulkRemoving(false);
+    }
+  }, [selectedJobIds, removeMatch, refreshMatches]);
+
   // NOTE the functional setState: reading `selectedId` directly would put it in the dep array, so
   // this identity would change on every selection — defeating the row memo again, just less often.
   const hideMatch = useCallback(async (match: Match) => {
@@ -607,7 +686,7 @@ function Dashboard() {
               <p className="text-[11px] text-muted-foreground">Choose which jobs to load &amp; auto-apply to</p>
             </div>
           </div>
-          <div className="flex gap-2 flex-wrap">
+          <div className="flex gap-2 flex-wrap items-center">
             <button
               id="job-mode-smart"
               type="button"
@@ -622,7 +701,7 @@ function Dashboard() {
               <span className="font-semibold text-xs uppercase tracking-wide flex items-center gap-1">
                 <CheckCircle2 className="h-3 w-3" /> Smart Apply
               </span>
-              <span className="text-[11px] opacity-80">Score ≥ {scoreThreshold} — best matches only</span>
+              <span className="text-[11px] opacity-80">Score ≥ {scoreThreshold} — original resume</span>
             </button>
             <button
               id="job-mode-all"
@@ -638,9 +717,48 @@ function Dashboard() {
               <span className="font-semibold text-xs uppercase tracking-wide flex items-center gap-1">
                 <Globe2 className="h-3 w-3" /> Apply All
               </span>
-              <span className="text-[11px] opacity-80">All matching roles — any score</span>
+              <span className="text-[11px] opacity-80">
+                All roles · {applyResumeSource === 'original' ? 'Original resume' : 'AI-tailored resume'}
+              </span>
             </button>
           </div>
+
+          {jobMode === 'all' && (
+            <div className="flex items-center gap-2 sm:ml-auto p-1.5 rounded-lg border border-border/70 bg-muted/40 shrink-0">
+              <span className="text-[11px] font-medium text-muted-foreground pl-1">Resume:</span>
+              <button
+                type="button"
+                id="apply-all-use-original"
+                onClick={() => toggleResumeSource('original')}
+                className={cn(
+                  'inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-semibold transition-all',
+                  applyResumeSource === 'original'
+                    ? 'bg-primary text-primary-foreground shadow-xs'
+                    : 'bg-background/80 text-muted-foreground hover:text-foreground hover:bg-background border border-border/50'
+                )}
+                title="Apply to all jobs using your original uploaded resume without AI modifications"
+              >
+                <FileText className="h-3 w-3" />
+                Use Original Resume
+              </button>
+              <button
+                type="button"
+                id="apply-all-use-tailored"
+                onClick={() => toggleResumeSource('tailored')}
+                className={cn(
+                  'inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-xs font-semibold transition-all',
+                  applyResumeSource === 'tailored'
+                    ? 'bg-primary text-primary-foreground shadow-xs'
+                    : 'bg-background/80 text-muted-foreground hover:text-foreground hover:bg-background border border-border/50'
+                )}
+                title="Tailor resume to each job description using AI"
+              >
+                <Sparkles className="h-3 w-3" />
+                Tailoring Resume
+              </button>
+            </div>
+          )}
+
           {jobMode === 'smart' && (
             <div className="flex items-center gap-2 ml-auto shrink-0">
               <span className="text-[11px] text-muted-foreground">Min score:</span>
@@ -971,6 +1089,53 @@ function Dashboard() {
       <div className="flex flex-1 flex-col gap-3 md:flex-row min-h-[600px] lg:min-h-[650px]">
         {/* Left: list only */}
         <div className="flex w-full flex-col overflow-hidden rounded-xl border bg-card shadow-soft md:w-[320px] lg:w-[380px] md:shrink-0 min-h-[500px]">
+          {/* Batch action toolbar */}
+          {filtered.length > 0 && (
+            <div className="flex items-center justify-between border-b bg-muted/30 px-3 py-2 text-xs">
+              <label className="flex items-center gap-2 cursor-pointer select-none text-muted-foreground hover:text-foreground">
+                <input
+                  type="checkbox"
+                  checked={filtered.length > 0 && selectedJobIds.size === filtered.length}
+                  onChange={(e) => {
+                    if (e.target.checked) selectAllJobs();
+                    else clearSelection();
+                  }}
+                  className="h-3.5 w-3.5 rounded border-border text-primary focus:ring-primary/40 cursor-pointer accent-primary"
+                />
+                <span className="font-medium text-[11px]">
+                  {selectedJobIds.size > 0 ? `${selectedJobIds.size} of ${filtered.length} selected` : 'Select all'}
+                </span>
+              </label>
+
+              {selectedJobIds.size > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={clearSelection}
+                    className="text-[11px] text-muted-foreground hover:text-foreground px-1"
+                  >
+                    Clear
+                  </button>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    onClick={bulkRemoveJobs}
+                    disabled={bulkRemoving}
+                    className="h-6 px-2 text-[11px] gap-1 shadow-xs"
+                    title={`Remove ${selectedJobIds.size} selected jobs from dashboard`}
+                  >
+                    {bulkRemoving ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-3 w-3" />
+                    )}
+                    Remove ({selectedJobIds.size})
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* List */}
           <div className="flex-1 overflow-y-auto scroll-slim">
             {isLoading && matches.length === 0 ? (
@@ -992,6 +1157,8 @@ function Dashboard() {
                     index={i}
                     selected={selectedId === m.id}
                     focused={focusedIdx === i}
+                    checked={selectedJobIds.has(m.id)}
+                    onToggleCheck={toggleSelectJob}
                     onSelect={handleRowSelect}
                     onHide={hideMatch}
                     onPrefetch={prefetchJob}
@@ -1015,8 +1182,8 @@ function Dashboard() {
           </div>
         </div>
 
-        {/* Right: detail — plain scroll surface; the panel renders its own cards */}
-        <div className="hidden min-w-0 flex-1 overflow-y-auto scroll-slim pr-1 md:block min-h-[500px]">
+        {/* Right: detail — sticky desktop container so it stays pinned and visible while scrolling down the page */}
+        <div className="hidden min-w-0 flex-1 md:block md:sticky md:top-4 md:max-h-[calc(100vh-2rem)] md:self-start overflow-y-auto scroll-slim pr-1 min-h-[500px]">
           {isLoading && matches.length === 0 ? (
             <div className="space-y-4 p-6 rounded-xl border bg-card shadow-soft">
               <Skeleton className="h-8 w-2/3" />
@@ -1098,9 +1265,11 @@ function RowSkeleton() {
 }
 
 const MatchRow = memo(function MatchRow({
-  m, index, selected, focused, onSelect, onHide, onPrefetch,
+  m, index, selected, focused, checked, onToggleCheck, onSelect, onHide, onPrefetch,
 }: {
   m: Match; index: number; selected: boolean; focused: boolean;
+  checked?: boolean;
+  onToggleCheck?: (id: number) => void;
   onSelect: (m: Match, i: number) => void;
   onHide: (m: Match) => void;
   onPrefetch: (id: number) => void;
@@ -1117,7 +1286,7 @@ const MatchRow = memo(function MatchRow({
       className={cn(
         // `match-row` enables content-visibility (see globals.css) so offscreen rows cost no
         // layout/paint while staying in the DOM for keyboard nav and scrollIntoView.
-        'match-row group flex cursor-pointer items-start gap-3 border-l-2 px-3 py-2.5 transition-colors',
+        'match-row group flex cursor-pointer items-start gap-2.5 border-l-2 px-3 py-2.5 transition-colors',
         // Applied jobs get a persistent tint + green left-rail so they read as "done" even when
         // kept in the list (badge alone is easy to miss). Selected state still wins.
         selected ? 'border-l-transparent bg-accent'
@@ -1126,6 +1295,15 @@ const MatchRow = memo(function MatchRow({
         focused && !selected && 'ring-1 ring-inset ring-ring/40'
       )}
     >
+      <div className="mt-1 flex items-center shrink-0" onClick={(e) => e.stopPropagation()}>
+        <input
+          type="checkbox"
+          checked={!!checked}
+          onChange={() => onToggleCheck?.(m.id)}
+          aria-label={`Select ${m.title}`}
+          className="h-3.5 w-3.5 rounded border-border text-primary focus:ring-primary/40 cursor-pointer accent-primary"
+        />
+      </div>
       <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-muted font-mono text-xs font-semibold text-muted-foreground">
         {companyInitials(m.company)}
       </div>

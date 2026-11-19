@@ -32,6 +32,18 @@ const EXCLUDED_ROLE_PATTERNS = [
   /\bsre\b/i,
 ];
 
+// Roles outside software/data tech (e.g. automotive mechanical, civil, electrical hardware, biomedical, manufacturing)
+// that accidentally match generic terms like "Integration Engineer", "Support Engineer", etc.
+export const NON_SOFTWARE_ROLE_PATTERNS = [
+  /\b(?:vehicle|automotive|automobile|chassis|powertrain|battery\s+pack|propulsion|suspension|brakes?)\b/i,
+  /\b(?:mechanical|civil|structural|hvac|piping|plumbing|instrumentation|metallurg\w+|welding)\b/i,
+  /\b(?:cad|cam|catia|unigraphics|creo|solidworks|ansys|dmu|digital\s+mock\s*up)\b/i,
+  /\b(?:hardware|pcb|embedded\s+hardware|vlsi|fpga|asic|schematic|soldering)\b/i,
+  /\b(?:biomedical|clinical|nursing|pharmaceutical|doctor|pharmacist)\b/i,
+  /\b(?:manufacturing|machining|cnc|die|mold|casting|machinist|fabricat\w+)\b/i,
+  /\b(?:aviation|aircraft|avionics|aerospace|flight|pilot|marine|shipbuilding)\b/i,
+];
+
 export function isTargetDataRole(title: string): boolean {
   const value = title || '';
 
@@ -49,12 +61,25 @@ export function matchesPreferredRole(
   if (!title) return false;
   if (!preferredRoles || preferredRoles.length === 0) return true;
   const lower = title.toLowerCase();
+
+  // Reject titles belonging to non-software/physical engineering domains unless the user
+  // explicitly configured a target role containing that specific domain keyword.
+  for (const pattern of NON_SOFTWARE_ROLE_PATTERNS) {
+    if (pattern.test(lower)) {
+      const userWantsDomain = preferredRoles.some((role) => pattern.test(role));
+      if (!userWantsDomain) return false;
+    }
+  }
+
   return preferredRoles.some((role) => {
     const r = role.trim().toLowerCase();
     if (!r) return false;
-    // Token-based matching: all words in the preferred role should appear in the title
+    // Word-boundary token-based matching: all words in the preferred role must appear as complete words in title
     const tokens = r.split(/\s+/).filter(Boolean);
-    return tokens.every((tok) => lower.includes(tok));
+    return tokens.every((tok) => {
+      const escaped = tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(`\\b${escaped}\\b`, 'i').test(lower);
+    });
   });
 }
 
